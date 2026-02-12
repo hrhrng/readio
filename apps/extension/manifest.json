@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Readio Companion",
+  "version": "0.1.0",
+  "description": "Read selected web text aloud through the Readio API",
+  "action": {
+    "default_title": "Readio",
+    "default_popup": "popup.html"
+  },
+  "permissions": ["activeTab", "storage", "scripting", "tabs"],
+  "host_permissions": [
+    "http://localhost:8000/*",
+    "http://127.0.0.1:8000/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  }
+}

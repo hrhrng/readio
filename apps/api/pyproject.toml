@@ -1,0 +1,21 @@
+[project]
+name = "readio-api"
+version = "0.1.0"
+description = "Readio FastAPI backend"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi==0.116.1",
+  "uvicorn[standard]==0.35.0",
+  "httpx==0.28.1",
+  "edge-tts==7.2.7",
+  "pydantic==2.11.7",
+  "python-dotenv==1.1.1",
+  "python-multipart>=0.0.22",
+  "pymupdf>=1.23.0",
+]
+
+[dependency-groups]
+dev = [
+  "pytest==8.4.1",
+  "pytest-asyncio==1.1.0",
+]

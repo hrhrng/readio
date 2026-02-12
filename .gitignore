@@ -1,0 +1,35 @@
+node_modules
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.venv/
+.venv-indextts2/
+apps/api/.venv/
+data/
+apps/api/data/
+apps/api/checkpoints/
+third_party/indexTTS2/
+
+# Next.js
+apps/web/.next/
+apps/web/.next-dev/
+apps/web/out/
+
+# Extension build
+apps/extension/dist/
+apps/extension/.cache/
+
+# Local media
+*.wav
+*.mp3
+*.flac
+
+# OS
+.DS_Store

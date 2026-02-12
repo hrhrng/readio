@@ -1,0 +1,63 @@
+@import "tailwindcss";
+
+@theme {
+  --color-surface: var(--surface);
+  --color-surface-sidebar: var(--surface-sidebar);
+  --color-surface-card: var(--surface-card);
+  --color-surface-hover: var(--surface-hover);
+  --color-surface-active: var(--surface-active);
+  --color-text-primary: var(--text-primary);
+  --color-text-secondary: var(--text-secondary);
+  --color-text-tertiary: var(--text-tertiary);
+  --color-accent: var(--accent);
+  --color-border: var(--border);
+  --color-badge-new: var(--badge-new);
+  --color-highlight-sentence: var(--highlight-sentence);
+  --color-highlight-word: var(--highlight-word);
+}
+
+:root {
+  --surface: #FFFFFF;
+  --surface-sidebar: #F5F5F7;
+  --surface-card: #FFFFFF;
+  --surface-hover: #F0F0F0;
+  --surface-active: rgba(0, 0, 0, 0.05);
+  --text-primary: #1D1D1F;
+  --text-secondary: #86868B;
+  --text-tertiary: #AEAEB2;
+  --accent: #007AFF;
+  --border: #E5E5EA;
+  --badge-new: #007AFF;
+  --highlight-sentence: rgba(0, 122, 255, 0.08);
+  --highlight-word: #007AFF;
+}
+
+.dark {
+  --surface: #1C1C1E;
+  --surface-sidebar: #000000;
+  --surface-card: #2C2C2E;
+  --surface-hover: #3A3A3C;
+  --surface-active: rgba(255, 255, 255, 0.1);
+  --text-primary: #FFFFFF;
+  --text-secondary: #8E8E93;
+  --text-tertiary: #636366;
+  --accent: #0A84FF;
+  --border: #38383A;
+  --badge-new: #0A84FF;
+  --highlight-sentence: rgba(10, 132, 255, 0.15);
+  --highlight-word: #0A84FF;
+}
+
+body {
+  color: var(--text-primary);
+  background: var(--surface);
+}
+
+/* Hide scrollbar for carousel */
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
+}
+.scrollbar-hide {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
