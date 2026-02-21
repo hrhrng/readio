@@ -16,8 +16,23 @@ export interface LibraryItem {
   voice: string | null;
 }
 
+/** 列表接口返回的轻量模型，不含 content */
+export interface LibraryItemSummary {
+  id: string;
+  title: string;
+  type: LibraryItemType;
+  progress: number;
+  date: string;
+  category: LibraryItemCategory;
+  folder_id: string;
+  source: string;
+  file_path: string | null;
+  cover_image: string | null;
+  voice: string | null;
+}
+
 export interface LibraryItemsResponse {
-  items: LibraryItem[];
+  items: LibraryItemSummary[];
   total: number;
   page: number;
   page_size: number;

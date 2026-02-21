@@ -4,7 +4,7 @@ import { useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { MoreHorizontal, Trash2 } from "lucide-react";
 import { useSWRConfig } from "swr";
-import { LibraryItem, getReadingStatus } from "@/lib/types";
+import { LibraryItemSummary, getReadingStatus } from "@/lib/types";
 import { deleteItem } from "@/lib/api";
 import { ConfirmDialog } from "./confirm-dialog";
 
@@ -26,7 +26,7 @@ function CoverPlaceholder({
   item,
   className,
 }: {
-  item: LibraryItem;
+  item: LibraryItemSummary;
   className?: string;
 }) {
   const gradient = typeGradients[item.type] || typeGradients.txt;
@@ -52,7 +52,7 @@ function BookCover({
   item,
   className,
 }: {
-  item: LibraryItem;
+  item: LibraryItemSummary;
   className?: string;
 }) {
   if (item.cover_image) {
@@ -68,7 +68,7 @@ function BookCover({
 }
 
 interface BookCardProps {
-  item: LibraryItem;
+  item: LibraryItemSummary;
   variant?: "grid" | "list";
 }
 

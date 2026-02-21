@@ -11,7 +11,7 @@ interface ContentRouterProps {
   currentSentenceIndex: number;
   currentWordProgress: number;
   onSentenceClick: (index: number) => void;
-  onChaptersExtracted?: (chapters: { id: string; title: string }[]) => void;
+  onChaptersExtracted?: (chapters: { id: string; title: string; depth?: number }[]) => void;
   onOutlineExtracted?: (outline: { title: string; page: number }[]) => void;
 }
 

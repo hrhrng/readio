@@ -22,8 +22,23 @@ class LibraryItem(BaseModel):
     voice: str | None = None
 
 
+class LibraryItemSummary(BaseModel):
+    """列表接口用的轻量模型，不含 content。"""
+    id: str
+    title: str
+    type: LibraryItemType
+    progress: int = Field(ge=0, le=100)
+    date: str
+    category: LibraryItemCategory
+    folder_id: str
+    source: str
+    file_path: str | None = None
+    cover_image: str | None = None
+    voice: str | None = None
+
+
 class LibraryItemsResponse(BaseModel):
-    items: list[LibraryItem]
+    items: list[LibraryItemSummary]
     total: int
     page: int
     page_size: int

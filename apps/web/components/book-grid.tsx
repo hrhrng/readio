@@ -1,8 +1,8 @@
-import { LibraryItem } from "@/lib/types";
+import { LibraryItemSummary } from "@/lib/types";
 import { BookCard } from "./book-card";
 
 interface BookGridProps {
-  items: LibraryItem[];
+  items: LibraryItemSummary[];
 }
 
 export function BookGrid({ items }: BookGridProps) {

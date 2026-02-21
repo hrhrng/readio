@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from app.library.models import CreateLibraryItemRequest, LibraryItem
+from app.library.models import CreateLibraryItemRequest, LibraryItem, LibraryItemSummary
 
 
 def _format_library_date(now: datetime) -> str:
@@ -174,7 +174,7 @@ class LibraryStore:
         page_size: int = 20,
         sort_by: str = 'created_at',
         sort_order: str = 'desc',
-    ) -> tuple[list[LibraryItem], int, int]:
+    ) -> tuple[list[LibraryItemSummary], int, int]:
         current_page = max(1, int(page))
         current_page_size = min(100, max(1, int(page_size)))
 
@@ -213,8 +213,9 @@ class LibraryStore:
         offset = (current_page - 1) * current_page_size
 
         count_query = f'SELECT COUNT(*) AS count FROM library_items WHERE {where_sql}'
+        # 列表接口不需要 content 字段，避免传输大量数据（如 base64 封面）
         data_query = f'''
-            SELECT id, title, content, type, progress, date, category, folder_id, source, file_path, cover_image, voice
+            SELECT id, title, type, progress, date, category, folder_id, source, file_path, cover_image, voice
             FROM library_items
             WHERE {where_sql}
             ORDER BY {order_column} {order_direction}
@@ -226,7 +227,7 @@ class LibraryStore:
             rows = connection.execute(data_query, [*params, current_page_size, offset]).fetchall()
 
         total_pages = max(1, math.ceil(total / current_page_size))
-        return [LibraryItem(**dict(row)) for row in rows], total, total_pages
+        return [LibraryItemSummary(**dict(row)) for row in rows], total, total_pages
 
     def get_item(self, item_id: str) -> LibraryItem | None:
         with self._connect() as connection:

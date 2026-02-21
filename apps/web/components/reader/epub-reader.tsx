@@ -10,11 +10,12 @@ import { tokenize, countTokens } from "@/lib/cjk";
 // Data structures for structured EPUB content
 // ---------------------------------------------------------------------------
 
-/** A run of text with inline formatting (bold / italic). */
+/** A run of text with inline formatting (bold / italic) and optional hyperlink. */
 interface StyledRun {
   text: string;
   bold?: boolean;
   italic?: boolean;
+  href?: string; // hyperlink target (internal or external)
 }
 
 /** A sentence with its global index, plain text (for TTS), and styled runs (for rendering). */
@@ -26,15 +27,16 @@ interface RichSentence {
 
 /** Union type representing a single content block extracted from EPUB HTML. */
 type ContentBlock =
-  | { type: "heading"; level: number; sentences: RichSentence[] }
-  | { type: "paragraph"; sentences: RichSentence[] }
+  | { type: "heading"; level: number; sentences: RichSentence[]; anchorId?: string }
+  | { type: "paragraph"; sentences: RichSentence[]; anchorId?: string }
   | { type: "image"; src: string; alt?: string }
   | {
       type: "list";
       ordered: boolean;
       items: { sentences: RichSentence[] }[];
+      anchorId?: string;
     }
-  | { type: "blockquote"; sentences: RichSentence[] }
+  | { type: "blockquote"; sentences: RichSentence[]; anchorId?: string }
   | { type: "separator" };
 
 interface EpubChapter {
@@ -47,6 +49,48 @@ interface EpubChapter {
 // Props — identical to the old EpubReader, so ContentRouter needs no changes
 // ---------------------------------------------------------------------------
 
+/** A single entry in the navigation TOC, with hierarchical depth for indentation. */
+interface NavTocEntry {
+  id: string;     // scroll target: "chapter-5" or "chapter-5#anchor"
+  title: string;
+  depth: number;  // 0 = top-level, 1 = sub-item, 2 = sub-sub-item, ...
+}
+
+/**
+ * Recursively build a flat list of NavTocEntry from epub.js navigation.toc,
+ * mapping each entry's href to the corresponding chapter element id.
+ */
+function buildNavToc(
+  entries: any[],
+  hrefToChapterMap: Map<string, string>,
+  depth: number = 0
+): NavTocEntry[] {
+  const result: NavTocEntry[] = [];
+  for (const entry of entries) {
+    const rawHref = entry.href || "";
+    const [file, anchor] = rawHref.split("#");
+    const label = (entry.label || "").trim();
+    if (!label) continue;
+
+    // Try both the full href path and basename for matching
+    const fileBasename = file.split("/").pop() || file;
+    const chapterId = hrefToChapterMap.get(file) || hrefToChapterMap.get(fileBasename);
+    if (chapterId) {
+      result.push({
+        id: anchor ? `${chapterId}#${anchor}` : chapterId,
+        title: label,
+        depth,
+      });
+    }
+
+    // Recurse into child items (epub.js stores them as `subitems`)
+    if (entry.subitems?.length) {
+      result.push(...buildNavToc(entry.subitems, hrefToChapterMap, depth + 1));
+    }
+  }
+  return result;
+}
+
 interface EpubReaderProps {
   itemId: string;
   fallbackContent?: string;
@@ -54,7 +98,7 @@ interface EpubReaderProps {
   currentSentenceIndex: number;
   currentWordProgress: number;
   onSentenceClick: (index: number) => void;
-  onChaptersExtracted?: (chapters: { id: string; title: string }[]) => void;
+  onChaptersExtracted?: (chapters: { id: string; title: string; depth?: number }[]) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +187,7 @@ function splitRunsIntoSentences(
         text: slice,
         ...(run.bold ? { bold: true } : {}),
         ...(run.italic ? { italic: true } : {}),
+        ...(run.href ? { href: run.href } : {}),
       });
 
       remaining -= take;
@@ -177,7 +222,8 @@ function splitRunsIntoSentences(
 function extractStyledRuns(
   node: Node,
   inheritBold: boolean,
-  inheritItalic: boolean
+  inheritItalic: boolean,
+  inheritHref?: string
 ): StyledRun[] {
   if (node.nodeType === Node.TEXT_NODE) {
     const text = node.textContent || "";
@@ -187,6 +233,7 @@ function extractStyledRuns(
         text,
         ...(inheritBold ? { bold: true } : {}),
         ...(inheritItalic ? { italic: true } : {}),
+        ...(inheritHref ? { href: inheritHref } : {}),
       },
     ];
   }
@@ -202,9 +249,13 @@ function extractStyledRuns(
   const isItalic =
     inheritItalic || tag === "i" || tag === "em";
 
+  // Capture href from <a> tags and propagate to all child runs
+  const currentHref =
+    tag === "a" ? el.getAttribute("href") || inheritHref : inheritHref;
+
   const runs: StyledRun[] = [];
   for (const child of Array.from(el.childNodes)) {
-    runs.push(...extractStyledRuns(child, isBold, isItalic));
+    runs.push(...extractStyledRuns(child, isBold, isItalic, currentHref));
   }
   return runs;
 }
@@ -237,13 +288,16 @@ async function extractBlocks(
   async function processElement(el: Element): Promise<void> {
     const tag = el.tagName.toLowerCase();
 
+    // Capture element id for anchor-based navigation (e.g. <h2 id="section5">)
+    const anchorId = el.getAttribute("id") || undefined;
+
     // --- Headings ---
     if (/^h[1-6]$/.test(tag)) {
       const level = parseInt(tag[1]);
       const runs = extractStyledRuns(el, false, false);
       const { sentences, nextIndex } = splitRunsIntoSentences(runs, sentenceIdx);
       if (sentences.length > 0) {
-        blocks.push({ type: "heading", level, sentences });
+        blocks.push({ type: "heading", level, sentences, anchorId });
         sentenceIdx = nextIndex;
       }
       return;
@@ -305,7 +359,7 @@ async function extractBlocks(
         }
       }
       if (items.length > 0) {
-        blocks.push({ type: "list", ordered, items });
+        blocks.push({ type: "list", ordered, items, anchorId });
       }
       return;
     }
@@ -318,7 +372,7 @@ async function extractBlocks(
         sentenceIdx
       );
       if (sentences.length > 0) {
-        blocks.push({ type: "blockquote", sentences });
+        blocks.push({ type: "blockquote", sentences, anchorId });
         sentenceIdx = nextIndex;
       }
       return;
@@ -351,7 +405,7 @@ async function extractBlocks(
         sentenceIdx
       );
       if (sentences.length > 0) {
-        blocks.push({ type: "paragraph", sentences });
+        blocks.push({ type: "paragraph", sentences, anchorId });
         sentenceIdx = nextIndex;
       }
       return;
@@ -403,7 +457,7 @@ async function extractBlocks(
         sentenceIdx
       );
       if (sentences.length > 0) {
-        blocks.push({ type: "paragraph", sentences });
+        blocks.push({ type: "paragraph", sentences, anchorId });
         sentenceIdx = nextIndex;
       }
       return;
@@ -438,11 +492,13 @@ const SentenceSpan = memo(function SentenceSpan({
   isActive,
   wordProgress,
   onClick,
+  onLinkClick,
 }: {
   sentence: RichSentence;
   isActive: boolean;
   wordProgress: number;
   onClick: (index: number) => void;
+  onLinkClick?: (href: string) => void;
 }) {
   // Cache wordCount — sentence.text is stable across renders.
   // countTokens handles CJK (per-character) and Latin (per-word) correctly.
@@ -456,6 +512,10 @@ const SentenceSpan = memo(function SentenceSpan({
 
   let globalWordIdx = 0;
 
+  /** Determine if an href is an external link (http/https/mailto). */
+  const isExternal = (href: string) =>
+    /^(https?:|mailto:)/i.test(href);
+
   return (
     <span
       data-sentence-id={sentence.index}
@@ -466,30 +526,57 @@ const SentenceSpan = memo(function SentenceSpan({
     >
       {sentence.runs.map((run, ri) => {
         const tokens = tokenize(run.text);
-        return (
-          <span
-            key={ri}
-            className={`${run.bold ? "font-bold" : ""} ${run.italic ? "italic" : ""}`}
-          >
-            {tokens.map((token, ti) => {
-              if (!token.trim()) {
-                return <span key={ti}>{token}</span>;
+
+        // Build the inner content (with per-word highlighting)
+        const inner = tokens.map((token, ti) => {
+          if (!token.trim()) {
+            return <span key={ti}>{token}</span>;
+          }
+          const thisIdx = globalWordIdx++;
+          const isHighlighted = isActive && thisIdx === highlightedWordIdx;
+          return (
+            <span
+              key={ti}
+              className={
+                isHighlighted
+                  ? "text-highlight-word font-semibold"
+                  : ""
               }
-              const thisIdx = globalWordIdx++;
-              const isHighlighted = isActive && thisIdx === highlightedWordIdx;
-              return (
-                <span
-                  key={ti}
-                  className={
-                    isHighlighted
-                      ? "text-highlight-word font-semibold"
-                      : ""
-                  }
-                >
-                  {token}
-                </span>
-              );
-            })}
+            >
+              {token}
+            </span>
+          );
+        });
+
+        // Wrap in formatting + optional link
+        const styleClass = `${run.bold ? "font-bold" : ""} ${run.italic ? "italic" : ""}`.trim();
+
+        if (run.href) {
+          // Render as a clickable hyperlink
+          const external = isExternal(run.href);
+          return (
+            <a
+              key={ri}
+              href={run.href}
+              className={`${styleClass} text-blue-500 underline decoration-blue-300 hover:text-blue-600 hover:decoration-blue-500`.trim()}
+              onClick={(e) => {
+                e.stopPropagation(); // don't trigger sentence click
+                if (external) return; // let browser handle external links
+                e.preventDefault();
+                onLinkClick?.(run.href!);
+              }}
+              {...(external
+                ? { target: "_blank", rel: "noopener noreferrer" }
+                : {})}
+            >
+              {inner}
+            </a>
+          );
+        }
+
+        return (
+          <span key={ri} className={styleClass || undefined}>
+            {inner}
           </span>
         );
       })}
@@ -497,8 +584,7 @@ const SentenceSpan = memo(function SentenceSpan({
   );
 }, (prevProps, nextProps) => {
   // Return true = skip re-render, false = re-render
-  // onClick is ref-stable (useTTSPlayer stores mutable values in refs),
-  // so no identity check needed here.
+  // onClick / onLinkClick are ref-stable — no identity check needed.
   if (!prevProps.isActive && !nextProps.isActive) return true;   // both inactive → skip
   if (prevProps.isActive !== nextProps.isActive) return false;    // active state changed → re-render
   return prevProps.wordProgress === nextProps.wordProgress;       // both active → compare progress
@@ -512,7 +598,8 @@ function renderSentences(
   sentences: RichSentence[],
   currentSentenceIndex: number,
   currentWordProgress: number,
-  onSentenceClick: (index: number) => void
+  onSentenceClick: (index: number) => void,
+  onLinkClick?: (href: string) => void
 ) {
   return sentences.map((s) => (
     <SentenceSpan
@@ -521,6 +608,7 @@ function renderSentences(
       isActive={s.index === currentSentenceIndex}
       wordProgress={currentWordProgress}
       onClick={onSentenceClick}
+      onLinkClick={onLinkClick}
     />
   ));
 }
@@ -564,11 +652,13 @@ const BlockRenderer = memo(function BlockRenderer({
   currentSentenceIndex,
   currentWordProgress,
   onSentenceClick,
+  onLinkClick,
 }: {
   block: ContentBlock;
   currentSentenceIndex: number;
   currentWordProgress: number;
   onSentenceClick: (index: number) => void;
+  onLinkClick?: (href: string) => void;
 }) {
   switch (block.type) {
     case "heading": {
@@ -583,24 +673,26 @@ const BlockRenderer = memo(function BlockRenderer({
         block.sentences,
         currentSentenceIndex,
         currentWordProgress,
-        onSentenceClick
+        onSentenceClick,
+        onLinkClick
       );
-      if (block.level <= 1) return <h1 className={className}>{children}</h1>;
-      if (block.level === 2) return <h2 className={className}>{children}</h2>;
-      if (block.level === 3) return <h3 className={className}>{children}</h3>;
-      if (block.level === 4) return <h4 className={className}>{children}</h4>;
-      if (block.level === 5) return <h5 className={className}>{children}</h5>;
-      return <h6 className={className}>{children}</h6>;
+      if (block.level <= 1) return <h1 id={block.anchorId} className={className}>{children}</h1>;
+      if (block.level === 2) return <h2 id={block.anchorId} className={className}>{children}</h2>;
+      if (block.level === 3) return <h3 id={block.anchorId} className={className}>{children}</h3>;
+      if (block.level === 4) return <h4 id={block.anchorId} className={className}>{children}</h4>;
+      if (block.level === 5) return <h5 id={block.anchorId} className={className}>{children}</h5>;
+      return <h6 id={block.anchorId} className={className}>{children}</h6>;
     }
 
     case "paragraph":
       return (
-        <p className="mb-4 text-lg leading-relaxed text-text-primary">
+        <p id={block.anchorId} className="mb-4 text-lg leading-relaxed text-text-primary">
           {renderSentences(
             block.sentences,
             currentSentenceIndex,
             currentWordProgress,
-            onSentenceClick
+            onSentenceClick,
+            onLinkClick
           )}
         </p>
       );
@@ -620,14 +712,15 @@ const BlockRenderer = memo(function BlockRenderer({
         ? "list-decimal pl-6 mb-4"
         : "list-disc pl-6 mb-4";
       return (
-        <ListTag className={listClass}>
+        <ListTag id={block.anchorId} className={listClass}>
           {block.items.map((item, i) => (
             <li key={i} className="mb-1 text-lg leading-relaxed text-text-primary">
               {renderSentences(
                 item.sentences,
                 currentSentenceIndex,
                 currentWordProgress,
-                onSentenceClick
+                onSentenceClick,
+                onLinkClick
               )}
             </li>
           ))}
@@ -637,12 +730,13 @@ const BlockRenderer = memo(function BlockRenderer({
 
     case "blockquote":
       return (
-        <blockquote className="border-l-4 border-border pl-4 italic text-text-secondary mb-4">
+        <blockquote id={block.anchorId} className="border-l-4 border-border pl-4 italic text-text-secondary mb-4">
           {renderSentences(
             block.sentences,
             currentSentenceIndex,
             currentWordProgress,
-            onSentenceClick
+            onSentenceClick,
+            onLinkClick
           )}
         </blockquote>
       );
@@ -678,6 +772,29 @@ const BlockRenderer = memo(function BlockRenderer({
  */
 interface EpubLoadResult {
   chapters: EpubChapter[];
+  /** Maps spine section href (and basename) → chapter id for internal link navigation. */
+  hrefToChapterMap: Map<string, string>;
+  /** Cover blob URL if present (caller should revoke on unmount). */
+  coverUrl?: string;
+  /** Hierarchical TOC built from epub.js navigation (NCX/nav). */
+  navToc: NavTocEntry[];
+}
+
+/**
+ * Recursively flatten nested TOC entries from epub.js navigation.
+ * epub.js stores child items in `entry.subitems`.
+ */
+function flattenToc(entries: any[]): { href: string; label: string }[] {
+  const result: { href: string; label: string }[] = [];
+  for (const entry of entries) {
+    const href = (entry.href || "").split("#")[0];
+    const label = (entry.label || "").trim();
+    if (href && label) result.push({ href, label });
+    if (entry.subitems && Array.isArray(entry.subitems)) {
+      result.push(...flattenToc(entry.subitems));
+    }
+  }
+  return result;
 }
 
 async function loadEpubChapters(
@@ -690,18 +807,37 @@ async function loadEpubChapters(
   await book.ready;
   await book.loaded.navigation;
 
-  // Build TOC label lookup: href (without fragment) → label
-  const tocLabels = new Map<string, string>();
+  // --- Cover image: fetch blob URL before processing spine ---
+  // Use a timeout to prevent hanging on EPUBs where coverUrl() never resolves
+  let coverUrl: string | undefined;
+  try {
+    const url = await Promise.race([
+      book.coverUrl(),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000)),
+    ]);
+    if (url) coverUrl = url;
+  } catch {
+    // Some EPUBs don't have a cover — that's fine
+  }
+
+  // --- Build TOC label lookup with multi-strategy matching ---
+  // Two maps: exact href → label, and basename → label (fallback)
+  const tocByHref = new Map<string, string>();
+  const tocByBasename = new Map<string, string>();
   const navToc = (book.navigation as any)?.toc;
   if (navToc && Array.isArray(navToc)) {
-    for (const entry of navToc) {
-      const href = (entry.href || "").split("#")[0];
-      const label = (entry.label || "").trim();
-      if (href && label) tocLabels.set(href, label);
+    for (const { href, label } of flattenToc(navToc)) {
+      tocByHref.set(href, label);
+      // basename fallback: "OEBPS/Text/ch1.xhtml" → "ch1.xhtml"
+      const basename = href.split("/").pop() || href;
+      if (!tocByBasename.has(basename)) {
+        tocByBasename.set(basename, label);
+      }
     }
   }
 
   const chapters: EpubChapter[] = [];
+  const hrefToChapterMap = new Map<string, string>();
   let sentenceIdx = 0;
 
   // Access the spine — epub.js stores spine items under `book.spine`
@@ -766,9 +902,14 @@ async function loadEpubChapters(
     );
     sentenceIdx = nextSentenceIndex;
 
-    // Determine chapter title: prefer TOC label, then first heading, then generic
+    // Determine chapter title: prefer TOC label (exact match, then basename fallback),
+    // then first heading in content, then generic "Chapter N"
     const sectionHref = (section.href || "").split("#")[0];
-    let title = tocLabels.get(sectionHref) || "";
+    const sectionBasename = sectionHref.split("/").pop() || sectionHref;
+    let title =
+      tocByHref.get(sectionHref) ||
+      tocByBasename.get(sectionBasename) ||
+      "";
     if (!title) {
       // Look for first heading block
       const headingBlock = blocks.find((b) => b.type === "heading");
@@ -780,17 +921,36 @@ async function loadEpubChapters(
       title = `Chapter ${chapters.length + 1}`;
     }
 
-    chapters.push({
-      id: `chapter-${chapters.length + 1}`,
-      title,
-      blocks,
-    });
+    const chapterId = `chapter-${chapters.length + 1}`;
+    chapters.push({ id: chapterId, title, blocks });
+
+    // Build href → chapter id mapping for internal link navigation
+    hrefToChapterMap.set(sectionHref, chapterId);
+    if (sectionBasename !== sectionHref) {
+      hrefToChapterMap.set(sectionBasename, chapterId);
+    }
   }
+
+  // --- Insert cover chapter at the beginning if cover image exists ---
+  if (coverUrl) {
+    const coverChapter: EpubChapter = {
+      id: "cover",
+      title: "Cover",
+      blocks: [{ type: "image", src: coverUrl }],
+    };
+    chapters.unshift(coverChapter);
+  }
+
+  // Build hierarchical navigation TOC from epub.js's parsed NCX/nav document.
+  // Falls back to empty array for EPUBs without navigation metadata.
+  const navEntries = navToc && Array.isArray(navToc)
+    ? buildNavToc(navToc, hrefToChapterMap)
+    : [];
 
   // Clean up epub.js resources (blob URLs survive destroy)
   book.destroy();
 
-  return { chapters };
+  return { chapters, hrefToChapterMap, coverUrl, navToc: navEntries };
 }
 
 // ---------------------------------------------------------------------------
@@ -810,6 +970,13 @@ export function EpubReader({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const sentencesExtractedRef = useRef(false);
+  const [hrefToChapterMap, setHrefToChapterMap] = useState<Map<string, string>>(
+    new Map()
+  );
+
+  // Track blob URLs from EPUB images and revoke them on unmount to prevent memory leaks.
+  // Declared early so loadEpub can add the cover blob URL.
+  const blobUrlsRef = useRef<Set<string>>(new Set());
 
   // Collect all sentences across all chapters into a flat array (for TTS)
   const allSentences: Sentence[] = useMemo(() => {
@@ -845,8 +1012,19 @@ export function EpubReader({
       }
 
       setChapters(result.chapters);
+      setHrefToChapterMap(result.hrefToChapterMap);
+
+      // Track cover blob URL for cleanup
+      if (result.coverUrl) {
+        blobUrlsRef.current.add(result.coverUrl);
+      }
+
+      // Prefer the hierarchical navigation TOC (NCX/nav) for meaningful entries;
+      // fall back to spine-based chapters only if navToc is empty (rare EPUBs).
       onChaptersExtracted?.(
-        result.chapters.map((c) => ({ id: c.id, title: c.title }))
+        result.navToc.length > 0
+          ? result.navToc
+          : result.chapters.map((c) => ({ id: c.id, title: c.title }))
       );
     } catch (err) {
       console.error("EPUB load error:", err);
@@ -869,8 +1047,7 @@ export function EpubReader({
     }
   }, [allSentences, onSentencesExtracted]);
 
-  // Track blob URLs from EPUB images and revoke them on unmount to prevent memory leaks
-  const blobUrlsRef = useRef<Set<string>>(new Set());
+  // Collect image blob URLs from chapters and revoke all on unmount
   useEffect(() => {
     const urls = blobUrlsRef.current;
     for (const chapter of chapters) {
@@ -885,6 +1062,28 @@ export function EpubReader({
       urls.clear();
     };
   }, [chapters]);
+
+  // Handle internal EPUB link clicks: resolve href → chapter, scroll to target
+  const handleLinkClick = useCallback(
+    (href: string) => {
+      const targetFile = href.split("#")[0];
+      const anchor = href.split("#")[1];
+      // Try exact match first, then basename fallback
+      const chapterId =
+        hrefToChapterMap.get(targetFile) ||
+        hrefToChapterMap.get(targetFile.split("/").pop() || "");
+      if (chapterId) {
+        // If there's an anchor fragment, try to find the specific element first
+        const el = anchor
+          ? document.querySelector(
+              `[data-chapter="${chapterId}"] [id="${anchor}"]`
+            )
+          : document.querySelector(`[data-chapter="${chapterId}"]`);
+        el?.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
+    },
+    [hrefToChapterMap]
+  );
 
   // Auto-scroll to the currently active sentence
   useEffect(() => {
@@ -948,6 +1147,7 @@ export function EpubReader({
                 currentSentenceIndex={currentSentenceIndex}
                 currentWordProgress={currentWordProgress}
                 onSentenceClick={onSentenceClick}
+                onLinkClick={handleLinkClick}
               />
             ))}
           </div>

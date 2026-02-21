@@ -23,7 +23,7 @@ export default function PlayerPage({
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [speed, setSpeed] = useState(1.0);
   const [tocItems, setTocItems] = useState<
-    { id: string; title: string }[]
+    { id: string; title: string; depth?: number }[]
   >([]);
   const [fontSize, setFontSize] = useState("18px");
 
@@ -184,7 +184,7 @@ export default function PlayerPage({
   );
 
   const handleChaptersExtracted = useCallback(
-    (chapters: { id: string; title: string }[]) => {
+    (chapters: { id: string; title: string; depth?: number }[]) => {
       setTocItems(chapters);
     },
     []
@@ -201,15 +201,19 @@ export default function PlayerPage({
 
   const handleTocItemClick = useCallback(
     (index: number) => {
-      // For now, scroll to the chapter element
-      const chapterEl = document.querySelector(
-        `[data-chapter="chapter-${index + 1}"]`
-      );
-      if (chapterEl) {
-        chapterEl.scrollIntoView({ behavior: "smooth", block: "start" });
+      const item = tocItems[index];
+      if (!item) return;
+
+      // Support "chapterId#anchor" format from navToc entries
+      const [chapterId, anchor] = item.id.split("#");
+      const el = anchor
+        ? document.querySelector(`[data-chapter="${chapterId}"] [id="${anchor}"]`)
+        : document.querySelector(`[data-chapter="${chapterId}"]`);
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "start" });
       }
     },
-    []
+    [tocItems]
   );
 
   // Generate TOC from plain text if none available
