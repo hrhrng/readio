@@ -1,8 +1,8 @@
 "use client";
 
-import { use, useCallback, useEffect, useState } from "react";
-import { useLibraryItem } from "@/lib/hooks";
-import { updateProgress } from "@/lib/api";
+import { use, useCallback, useEffect, useRef, useState } from "react";
+import { useLibraryItem, useVoices } from "@/lib/hooks";
+import { updateProgress, updateVoice } from "@/lib/api";
 import { Sentence } from "@/lib/types";
 import { useTTSPlayer } from "@/lib/use-tts-player";
 import { TopBar } from "@/components/reader/top-bar";
@@ -27,38 +27,67 @@ export default function PlayerPage({
   >([]);
   const [fontSize, setFontSize] = useState("18px");
 
+  // Per-item voice preference — initialized from backend item data
+  const [voice, setVoice] = useState<string | null>(null);
+  const voiceInitialized = useRef(false);
+
+  // Sync voice state from backend item data on first load
+  useEffect(() => {
+    if (item && !voiceInitialized.current) {
+      setVoice(item.voice);
+      voiceInitialized.current = true;
+    }
+  }, [item]);
+
+  const handleVoiceChange = useCallback(
+    (voiceId: string | null) => {
+      setVoice(voiceId);
+      // Persist to backend (fire-and-forget, same pattern as updateProgress)
+      updateVoice(id, voiceId).catch(() => {});
+    },
+    [id]
+  );
+
   const player = useTTSPlayer({
     itemId: id,
     sentences,
     speed,
-    prefetchWindow: 3,
+    voice,
   });
 
-  // Load font size from localStorage
+  // Resolve voice label for display in the PlayerBar
+  const { data: voiceData } = useVoices();
+  const currentVoiceLabel = (() => {
+    const effectiveId = voice ?? voiceData?.default_voice_id ?? null;
+    if (!effectiveId || !voiceData) return null;
+    const match = voiceData.voices.find((v) => v.voice_id === effectiveId);
+    return match?.label ?? null;
+  })();
+
+  // Load font size from localStorage and listen for changes
   useEffect(() => {
-    const saved = localStorage.getItem("readio-font-size");
     const sizeMap: Record<string, string> = {
       small: "16px",
       medium: "18px",
       large: "22px",
     };
-    if (saved && saved in sizeMap) {
-      setFontSize(sizeMap[saved]);
-    }
 
-    // Listen for changes
-    const handler = () => {
+    const applyFontSize = () => {
       const current = localStorage.getItem("readio-font-size");
       if (current && current in sizeMap) {
         setFontSize(sizeMap[current]);
       }
     };
-    window.addEventListener("storage", handler);
-    // Also poll for same-tab changes
-    const interval = setInterval(handler, 500);
+
+    // Apply saved value on mount
+    applyFontSize();
+
+    // Cross-tab changes fire "storage"; same-tab changes fire "readio-font-change"
+    window.addEventListener("storage", applyFontSize);
+    window.addEventListener("readio-font-change", applyFontSize);
     return () => {
-      window.removeEventListener("storage", handler);
-      clearInterval(interval);
+      window.removeEventListener("storage", applyFontSize);
+      window.removeEventListener("readio-font-change", applyFontSize);
     };
   }, []);
 
@@ -119,13 +148,23 @@ export default function PlayerPage({
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [player, speed]);
 
-  // Progress persistence
+  // Track latest progress values in a ref so the save callback is always fresh
+  // without re-running the effect (which was causing the PATCH storm).
+  const progressRef = useRef({ currentSentenceIndex: 0, sentencesLength: 0 });
   useEffect(() => {
-    if (!item || sentences.length === 0) return;
+    progressRef.current = {
+      currentSentenceIndex: player.currentSentenceIndex,
+      sentencesLength: sentences.length,
+    };
+  }, [player.currentSentenceIndex, sentences.length]);
 
+  // Progress persistence — only fires on page unload / component unmount
+  useEffect(() => {
     const saveProgress = () => {
+      const { currentSentenceIndex, sentencesLength } = progressRef.current;
+      if (sentencesLength === 0) return;
       const progress = Math.round(
-        (player.currentSentenceIndex / sentences.length) * 100
+        (currentSentenceIndex / sentencesLength) * 100
       );
       updateProgress(id, progress).catch(() => {});
     };
@@ -133,9 +172,9 @@ export default function PlayerPage({
     window.addEventListener("beforeunload", saveProgress);
     return () => {
       window.removeEventListener("beforeunload", saveProgress);
-      saveProgress();
+      saveProgress(); // save once on unmount
     };
-  }, [id, item, player.currentSentenceIndex, sentences.length]);
+  }, [id]);
 
   const handleSentencesExtracted = useCallback(
     (extracted: Sentence[]) => {
@@ -239,18 +278,21 @@ export default function PlayerPage({
         <SettingsPanel onClose={() => setSettingsOpen(false)} />
       )}
 
-      <div className="flex pt-12 pb-[72px] min-h-screen">
+      <div className="flex pt-12 h-screen overflow-hidden">
+        {/* TOC as fixed overlay — avoids reflowing the content area */}
         {tocOpen && (
-          <TOCPanel
-            items={tocItems}
-            onClose={() => setTocOpen(false)}
-            onItemClick={handleTocItemClick}
-          />
+          <div className="fixed left-0 top-12 bottom-[80px] z-30">
+            <TOCPanel
+              items={tocItems}
+              onClose={() => setTocOpen(false)}
+              onItemClick={handleTocItemClick}
+            />
+          </div>
         )}
 
         <div className="flex-1 flex justify-center overflow-y-auto">
           <div
-            className="max-w-prose w-full px-6 py-8"
+            className="max-w-prose w-full px-6 pt-8 pb-24"
             style={{ fontSize }}
           >
             <ContentRouter
@@ -274,6 +316,9 @@ export default function PlayerPage({
           player.setSpeed(s);
         }}
         totalSentences={sentences.length}
+        voice={voice}
+        onVoiceChange={handleVoiceChange}
+        voiceLabel={currentVoiceLabel}
       />
     </>
   );

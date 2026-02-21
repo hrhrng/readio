@@ -1,6 +1,8 @@
 import base64
 import json
+import logging
 import re
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -12,8 +14,71 @@ import httpx
 from app.core.settings import settings
 from app.tts.models import TTSRequest, TTSResult
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_MINIMAX_MODEL = 'speech-2.6-hd'
 DEFAULT_MINIMAX_VOICE = 'English_expressive_narrator'
+
+# In-memory cache for system voices fetched from MiniMax API.
+# Tuple of (timestamp, voice_list) — refreshed every hour.
+_voice_cache: tuple[float, list[dict[str, Any]]] | None = None
+_VOICE_CACHE_TTL = 3600  # 1 hour
+
+
+async def fetch_system_voices() -> list[dict[str, Any]]:
+    """Call MiniMax POST /v1/get_voice to retrieve all system voices.
+
+    Results are cached in memory for 1 hour to avoid redundant API calls.
+    Returns a list of dicts with keys: voice_id, voice_name, description.
+    """
+    global _voice_cache
+
+    # Return cached result if still fresh
+    if _voice_cache is not None:
+        cached_at, cached_voices = _voice_cache
+        if time.monotonic() - cached_at < _VOICE_CACHE_TTL:
+            return cached_voices
+
+    api_key = settings.minimax_api_key
+    if not api_key:
+        logger.warning('MINIMAX_API_KEY not set — returning empty voice list')
+        return []
+
+    base_url = settings.minimax_base_url.rstrip('/')
+    url = f'{base_url}/v1/get_voice'
+
+    # Append GroupId if configured (same pattern as TTS endpoint)
+    group_id = settings.minimax_group_id.strip()
+    if group_id:
+        url = _append_group_id(url, group_id)
+
+    headers = {
+        'Authorization': f'Bearer {api_key}',
+        'Content-Type': 'application/json',
+    }
+    body = {'voice_type': 'system'}
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(url, headers=headers, json=body)
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception:
+        logger.exception('Failed to fetch MiniMax system voices')
+        # Return stale cache if available, otherwise empty
+        if _voice_cache is not None:
+            return _voice_cache[1]
+        return []
+
+    # MiniMax response shape: {"system_voice": [{"voice_id": "...", ...}, ...]}
+    voices = data.get('system_voice', [])
+    if not isinstance(voices, list):
+        logger.error('Unexpected MiniMax get_voice response: %s', type(voices))
+        return []
+
+    _voice_cache = (time.monotonic(), voices)
+    logger.info('Fetched %d system voices from MiniMax API', len(voices))
+    return voices
 
 
 @dataclass
@@ -159,11 +224,13 @@ class MiniMaxProvider:
 
         audio_bytes = decode_audio_payload(audio_payload)
 
+        # MiniMax returns duration and sample rate in `extra_info`, not in `data`.
+        extra = data.get('extra_info') or {}
         return TTSResult(
             provider=self.id,
             audio_bytes=audio_bytes,
-            duration_ms=(data.get('data') or {}).get('audio_length_ms') if isinstance(data.get('data'), dict) else None,
-            sample_rate=(data.get('data') or {}).get('sample_rate') if isinstance(data.get('data'), dict) else None,
+            duration_ms=extra.get('audio_length'),
+            sample_rate=extra.get('audio_sample_rate'),
             trace_id=_extract_trace_id(data),
         )
 

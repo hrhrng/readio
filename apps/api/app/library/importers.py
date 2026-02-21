@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import mimetypes
 import posixpath
 import re
@@ -14,6 +15,8 @@ from xml.etree import ElementTree as ET
 import httpx
 
 from app.core.settings import settings
+
+logger = logging.getLogger(__name__)
 
 
 TITLE_PATTERN = re.compile(r'<title[^>]*>(.*?)</title>', flags=re.IGNORECASE | re.DOTALL)
@@ -189,29 +192,51 @@ def _extract_epub_manifest(
     if not chapter_names:
         chapter_names = fallback_names
 
+    # --- Cover detection (ordered by reliability) ---
     cover_image = ''
-    cover_id = ''
-    for node in root.findall('.//{*}metadata/{*}meta'):
-        if (node.attrib.get('name') or '').strip().lower() == 'cover':
-            cover_id = (node.attrib.get('content') or '').strip()
-            if cover_id:
-                break
 
-    if cover_id and cover_id in manifest:
-        cover_name = manifest[cover_id]['name']
+    # 1. EPUB 3 standard: manifest item with properties="cover-image" — most authoritative
+    for item in manifest.values():
+        if 'cover-image' not in item['properties']:
+            continue
+        media_type = item['media_type']
+        if not media_type.startswith('image/') and not item['name'].lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.gif')):
+            continue
         try:
             cover_image = _build_limited_data_url(
-                archive.read(cover_name),
-                cover_name,
+                archive.read(item['name']),
+                item['name'],
                 max_bytes=max_image_bytes,
             ) or ''
         except KeyError:
-            cover_image = ''
+            pass
+        if cover_image:
+            break
 
+    # 2. EPUB 2 standard: <meta name="cover" content="item-id"/> in OPF metadata
+    if not cover_image:
+        cover_id = ''
+        for node in root.findall('.//{*}metadata/{*}meta'):
+            if (node.attrib.get('name') or '').strip().lower() == 'cover':
+                cover_id = (node.attrib.get('content') or '').strip()
+                if cover_id:
+                    break
+
+        if cover_id and cover_id in manifest:
+            cover_name = manifest[cover_id]['name']
+            try:
+                cover_image = _build_limited_data_url(
+                    archive.read(cover_name),
+                    cover_name,
+                    max_bytes=max_image_bytes,
+                ) or ''
+            except KeyError:
+                cover_image = ''
+
+    # 3. Fallback: filename heuristic — look for image items with "cover" in the name
     if not cover_image:
         for item in manifest.values():
-            is_cover = 'cover-image' in item['properties'] or 'cover' in posixpath.basename(item['name']).lower()
-            if not is_cover:
+            if 'cover' not in posixpath.basename(item['name']).lower():
                 continue
             media_type = item['media_type']
             if not media_type.startswith('image/') and not item['name'].lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.gif')):
@@ -301,6 +326,7 @@ def _extract_epub_text(data: bytes) -> str:
             try:
                 html = archive.read(canonical_name).decode('utf-8', errors='ignore')
             except Exception:  # noqa: BLE001
+                logger.debug('epub: failed to read chapter %s, skipping', canonical_name, exc_info=True)
                 continue
 
             text = _extract_text(html)
@@ -343,7 +369,9 @@ def _extract_epub_text(data: bytes) -> str:
         'format': EPUB_FORMAT,
         'title': (manifest['title'] or '').strip(),
         'author': (manifest['author'] or '').strip() or None,
-        'cover_image': manifest['cover_image'] or first_cover,
+        # Prefer the first chapter image (the actual book cover from the cover XHTML page)
+        # over the OPF-declared cover, which is often a publisher logo.
+        'cover_image': first_cover or manifest['cover_image'],
         'chapters': chapter_entries,
     }
     return json.dumps(payload, ensure_ascii=False)
@@ -352,6 +380,7 @@ def _extract_epub_text(data: bytes) -> str:
 def extract_uploaded_document(filename: str, data: bytes) -> dict[str, str]:
     suffix = Path(filename).suffix.lower()
     stem = Path(filename).stem.strip() or 'Untitled'
+    logger.info('extract_uploaded_document: filename=%s suffix=%s size=%d bytes', filename, suffix, len(data))
 
     if suffix == '.txt':
         text = _decode_text_bytes(data)
@@ -365,25 +394,39 @@ def extract_uploaded_document(filename: str, data: bytes) -> dict[str, str]:
     elif suffix == '.epub':
         text = _extract_epub_text(data)
         doc_type = 'epub'
+        # Parse the EPUB JSON payload to extract title and cover_image
+        epub_cover_image = None
         try:
             epub_payload = json.loads(text)
             epub_title = epub_payload.get('title')
             if isinstance(epub_title, str) and epub_title.strip():
                 stem = epub_title.strip()
+            epub_cover = epub_payload.get('cover_image')
+            if isinstance(epub_cover, str) and epub_cover.strip():
+                epub_cover_image = epub_cover.strip()
         except Exception:  # noqa: BLE001
-            pass
+            logger.warning('epub: failed to parse internal JSON payload for %s', filename, exc_info=True)
     else:
-        raise ValueError('unsupported file type, expected txt/pdf/docx/epub')
+        raise ValueError(f'unsupported file type "{suffix}", expected .txt/.pdf/.docx/.epub')
 
     text = text.strip()
     if not text:
-        raise ValueError('no readable content extracted')
+        raise ValueError(f'no readable content extracted from "{filename}" (type={doc_type})')
 
-    return {
+    # epub_cover_image is only set in the epub branch; default to None for others
+    cover = epub_cover_image if doc_type == 'epub' else None
+    logger.info(
+        'extract_uploaded_document: success — title=%r type=%s content_len=%d cover=%s',
+        stem, doc_type, len(text), 'yes' if cover else 'no',
+    )
+    result = {
         'title': stem,
         'content': text,
         'type': doc_type,
     }
+    if cover:
+        result['cover_image'] = cover
+    return result
 
 
 async def fetch_url_document(url: str) -> dict[str, str]:

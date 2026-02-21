@@ -53,6 +53,33 @@ class LibraryStore:
                 connection.execute('ALTER TABLE library_items ADD COLUMN file_path TEXT DEFAULT NULL')
                 connection.commit()
 
+            if 'cover_image' not in columns:
+                connection.execute('ALTER TABLE library_items ADD COLUMN cover_image TEXT DEFAULT NULL')
+                connection.commit()
+
+                # Backfill: extract cover_image from content JSON for existing EPUB items
+                import json as _json
+                rows = connection.execute(
+                    "SELECT id, content FROM library_items WHERE type = 'epub'"
+                ).fetchall()
+                for row in rows:
+                    try:
+                        payload = _json.loads(row['content'])
+                        cover = payload.get('cover_image')
+                        if cover:
+                            connection.execute(
+                                'UPDATE library_items SET cover_image = ? WHERE id = ?',
+                                (cover, row['id']),
+                            )
+                    except Exception:  # noqa: BLE001
+                        pass
+                connection.commit()
+
+            # Migrate: add voice column for per-item TTS voice preference
+            if 'voice' not in columns:
+                connection.execute('ALTER TABLE library_items ADD COLUMN voice TEXT DEFAULT NULL')
+                connection.commit()
+
         self._seed_defaults_if_needed()
 
     def _seed_defaults_if_needed(self) -> None:
@@ -187,7 +214,7 @@ class LibraryStore:
 
         count_query = f'SELECT COUNT(*) AS count FROM library_items WHERE {where_sql}'
         data_query = f'''
-            SELECT id, title, content, type, progress, date, category, folder_id, source, file_path
+            SELECT id, title, content, type, progress, date, category, folder_id, source, file_path, cover_image, voice
             FROM library_items
             WHERE {where_sql}
             ORDER BY {order_column} {order_direction}
@@ -205,7 +232,7 @@ class LibraryStore:
         with self._connect() as connection:
             row = connection.execute(
                 '''
-                SELECT id, title, content, type, progress, date, category, folder_id, source, file_path
+                SELECT id, title, content, type, progress, date, category, folder_id, source, file_path, cover_image, voice
                 FROM library_items
                 WHERE id = ?
                 ''',
@@ -229,14 +256,16 @@ class LibraryStore:
             folder_id=payload.folder_id,
             source=payload.source.strip(),
             file_path=payload.file_path,
+            cover_image=payload.cover_image,
+            voice=None,
         )
 
         with self._connect() as connection:
             connection.execute(
                 '''
                 INSERT INTO library_items (
-                    id, title, content, type, progress, date, category, folder_id, source, created_at, file_path
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    id, title, content, type, progress, date, category, folder_id, source, created_at, file_path, cover_image, voice
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''',
                 (
                     item.id,
@@ -250,6 +279,8 @@ class LibraryStore:
                     item.source,
                     now.isoformat() + 'Z',
                     item.file_path,
+                    item.cover_image,
+                    item.voice,
                 ),
             )
             connection.commit()
@@ -262,6 +293,16 @@ class LibraryStore:
             cursor = connection.execute(
                 'UPDATE library_items SET progress = ? WHERE id = ?',
                 (clamped, item_id),
+            )
+            connection.commit()
+            return cursor.rowcount > 0
+
+    def update_voice(self, item_id: str, voice: str | None) -> bool:
+        """Persist the user's per-item TTS voice selection (None = use system default)."""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                'UPDATE library_items SET voice = ? WHERE id = ?',
+                (voice, item_id),
             )
             connection.commit()
             return cursor.rowcount > 0

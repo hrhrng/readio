@@ -22,7 +22,7 @@ export function TOCPanel({
 }: TOCPanelProps) {
   if (items.length === 0) {
     return (
-      <aside className="w-60 flex-shrink-0 bg-surface-sidebar border-r border-border overflow-y-auto">
+      <aside className="w-60 h-full bg-surface-sidebar border-r border-border overflow-y-auto shadow-lg">
         <div className="flex items-center justify-between p-4 border-b border-border">
           <h2 className="text-sm font-semibold text-text-primary">Contents</h2>
           <button
@@ -41,7 +41,7 @@ export function TOCPanel({
   }
 
   return (
-    <aside className="w-60 flex-shrink-0 bg-surface-sidebar border-r border-border overflow-y-auto">
+    <aside className="w-60 h-full bg-surface-sidebar border-r border-border overflow-y-auto shadow-lg">
       <div className="flex items-center justify-between p-4 border-b border-border">
         <h2 className="text-sm font-semibold text-text-primary">Contents</h2>
         <button

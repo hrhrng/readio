@@ -1,9 +1,12 @@
 import asyncio
 import base64
 import json
+import logging
 import re
 import uuid
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, Response, UploadFile
 from fastapi.responses import FileResponse
@@ -30,7 +33,9 @@ from app.tts.models import (
     TTSRequest,
 )
 from app.tts.providers.edge import EdgeTTSProvider
+from app.tts.providers.minimax import DEFAULT_MINIMAX_VOICE, fetch_system_voices
 from app.tts.registry import build_tts_router
+from app.api.text_utils import contains_cjk, split_sentences, split_cjk_clauses
 
 
 router = APIRouter()
@@ -61,12 +66,8 @@ def _split_text_for_stream(text: str, max_chars: int) -> list[str]:
     if not normalized:
         return []
 
-    # Keep natural sentence boundaries first, then enforce hard length limits.
-    base_chunks = [
-        chunk.strip()
-        for chunk in re.split(r'(?<=[.!?。！？])\s+|\n+', normalized)
-        if chunk.strip()
-    ]
+    # CJK-aware sentence splitting (handles 。！？ without trailing whitespace)
+    base_chunks = split_sentences(normalized)
 
     out: list[str] = []
     for chunk in base_chunks:
@@ -74,6 +75,13 @@ def _split_text_for_stream(text: str, max_chars: int) -> list[str]:
             out.append(chunk)
             continue
 
+        # CJK text: split on clause-level punctuation (，、；：) instead of
+        # hard character slicing which would break mid-sentence
+        if contains_cjk(chunk):
+            out.extend(split_cjk_clauses(chunk, max_chars))
+            continue
+
+        # Latin/other text: split on word boundaries
         words = chunk.split()
         if len(words) <= 1:
             out.extend(chunk[i : i + max_chars] for i in range(0, len(chunk), max_chars))
@@ -240,14 +248,127 @@ async def update_library_item_progress(item_id: str, payload: ProgressUpdateRequ
     return {'status': 'ok'}
 
 
+class VoiceUpdateRequest(BaseModel):
+    voice: str | None = None
+
+
+@router.patch('/api/library/items/{item_id}/voice')
+async def update_library_item_voice(item_id: str, payload: VoiceUpdateRequest) -> dict[str, str]:
+    updated = await asyncio.to_thread(library_store.update_voice, item_id, payload.voice)
+    if not updated:
+        raise HTTPException(status_code=404, detail='item not found')
+    return {'status': 'ok'}
+
+
+# ---------------------------------------------------------------------------
+# TTS voice catalogue — dynamically fetched from MiniMax API
+# ---------------------------------------------------------------------------
+
+class VoiceInfo(BaseModel):
+    voice_id: str
+    label: str
+    language: str       # "en" | "zh" | "other"
+    gender: str | None  # "male" | "female" | None
+    description: str | None
+
+
+class VoiceListResponse(BaseModel):
+    voices: list[VoiceInfo]
+    default_voice_id: str
+
+
+# Keywords in voice_id that imply female gender
+_FEMALE_KEYWORDS = {'girl', 'woman', 'lady', 'female', 'bestie', 'gentle_woman'}
+# Keywords in voice_id that imply male gender
+_MALE_KEYWORDS = {'man', 'boy', 'guy', 'male'}
+
+
+def _parse_language(voice_id: str) -> str:
+    """Infer language from MiniMax voice_id prefix convention."""
+    vid_lower = voice_id.lower()
+    if vid_lower.startswith('english_'):
+        return 'en'
+    if vid_lower.startswith('chinese'):
+        return 'zh'
+    return 'other'
+
+
+def _parse_gender(voice_id: str) -> str | None:
+    """Infer gender from keywords in the voice_id."""
+    # Split on underscores and check individual tokens against keyword sets
+    tokens = {t.lower() for t in voice_id.replace('(', '_').replace(')', '_').split('_') if t}
+    if tokens & _FEMALE_KEYWORDS:
+        return 'female'
+    if tokens & _MALE_KEYWORDS:
+        return 'male'
+    return None
+
+
+def _build_label(voice_id: str, voice_name: str | None) -> str:
+    """Build a human-readable label from voice metadata.
+
+    Prefer voice_name if available; otherwise derive from voice_id by
+    stripping the language prefix and replacing underscores with spaces.
+    """
+    if voice_name:
+        return voice_name
+
+    # Strip language prefix (e.g. "English_" or "Chinese (Mandarin)_")
+    label = re.sub(r'^(English|Chinese\s*\([^)]*\))_', '', voice_id)
+    return label.replace('_', ' ')
+
+
+def _convert_system_voice(raw: dict) -> VoiceInfo:
+    """Convert a raw MiniMax system voice dict into our VoiceInfo model."""
+    voice_id = raw.get('voice_id', '')
+    voice_name = raw.get('voice_name') or None
+    desc_list = raw.get('description', [])
+
+    # MiniMax description field is a list of strings; join into one line
+    description = '; '.join(desc_list) if isinstance(desc_list, list) and desc_list else None
+
+    return VoiceInfo(
+        voice_id=voice_id,
+        label=_build_label(voice_id, voice_name),
+        language=_parse_language(voice_id),
+        gender=_parse_gender(voice_id),
+        description=description,
+    )
+
+
+@router.get('/api/tts/voices', response_model=VoiceListResponse)
+async def list_voices() -> VoiceListResponse:
+    raw_voices = await fetch_system_voices()
+
+    # Convert and filter to English + Chinese only (primary reading languages)
+    voices: list[VoiceInfo] = []
+    for raw in raw_voices:
+        info = _convert_system_voice(raw)
+        if info.language in ('en', 'zh'):
+            voices.append(info)
+
+    # Sort: English first, then Chinese, alphabetical within each group
+    lang_order = {'en': 0, 'zh': 1}
+    voices.sort(key=lambda v: (lang_order.get(v.language, 99), v.label))
+
+    return VoiceListResponse(
+        voices=voices,
+        default_voice_id=settings.minimax_voice_id or DEFAULT_MINIMAX_VOICE,
+    )
+
+
 @router.post('/api/library/import/url', response_model=LibraryItem, status_code=201)
 async def import_library_url(payload: ImportUrlRequest) -> LibraryItem:
+    logger.info('importing url=%s', payload.url)
     try:
         document = await fetch_url_document(str(payload.url))
     except ValueError as exc:
+        logger.warning('url import validation error: url=%s — %s', payload.url, exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f'failed to fetch url: {exc}') from exc
+        logger.exception('url import failed: url=%s', payload.url)
+        exc_type = type(exc).__name__
+        raise HTTPException(status_code=502, detail=f'failed to fetch url ({exc_type}): {exc}') from exc
 
     title = (payload.title or document.get('title') or str(payload.url)).strip()
     content = document.get('content', '').strip()
@@ -273,6 +394,7 @@ async def import_library_file(
     category: str = Form('imported'),
     folder_id: str = Form('f1'),
     title: str | None = Form(None),
+    cover_image: str | None = Form(None),
 ) -> LibraryItem:
     filename = file.filename or 'upload.txt'
     try:
@@ -280,18 +402,30 @@ async def import_library_file(
             file,
             max_bytes=settings.library_import_max_bytes,
         )
+        logger.info('importing file=%s size=%d bytes', filename, len(raw))
         document = await asyncio.wait_for(
             asyncio.to_thread(extract_uploaded_document, filename, raw),
             timeout=settings.library_import_timeout_seconds,
         )
     except TimeoutError as exc:
-        raise HTTPException(status_code=504, detail='file parsing timed out, please try a smaller file') from exc
+        logger.warning('import timed out: file=%s size=%s', filename, 'unknown')
+        raise HTTPException(
+            status_code=504,
+            detail=f'file parsing timed out after {settings.library_import_timeout_seconds}s — try a smaller file',
+        ) from exc
     except ValueError as exc:
+        logger.warning('import validation error: file=%s — %s', filename, exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f'failed to parse file: {exc}') from exc
+        # Log the full traceback so we can actually debug server-side
+        logger.exception('import failed: file=%s', filename)
+        exc_type = type(exc).__name__
+        raise HTTPException(
+            status_code=500,
+            detail=f'failed to parse "{filename}" ({exc_type}): {exc}',
+        ) from exc
     finally:
         await file.close()
 
@@ -306,6 +440,10 @@ async def import_library_file(
         item_id = f'doc-{uuid4().hex[:12]}'
         file_path = save_file(item_id, filename, raw)
 
+    # Prefer the frontend-provided cover (extracted via epub.js, no size limit)
+    # over the backend's ZipFile-based extraction which is size-limited.
+    resolved_cover = cover_image or document.get('cover_image')
+
     create_req = CreateLibraryItemRequest(
         title=item_title,
         content=document['content'],
@@ -314,6 +452,7 @@ async def import_library_file(
         folder_id=folder_id,
         source=f'upload:{filename}',
         file_path=file_path,
+        cover_image=resolved_cover,
     )
     created = library_store.create_item(create_req)
     return created

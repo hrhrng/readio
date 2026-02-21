@@ -12,6 +12,8 @@ export interface LibraryItem {
   folder_id: string;
   source: string;
   file_path: string | null;
+  cover_image: string | null;
+  voice: string | null;
 }
 
 export interface LibraryItemsResponse {
@@ -50,7 +52,21 @@ export interface TTSJobCreateParams {
   request: {
     text: string;
     speed?: number;
+    voice?: string;
   };
+}
+
+export interface VoiceInfo {
+  voice_id: string;
+  label: string;
+  language: string;
+  gender: string | null;
+  description: string | null;
+}
+
+export interface VoiceListResponse {
+  voices: VoiceInfo[];
+  default_voice_id: string;
 }
 
 export interface TTSJobStatusResponse {

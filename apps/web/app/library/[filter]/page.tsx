@@ -5,6 +5,7 @@ import { useLibraryItems } from "@/lib/hooks";
 import { BookGrid } from "@/components/book-grid";
 import { EmptyState } from "@/components/empty-state";
 import { BookOpen, Clock, CheckCircle } from "lucide-react";
+import { SortSelect } from "@/components/sort-select";
 
 const filterConfig: Record<
   string,
@@ -62,17 +63,7 @@ export default function LibraryFilterPage({
         <h1 className="text-3xl font-bold font-serif text-text-primary">
           {config.title}
         </h1>
-        <select
-          value={sortBy}
-          onChange={(e) => setSortBy(e.target.value)}
-          className="rounded-lg bg-surface-card border border-border px-3 py-1.5 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-accent/50"
-        >
-          {sortOptions.map((opt) => (
-            <option key={opt.value} value={opt.value}>
-              {opt.label}
-            </option>
-          ))}
-        </select>
+        <SortSelect value={sortBy} onChange={setSortBy} options={sortOptions} />
       </div>
 
       {isLoading ? (

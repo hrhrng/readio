@@ -3,6 +3,7 @@ import {
   LibraryItemsResponse,
   TTSJobCreateParams,
   TTSJobStatusResponse,
+  VoiceListResponse,
 } from "./types";
 
 const BASE = "";
@@ -10,6 +11,47 @@ const BASE = "";
 // Direct backend URL for large uploads (bypasses Next.js proxy 10MB limit)
 const API_DIRECT =
   process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
+/**
+ * Extract cover image from an EPUB file using epub.js.
+ *
+ * epub.js reliably locates covers across EPUB 2/3 formats via `book.coverUrl()`,
+ * which is more reliable than backend ZipFile-based parsing and has no size limit.
+ * The returned data URL is sent as an extra form field during upload so the
+ * backend can use it directly instead of its own (size-limited) extraction.
+ */
+async function extractEpubCover(file: File): Promise<string | null> {
+  try {
+    const ePub = (await import("epubjs")).default;
+    const arrayBuffer = await file.arrayBuffer();
+    const book = ePub(arrayBuffer);
+    await book.ready;
+
+    const coverUrl = await book.coverUrl();
+    if (!coverUrl) {
+      book.destroy();
+      return null;
+    }
+
+    // Convert the blob URL produced by epub.js into a base64 data URL
+    // that the backend can store directly.
+    const response = await fetch(coverUrl);
+    const blob = await response.blob();
+    const dataUrl = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => resolve(reader.result as string);
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+
+    URL.revokeObjectURL(coverUrl);
+    book.destroy();
+    return dataUrl;
+  } catch {
+    // Cover extraction failure should never block the upload
+    return null;
+  }
+}
 
 interface FetchItemsParams {
   category?: string;
@@ -68,6 +110,19 @@ export async function importFile(
   formData.append("folder_id", options.folder_id ?? "f1");
   formData.append("category", options.category ?? "imported");
   if (options.title) formData.append("title", options.title);
+
+  // For EPUB files, extract the cover on the frontend using epub.js — it's more
+  // reliable than backend ZipFile parsing and has no size limit.
+  if (file.name.toLowerCase().endsWith(".epub")) {
+    try {
+      const cover = await extractEpubCover(file);
+      if (cover) {
+        formData.append("cover_image", cover);
+      }
+    } catch {
+      // Never block the upload on cover extraction failure
+    }
+  }
 
   const res = await fetch(`${API_DIRECT}/api/library/import/file`, {
     method: "POST",
@@ -157,4 +212,21 @@ export async function updateProgress(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ progress }),
   });
+}
+
+export async function updateVoice(
+  id: string,
+  voice: string | null
+): Promise<void> {
+  await fetch(`${BASE}/api/library/items/${id}/voice`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ voice }),
+  });
+}
+
+export async function fetchVoices(): Promise<VoiceListResponse> {
+  const res = await fetch(`${BASE}/api/tts/voices`);
+  if (!res.ok) throw new Error(`Failed to fetch voices: ${res.status}`);
+  return res.json();
 }

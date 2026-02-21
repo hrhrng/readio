@@ -18,6 +18,8 @@ class LibraryItem(BaseModel):
     folder_id: str
     source: str
     file_path: str | None = None
+    cover_image: str | None = None
+    voice: str | None = None
 
 
 class LibraryItemsResponse(BaseModel):
@@ -38,6 +40,7 @@ class CreateLibraryItemRequest(BaseModel):
     progress: int = Field(default=0, ge=0, le=100)
     date: str | None = None
     file_path: str | None = None
+    cover_image: str | None = None
 
 
 class ImportUrlRequest(BaseModel):

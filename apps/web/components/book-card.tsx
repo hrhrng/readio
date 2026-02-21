@@ -9,7 +9,7 @@ import { deleteItem } from "@/lib/api";
 import { ConfirmDialog } from "./confirm-dialog";
 
 const typeGradients: Record<string, string> = {
-  web: "from-blue-900 to-indigo-800",
+  web: "from-emerald-900 to-green-800",
   pdf: "from-red-900 to-orange-800",
   epub: "from-emerald-900 to-teal-800",
   txt: "from-gray-700 to-gray-600",
@@ -42,6 +42,29 @@ function CoverPlaceholder({
       </span>
     </div>
   );
+}
+
+/**
+ * Renders the book's actual cover image when available (e.g. EPUB cover),
+ * falling back to the gradient-based CoverPlaceholder for non-EPUB items.
+ */
+function BookCover({
+  item,
+  className,
+}: {
+  item: LibraryItem;
+  className?: string;
+}) {
+  if (item.cover_image) {
+    return (
+      <img
+        src={item.cover_image}
+        alt={item.title}
+        className={`object-cover ${className}`}
+      />
+    );
+  }
+  return <CoverPlaceholder item={item} className={className} />;
 }
 
 interface BookCardProps {
@@ -88,7 +111,7 @@ export function BookCard({ item, variant = "grid" }: BookCardProps) {
             onClick={handleClick}
             className="flex items-center gap-4 flex-1 min-w-0 cursor-pointer"
           >
-            <CoverPlaceholder
+            <BookCover
               item={item}
               className="w-[60px] h-[80px] rounded-lg shrink-0"
             />
@@ -168,7 +191,7 @@ export function BookCard({ item, variant = "grid" }: BookCardProps) {
           className="flex flex-col text-left cursor-pointer"
         >
           <div className="relative rounded-xl overflow-hidden shadow-sm dark:shadow-none transition-shadow group-hover:shadow-md dark:group-hover:shadow-none">
-            <CoverPlaceholder item={item} className="w-full aspect-[3/4]" />
+            <BookCover item={item} className="w-full aspect-[3/4]" />
             {/* NEW badge */}
             {status === "new" && (
               <span className="absolute top-2 right-2 bg-badge-new text-white text-[10px] font-bold px-1.5 py-0.5 rounded">

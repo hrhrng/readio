@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import {
   Search,
   Home,
@@ -13,9 +13,11 @@ import {
   Type,
   Plus,
   Upload,
+  ChevronUp,
 } from "lucide-react";
 import { SidebarLink } from "./sidebar-link";
-import { ThemeToggle } from "./theme-toggle";
+import { UserPopover } from "./user-popover";
+import { SettingsDialog } from "./settings-dialog";
 import { ImportDialog } from "./import-dialog";
 
 function SidebarSection({
@@ -37,6 +39,9 @@ function SidebarSection({
 
 export function Sidebar() {
   const [importOpen, setImportOpen] = useState(false);
+  const [popoverOpen, setPopoverOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const avatarRef = useRef<HTMLButtonElement>(null);
 
   return (
     <>
@@ -92,19 +97,38 @@ export function Sidebar() {
           </button>
         </SidebarSection>
 
-        {/* Bottom area */}
-        <div className="mt-auto pt-4 flex flex-col gap-3">
-          <ThemeToggle />
-          <div className="flex items-center gap-3 px-3 py-2">
-            <div className="w-8 h-8 rounded-full bg-surface-hover flex items-center justify-center text-text-secondary text-xs font-medium">
-              U
+        {/* Bottom area — avatar button + popover (portal-based) */}
+        <div className="mt-auto pt-4">
+          <UserPopover
+            open={popoverOpen}
+            onClose={() => setPopoverOpen(false)}
+            onOpenSettings={() => {
+              setPopoverOpen(false);
+              setSettingsOpen(true);
+            }}
+            triggerRef={avatarRef}
+          />
+          <button
+            ref={avatarRef}
+            onClick={() => setPopoverOpen((v) => !v)}
+            className="flex items-center gap-3 w-full rounded-lg px-3 py-2 hover:bg-surface-hover transition-colors cursor-pointer"
+          >
+            <div className="w-8 h-8 rounded-full bg-surface-hover flex items-center justify-center text-text-secondary text-xs font-bold">
+              R
             </div>
-            <span className="text-sm text-text-secondary">User</span>
-          </div>
+            <span className="flex-1 text-left text-sm text-text-secondary truncate">
+              reader
+            </span>
+            <ChevronUp
+              size={14}
+              className={`text-text-tertiary transition-transform ${popoverOpen ? "rotate-180" : ""}`}
+            />
+          </button>
         </div>
       </nav>
 
       <ImportDialog open={importOpen} onClose={() => setImportOpen(false)} />
+      <SettingsDialog open={settingsOpen} onClose={() => setSettingsOpen(false)} />
     </>
   );
 }

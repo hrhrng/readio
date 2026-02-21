@@ -1,6 +1,11 @@
 import { Sentence } from "./types";
 
-const BOUNDARY = /(?<=[.!?\u3002\uff01\uff1f])\s+/;
+// Two-branch sentence boundary regex:
+//   Branch 1 (English): lookbehind .!? + consume whitespace
+//   Branch 2 (CJK): lookbehind 。！？ + zero-width lookahead for CJK/word char
+//     (positive lookahead avoids splitting before closing quotes like "你好。"她说)
+export const BOUNDARY =
+  /(?<=[.!?])\s+|(?<=[\u3002\uff01\uff1f])(?=[\u2E80-\u9FFF\uAC00-\uD7AF\uF900-\uFAFF\w])/;
 
 export function extractSentencesFromText(text: string): Sentence[] {
   const sentences: Sentence[] = [];

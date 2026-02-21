@@ -2,8 +2,8 @@
 
 import useSWR from "swr";
 import { useEffect, useState } from "react";
-import { fetchItems, fetchItem, searchItems } from "./api";
-import { LibraryItem, LibraryItemsResponse } from "./types";
+import { fetchItems, fetchItem, searchItems, fetchVoices } from "./api";
+import { LibraryItem, LibraryItemsResponse, VoiceListResponse } from "./types";
 
 interface UseLibraryItemsParams {
   category?: string;
@@ -25,8 +25,15 @@ export function useLibraryItems(params: UseLibraryItemsParams = {}) {
 
 export function useLibraryItem(id: string | null) {
   return useSWR<LibraryItem>(id ? ["library-item", id] : null, () =>
-    fetchItem(id!)
+    fetchItem(id!),
+    { revalidateOnFocus: false }
   );
+}
+
+export function useVoices() {
+  return useSWR<VoiceListResponse>("tts-voices", fetchVoices, {
+    revalidateOnFocus: false,
+  });
 }
 
 export function useSearchItems(query: string) {

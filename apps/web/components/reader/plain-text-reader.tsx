@@ -1,8 +1,72 @@
 "use client";
 
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, memo } from "react";
 import { extractSentencesFromText } from "@/lib/sentences";
 import { Sentence } from "@/lib/types";
+import { tokenize } from "@/lib/cjk";
+
+// ---------------------------------------------------------------------------
+// PlainTextSentenceSpan — per-sentence rendering with word-level highlighting.
+//
+// Wrapped in React.memo so inactive sentences skip re-renders during TTS
+// playback (ontimeupdate fires 4-10x/sec, but only 1 sentence is active).
+// ---------------------------------------------------------------------------
+
+const PlainTextSentenceSpan = memo(function PlainTextSentenceSpan({
+  sentence,
+  isActive,
+  wordProgress,
+  onClick,
+}: {
+  sentence: Sentence;
+  isActive: boolean;
+  wordProgress: number;
+  onClick: (index: number) => void;
+}) {
+  const words = useMemo(() => tokenize(sentence.text), [sentence.text]);
+  const wordCount = useMemo(
+    () => words.filter((w) => w.trim()).length,
+    [words]
+  );
+  const highlightedWordIdx = isActive
+    ? Math.floor(wordProgress * wordCount)
+    : -1;
+
+  let wordIdx = 0;
+  return (
+    <span
+      data-sentence-id={sentence.index}
+      onClick={() => onClick(sentence.index)}
+      className={`cursor-pointer transition-colors duration-200 rounded-sm ${
+        isActive ? "bg-highlight-sentence" : "hover:bg-surface-hover"
+      }`}
+    >
+      {words.map((word, wIdx) => {
+        if (!word.trim()) {
+          return <span key={wIdx}>{word}</span>;
+        }
+        const thisWordIdx = wordIdx++;
+        const isHighlightedWord = isActive && thisWordIdx === highlightedWordIdx;
+        return (
+          <span
+            key={wIdx}
+            className={
+              isHighlightedWord ? "text-highlight-word font-semibold" : ""
+            }
+          >
+            {word}
+          </span>
+        );
+      })}
+    </span>
+  );
+}, (prevProps, nextProps) => {
+  // onClick is ref-stable (useTTSPlayer stores mutable values in refs),
+  // so no identity check needed here.
+  if (!prevProps.isActive && !nextProps.isActive) return true;   // both inactive → skip
+  if (prevProps.isActive !== nextProps.isActive) return false;    // active state changed → re-render
+  return prevProps.wordProgress === nextProps.wordProgress;       // both active → compare progress
+});
 
 interface PlainTextReaderProps {
   content: string;
@@ -58,51 +122,15 @@ export function PlainTextReader({
     <div className="space-y-6">
       {paragraphs.map((paraSentences, pIdx) => (
         <p key={pIdx} className="text-lg leading-relaxed text-text-primary">
-          {paraSentences.map((sentence) => {
-            const isActive = sentence.index === currentSentenceIndex;
-            const words = sentence.text.split(/(\s+)/);
-            const wordCount = words.filter((w) => w.trim()).length;
-            const highlightedWordIdx = isActive
-              ? Math.floor(currentWordProgress * wordCount)
-              : -1;
-
-            let wordIdx = 0;
-            return (
-              <span
-                key={sentence.index}
-                data-sentence-id={sentence.index}
-                onClick={() => onSentenceClick(sentence.index)}
-                className={`cursor-pointer transition-colors duration-200 rounded-sm ${
-                  isActive
-                    ? "bg-highlight-sentence"
-                    : "hover:bg-surface-hover"
-                }`}
-              >
-                {words.map((word, wIdx) => {
-                  if (!word.trim()) {
-                    return (
-                      <span key={wIdx}>{word}</span>
-                    );
-                  }
-                  const thisWordIdx = wordIdx++;
-                  const isHighlightedWord =
-                    isActive && thisWordIdx === highlightedWordIdx;
-                  return (
-                    <span
-                      key={wIdx}
-                      className={
-                        isHighlightedWord
-                          ? "text-highlight-word font-semibold"
-                          : ""
-                      }
-                    >
-                      {word}
-                    </span>
-                  );
-                })}
-              </span>
-            );
-          })}
+          {paraSentences.map((sentence) => (
+            <PlainTextSentenceSpan
+              key={sentence.index}
+              sentence={sentence}
+              isActive={sentence.index === currentSentenceIndex}
+              wordProgress={currentWordProgress}
+              onClick={onSentenceClick}
+            />
+          ))}
         </p>
       ))}
     </div>

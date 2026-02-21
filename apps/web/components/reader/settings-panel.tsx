@@ -33,6 +33,8 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
       "--reader-font-size",
       FONT_SIZE_MAP[size]
     );
+    // Notify same-tab listeners (storage event only fires cross-tab)
+    window.dispatchEvent(new CustomEvent("readio-font-change"));
   };
 
   return (
