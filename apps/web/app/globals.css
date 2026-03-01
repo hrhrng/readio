@@ -14,6 +14,7 @@
   --color-badge-new: var(--badge-new);
   --color-highlight-sentence: var(--highlight-sentence);
   --color-highlight-word: var(--highlight-word);
+  --color-highlight-word-bg: var(--highlight-word-bg);
 }
 
 :root {
@@ -28,8 +29,9 @@
   --accent: #6B8F71;
   --border: #E5E5EA;
   --badge-new: #6B8F71;
-  --highlight-sentence: rgba(107, 143, 113, 0.08);
-  --highlight-word: #6B8F71;
+  --highlight-sentence: color-mix(in srgb, var(--accent) 15%, #FFFFFF);
+  --highlight-word: inherit;
+  --highlight-word-bg: color-mix(in srgb, var(--accent) 40%, #FFFFFF);
 }
 
 .dark {
@@ -44,8 +46,9 @@
   --accent: #7EC8A0;
   --border: #38383A;
   --badge-new: #7EC8A0;
-  --highlight-sentence: rgba(126, 200, 160, 0.15);
-  --highlight-word: #7EC8A0;
+  --highlight-sentence: color-mix(in srgb, var(--accent) 20%, #1C1C1E);
+  --highlight-word: inherit;
+  --highlight-word-bg: color-mix(in srgb, var(--accent) 45%, #1C1C1E);
 }
 
 body {

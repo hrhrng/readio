@@ -4,6 +4,8 @@ import { useTheme } from "next-themes";
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Sun, Moon, Monitor, Check, X } from "lucide-react";
+import { useSettings } from "@/lib/hooks";
+import { applyAccentColor, applyFontSize } from "@/lib/settings-utils";
 
 interface SettingsDialogProps {
   open: boolean;
@@ -18,7 +20,7 @@ const NAV_ITEMS = [
 
 type SectionId = (typeof NAV_ITEMS)[number]["id"];
 
-const ACCENT_PRESETS = [
+export const ACCENT_PRESETS = [
   { name: "Sage", light: "#6B8F71", dark: "#7EC8A0" },
   { name: "Blue", light: "#4A7FBF", dark: "#6EB5FF" },
   { name: "Amber", light: "#B8860B", dark: "#E8B84B" },
@@ -29,14 +31,14 @@ const ACCENT_PRESETS = [
 /**
  * Full-screen modal overlay for settings.
  * Follows the same left-nav + right-content layout as Claude's settings dialog.
- * Closes on ESC or clicking the backdrop.
+ * All settings are persisted to the backend via the useSettings hook.
  */
 export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
   const overlayRef = useRef<HTMLDivElement>(null);
   const { theme, setTheme } = useTheme();
   const [mounted, setMounted] = useState(false);
   const [activeSection, setActiveSection] = useState<SectionId>("appearance");
-  const [accentIndex, setAccentIndex] = useState(0);
+  const { settings, updateSetting } = useSettings();
 
   useEffect(() => setMounted(true), []);
 
@@ -51,6 +53,11 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
   }, [open, onClose]);
 
   if (!open || !mounted) return null;
+
+  // Derive current values from persisted settings (with sensible defaults)
+  const accentIndex = parseInt(settings.accent_color ?? "0", 10);
+  const fontSize = parseInt(settings.font_size ?? "18", 10);
+  const ttsSpeed = parseFloat(settings.tts_speed ?? "1.0");
 
   return createPortal(
     <div
@@ -102,10 +109,25 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
                 theme={theme}
                 setTheme={setTheme}
                 accentIndex={accentIndex}
-                setAccentIndex={setAccentIndex}
+                onAccentChange={(i) => {
+                  updateSetting("accent_color", String(i));
+                  applyAccentColor(i);
+                }}
               />
             )}
-            {activeSection === "reading" && <ReadingSection />}
+            {activeSection === "reading" && (
+              <ReadingSection
+                fontSize={fontSize}
+                ttsSpeed={ttsSpeed}
+                onFontSizeChange={(size) => {
+                  updateSetting("font_size", String(size));
+                  applyFontSize(size);
+                }}
+                onTtsSpeedChange={(speed) => {
+                  updateSetting("tts_speed", speed.toFixed(1));
+                }}
+              />
+            )}
             {activeSection === "about" && <AboutSection />}
           </div>
         </div>
@@ -121,12 +143,12 @@ function AppearanceSection({
   theme,
   setTheme,
   accentIndex,
-  setAccentIndex,
+  onAccentChange,
 }: {
   theme: string | undefined;
   setTheme: (t: string) => void;
   accentIndex: number;
-  setAccentIndex: (i: number) => void;
+  onAccentChange: (i: number) => void;
 }) {
   const modes = [
     { value: "light", icon: Sun, label: "Light" },
@@ -172,14 +194,7 @@ function AppearanceSection({
           {ACCENT_PRESETS.map((preset, i) => (
             <button
               key={preset.name}
-              onClick={() => {
-                setAccentIndex(i);
-                document.documentElement.style.setProperty("--accent", preset.light);
-                const dark = document.querySelector(".dark");
-                if (dark) {
-                  (dark as HTMLElement).style.setProperty("--accent", preset.dark);
-                }
-              }}
+              onClick={() => onAccentChange(i)}
               title={preset.name}
               className="relative w-9 h-9 rounded-full border-2 transition-all cursor-pointer flex items-center justify-center"
               style={{
@@ -204,7 +219,17 @@ function AppearanceSection({
 
 /* ─────────────── Section: Reading ─────────────── */
 
-function ReadingSection() {
+function ReadingSection({
+  fontSize,
+  ttsSpeed,
+  onFontSizeChange,
+  onTtsSpeedChange,
+}: {
+  fontSize: number;
+  ttsSpeed: number;
+  onFontSizeChange: (size: number) => void;
+  onTtsSpeedChange: (speed: number) => void;
+}) {
   return (
     <div className="space-y-8">
       <div>
@@ -217,11 +242,12 @@ function ReadingSection() {
             type="range"
             min={14}
             max={24}
-            defaultValue={18}
+            value={fontSize}
+            onChange={(e) => onFontSizeChange(Number(e.target.value))}
             className="flex-1 accent-accent"
           />
           <span className="text-sm text-text-secondary font-medium tabular-nums w-10 text-right">
-            18px
+            {fontSize}px
           </span>
         </div>
       </div>
@@ -239,11 +265,12 @@ function ReadingSection() {
             min={0.5}
             max={2}
             step={0.1}
-            defaultValue={1}
+            value={ttsSpeed}
+            onChange={(e) => onTtsSpeedChange(Number(e.target.value))}
             className="flex-1 accent-accent"
           />
           <span className="text-sm text-text-secondary font-medium tabular-nums w-10 text-right">
-            1.0x
+            {ttsSpeed.toFixed(1)}x
           </span>
         </div>
       </div>

@@ -1,8 +1,15 @@
 "use client";
 
-import useSWR from "swr";
-import { useEffect, useState } from "react";
-import { fetchItems, fetchItem, searchItems, fetchVoices } from "./api";
+import useSWR, { mutate as globalMutate } from "swr";
+import { useCallback, useEffect, useState } from "react";
+import {
+  fetchItems,
+  fetchItem,
+  searchItems,
+  fetchVoices,
+  fetchSettings,
+  patchSettings,
+} from "./api";
 import { LibraryItem, LibraryItemsResponse, VoiceListResponse } from "./types";
 
 interface UseLibraryItemsParams {
@@ -49,4 +56,46 @@ export function useSearchItems(query: string) {
     () => searchItems(debouncedQuery),
     { revalidateOnFocus: false }
   );
+}
+
+// ── User settings (backend-persisted) ────────────────────────────────────
+
+const SETTINGS_KEY = "user-settings";
+
+export function useSettings() {
+  const { data: settings, isLoading } = useSWR<Record<string, string>>(
+    SETTINGS_KEY,
+    fetchSettings,
+    { revalidateOnFocus: false }
+  );
+
+  /**
+   * Optimistically update a single setting key/value, then persist to backend.
+   * Dispatches a `readio-settings-change` event so other components (e.g.
+   * reader content area) can react immediately without polling.
+   */
+  const updateSetting = useCallback(
+    (key: string, value: string) => {
+      // Optimistic SWR mutation — merges the new key into the cached dict
+      globalMutate(
+        SETTINGS_KEY,
+        (prev: Record<string, string> | undefined) => ({
+          ...prev,
+          [key]: value,
+        }),
+        false // don't revalidate immediately
+      );
+
+      // Fire-and-forget backend persistence
+      patchSettings({ [key]: value }).catch(() => {});
+
+      // Broadcast change so non-SWR consumers (e.g. CSS var appliers) can react
+      window.dispatchEvent(
+        new CustomEvent("readio-settings-change", { detail: { key, value } })
+      );
+    },
+    []
+  );
+
+  return { settings: settings ?? {}, isLoading, updateSetting };
 }

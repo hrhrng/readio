@@ -14,6 +14,9 @@ export interface LibraryItem {
   file_path: string | null;
   cover_image: string | null;
   voice: string | null;
+  speed: number | null;
+  current_chapter: string | null;
+  content_format: string | null;
 }
 
 /** 列表接口返回的轻量模型，不含 content */
@@ -29,6 +32,8 @@ export interface LibraryItemSummary {
   file_path: string | null;
   cover_image: string | null;
   voice: string | null;
+  speed: number | null;
+  content_format: string | null;
 }
 
 export interface LibraryItemsResponse {

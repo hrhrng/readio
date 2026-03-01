@@ -20,6 +20,9 @@ class LibraryItem(BaseModel):
     file_path: str | None = None
     cover_image: str | None = None
     voice: str | None = None
+    speed: float | None = None
+    current_chapter: str | None = None
+    content_format: str | None = None
 
 
 class LibraryItemSummary(BaseModel):
@@ -35,6 +38,8 @@ class LibraryItemSummary(BaseModel):
     file_path: str | None = None
     cover_image: str | None = None
     voice: str | None = None
+    speed: float | None = None
+    content_format: str | None = None
 
 
 class LibraryItemsResponse(BaseModel):
@@ -56,6 +61,7 @@ class CreateLibraryItemRequest(BaseModel):
     date: str | None = None
     file_path: str | None = None
     cover_image: str | None = None
+    content_format: str | None = None
 
 
 class ImportUrlRequest(BaseModel):

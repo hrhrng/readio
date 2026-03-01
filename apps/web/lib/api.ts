@@ -225,8 +225,48 @@ export async function updateVoice(
   });
 }
 
+export async function updateSpeed(
+  id: string,
+  speed: number | null
+): Promise<void> {
+  await fetch(`${BASE}/api/library/items/${id}/speed`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ speed }),
+  });
+}
+
+export async function updateChapter(
+  id: string,
+  chapter: string | null
+): Promise<void> {
+  await fetch(`${BASE}/api/library/items/${id}/chapter`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chapter }),
+  });
+}
+
 export async function fetchVoices(): Promise<VoiceListResponse> {
   const res = await fetch(`${BASE}/api/tts/voices`);
   if (!res.ok) throw new Error(`Failed to fetch voices: ${res.status}`);
   return res.json();
+}
+
+// ── User settings persistence ────────────────────────────────────────────
+
+export async function fetchSettings(): Promise<Record<string, string>> {
+  const res = await fetch(`${BASE}/api/settings`);
+  if (!res.ok) throw new Error(`Failed to fetch settings: ${res.status}`);
+  return res.json();
+}
+
+export async function patchSettings(
+  data: Record<string, string>
+): Promise<void> {
+  await fetch(`${BASE}/api/settings`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
 }

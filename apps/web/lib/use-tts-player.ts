@@ -25,6 +25,8 @@ export interface UseTTSPlayerReturn {
   play(): void;
   pause(): void;
   playFromSentence(index: number): void;
+  /** Move to a sentence without triggering playback (for progress restoration). */
+  seekToSentence(index: number): void;
   nextSentence(): void;
   prevSentence(): void;
   setSpeed(speed: number): void;
@@ -168,16 +170,31 @@ export function useTTSPlayer({
     }
   }, [voice]);
 
+  /**
+   * Recompute estimated remaining time.
+   * Accounts for both future sentences (avg duration * count) and the
+   * unplayed portion of the current sentence for a smoothly ticking display.
+   * @param idx            current sentence index
+   * @param elapsedSec     seconds already played in the current sentence (0 at sentence start)
+   */
   const updateEstimate = useCallback(
-    (idx: number) => {
+    (idx: number, elapsedSec = 0) => {
       if (durations.current.length === 0 || sentencesRef.current.length === 0) {
         setEstimatedRemainingSeconds(-1);
         return;
       }
       const recent = durations.current.slice(-10);
-      const avg = recent.reduce((a, b) => a + b, 0) / recent.length;
-      const remaining = sentencesRef.current.length - idx - 1;
-      setEstimatedRemainingSeconds(Math.round((avg * remaining) / 1000));
+      const avgMs = recent.reduce((a, b) => a + b, 0) / recent.length;
+
+      // Time for all sentences after the current one
+      const futureSentences = sentencesRef.current.length - idx - 1;
+      const futureSec = (avgMs * futureSentences) / 1000;
+
+      // Remaining portion of the current sentence (use actual duration if known, else avg)
+      const currentDurationMs = durations.current[durations.current.length - 1] ?? avgMs;
+      const currentRemainingSec = Math.max(0, currentDurationMs / 1000 - elapsedSec);
+
+      setEstimatedRemainingSeconds(Math.round(futureSec + currentRemainingSec));
     },
     []
   );
@@ -420,6 +437,8 @@ export function useTTSPlayer({
         if (el.duration > 0) {
           const progress = el.currentTime / el.duration;
           setCurrentWordProgress(Math.floor(progress * wordCount) / wordCount);
+          // Tick the remaining-time estimate using real playback position
+          updateEstimate(idx, el.currentTime);
         }
       };
 
@@ -534,6 +553,13 @@ export function useTTSPlayer({
     // React batches → Playback Effect triggers once with both new values
   }, []);
 
+  // Seek to a sentence without triggering playback — used for restoring
+  // reading position on page load. Only updates index + resets word progress.
+  const seekToSentence = useCallback((index: number) => {
+    setCurrentSentenceIndex(index);
+    setCurrentWordProgress(0);
+  }, []);
+
   const nextSentence = useCallback(() => {
     setCurrentSentenceIndex(prev => {
       const next = prev + 1;
@@ -629,6 +655,7 @@ export function useTTSPlayer({
     play,
     pause,
     playFromSentence,
+    seekToSentence,
     nextSentence,
     prevSentence,
     setSpeed: setSpeedFn,

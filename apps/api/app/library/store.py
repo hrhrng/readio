@@ -80,6 +80,43 @@ class LibraryStore:
                 connection.execute('ALTER TABLE library_items ADD COLUMN voice TEXT DEFAULT NULL')
                 connection.commit()
 
+            # Migrate: add per-book playback speed preference
+            if 'speed' not in columns:
+                connection.execute('ALTER TABLE library_items ADD COLUMN speed REAL DEFAULT NULL')
+                connection.commit()
+
+            # Migrate: add current chapter position tracking for EPUB reading
+            if 'current_chapter' not in columns:
+                connection.execute('ALTER TABLE library_items ADD COLUMN current_chapter TEXT DEFAULT NULL')
+                connection.commit()
+
+            # Migrate: add per-book TTS speed preference (NULL = use global default)
+            if 'speed' not in columns:
+                connection.execute('ALTER TABLE library_items ADD COLUMN speed REAL DEFAULT NULL')
+                connection.commit()
+
+            # Migrate: add current_chapter to track EPUB reading position
+            if 'current_chapter' not in columns:
+                connection.execute('ALTER TABLE library_items ADD COLUMN current_chapter TEXT DEFAULT NULL')
+                connection.commit()
+
+            # Migrate: add content_format to distinguish markdown vs plaintext web imports
+            if 'content_format' not in columns:
+                connection.execute('ALTER TABLE library_items ADD COLUMN content_format TEXT DEFAULT NULL')
+                connection.commit()
+
+            # Settings table: single-row key-value store for user preferences
+            # (font_size, accent_color, tts_speed, etc.)
+            connection.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                '''
+            )
+            connection.commit()
+
         self._seed_defaults_if_needed()
 
     def _seed_defaults_if_needed(self) -> None:
@@ -215,7 +252,7 @@ class LibraryStore:
         count_query = f'SELECT COUNT(*) AS count FROM library_items WHERE {where_sql}'
         # 列表接口不需要 content 字段，避免传输大量数据（如 base64 封面）
         data_query = f'''
-            SELECT id, title, type, progress, date, category, folder_id, source, file_path, cover_image, voice
+            SELECT id, title, type, progress, date, category, folder_id, source, file_path, cover_image, voice, speed, content_format
             FROM library_items
             WHERE {where_sql}
             ORDER BY {order_column} {order_direction}
@@ -233,7 +270,7 @@ class LibraryStore:
         with self._connect() as connection:
             row = connection.execute(
                 '''
-                SELECT id, title, content, type, progress, date, category, folder_id, source, file_path, cover_image, voice
+                SELECT id, title, content, type, progress, date, category, folder_id, source, file_path, cover_image, voice, speed, current_chapter, content_format
                 FROM library_items
                 WHERE id = ?
                 ''',
@@ -259,14 +296,17 @@ class LibraryStore:
             file_path=payload.file_path,
             cover_image=payload.cover_image,
             voice=None,
+            speed=None,
+            current_chapter=None,
+            content_format=payload.content_format,
         )
 
         with self._connect() as connection:
             connection.execute(
                 '''
                 INSERT INTO library_items (
-                    id, title, content, type, progress, date, category, folder_id, source, created_at, file_path, cover_image, voice
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    id, title, content, type, progress, date, category, folder_id, source, created_at, file_path, cover_image, voice, speed, current_chapter, content_format
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''',
                 (
                     item.id,
@@ -282,6 +322,9 @@ class LibraryStore:
                     item.file_path,
                     item.cover_image,
                     item.voice,
+                    item.speed,
+                    item.current_chapter,
+                    item.content_format,
                 ),
             )
             connection.commit()
@@ -308,6 +351,26 @@ class LibraryStore:
             connection.commit()
             return cursor.rowcount > 0
 
+    def update_speed(self, item_id: str, speed: float | None) -> bool:
+        """Persist the user's per-item TTS speed preference (None = use global default)."""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                'UPDATE library_items SET speed = ? WHERE id = ?',
+                (speed, item_id),
+            )
+            connection.commit()
+            return cursor.rowcount > 0
+
+    def update_chapter(self, item_id: str, chapter_id: str | None) -> bool:
+        """Persist the current EPUB chapter position for reading progress restoration."""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                'UPDATE library_items SET current_chapter = ? WHERE id = ?',
+                (chapter_id, item_id),
+            )
+            connection.commit()
+            return cursor.rowcount > 0
+
     def delete_item(self, item_id: str) -> bool:
         with self._connect() as connection:
             cursor = connection.execute(
@@ -319,3 +382,27 @@ class LibraryStore:
             )
             connection.commit()
             return cursor.rowcount > 0
+
+    # ── Settings persistence ──────────────────────────────────────────────
+
+    def get_settings(self) -> dict[str, str]:
+        """Return all user settings as a flat {key: value} dict."""
+        with self._connect() as connection:
+            rows = connection.execute('SELECT key, value FROM settings').fetchall()
+        return {row['key']: row['value'] for row in rows}
+
+    def update_settings(self, data: dict[str, str | None]) -> None:
+        """Upsert each key; a value of None deletes the key."""
+        with self._connect() as connection:
+            for key, value in data.items():
+                if value is None:
+                    connection.execute('DELETE FROM settings WHERE key = ?', (key,))
+                else:
+                    connection.execute(
+                        '''
+                        INSERT INTO settings (key, value) VALUES (?, ?)
+                        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                        ''',
+                        (key, value),
+                    )
+            connection.commit()

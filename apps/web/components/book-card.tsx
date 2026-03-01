@@ -246,7 +246,7 @@ export function BookCard({ item, variant = "grid" }: BookCardProps) {
           onClick={handleClick}
           className="text-left cursor-pointer"
         >
-          <h3 className="mt-2 text-sm font-medium text-text-primary line-clamp-2 leading-snug">
+          <h3 className="mt-2 text-sm font-medium text-text-primary truncate leading-snug">
             {item.title}
           </h3>
           <p className="text-xs text-text-secondary mt-0.5">

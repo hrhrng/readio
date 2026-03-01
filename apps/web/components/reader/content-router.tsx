@@ -4,6 +4,7 @@ import { LibraryItem, Sentence } from "@/lib/types";
 import { PlainTextReader } from "./plain-text-reader";
 import { EpubReader } from "./epub-reader";
 import { PdfReader } from "./pdf-reader";
+import { HtmlReader } from "./html-reader";
 
 interface ContentRouterProps {
   item: LibraryItem;
@@ -12,7 +13,6 @@ interface ContentRouterProps {
   currentWordProgress: number;
   onSentenceClick: (index: number) => void;
   onChaptersExtracted?: (chapters: { id: string; title: string; depth?: number }[]) => void;
-  onOutlineExtracted?: (outline: { title: string; page: number }[]) => void;
 }
 
 export function ContentRouter({
@@ -22,7 +22,6 @@ export function ContentRouter({
   currentWordProgress,
   onSentenceClick,
   onChaptersExtracted,
-  onOutlineExtracted,
 }: ContentRouterProps) {
   if (!item.content && !item.file_path) {
     return (
@@ -55,7 +54,20 @@ export function ContentRouter({
         currentSentenceIndex={currentSentenceIndex}
         currentWordProgress={currentWordProgress}
         onSentenceClick={onSentenceClick}
-        onOutlineExtracted={onOutlineExtracted}
+        onChaptersExtracted={onChaptersExtracted}
+      />
+    );
+  }
+
+  // HTML-formatted web imports get rich rendering with TTS integration
+  if (item.type === "web" && item.content_format === "html") {
+    return (
+      <HtmlReader
+        content={item.content}
+        onSentencesExtracted={onSentencesExtracted}
+        currentSentenceIndex={currentSentenceIndex}
+        currentWordProgress={currentWordProgress}
+        onSentenceClick={onSentenceClick}
       />
     );
   }

@@ -29,6 +29,9 @@ class Settings:
     minimax_base_url: str = field(default_factory=lambda: os.getenv('MINIMAX_BASE_URL', 'https://api.minimax.io'))
     minimax_model_id: str = field(default_factory=lambda: os.getenv('MINIMAX_MODEL_ID', 'speech-2.6-hd'))
     minimax_voice_id: str = field(default_factory=lambda: os.getenv('MINIMAX_VOICE_ID', 'English_expressive_narrator'))
+    minimax_default_language_boost: str = field(
+        default_factory=lambda: os.getenv('MINIMAX_DEFAULT_LANGUAGE_BOOST', '')
+    )
     edge_tts_voice: str = field(default_factory=lambda: os.getenv('EDGE_TTS_VOICE', 'en-US-AriaNeural'))
 
     tts_fallback_order: str = field(default_factory=lambda: os.getenv('TTS_FALLBACK_ORDER', 'edge,minimax,elevenlabs'))

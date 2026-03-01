@@ -124,7 +124,18 @@ export function PlayerBar({
         </div>
       )}
     <div className="fixed bottom-4 left-1/2 -translate-x-1/2 w-[min(480px,calc(100%-32px))] h-[56px] bg-surface-card/80 backdrop-blur-xl border border-border rounded-2xl shadow-lg z-40 flex items-center px-4 gap-2">
-      {/* Transport controls — prev / play-pause / next */}
+      {/* Left — progress & remaining time */}
+      <div className="flex-1 flex items-center gap-2 text-xs text-text-secondary tabular-nums">
+        <span>{progressPercent}%</span>
+        {remaining >= 0 && (
+          <>
+            <span className="text-border">·</span>
+            <span>−{formatTime(remaining)}</span>
+          </>
+        )}
+      </div>
+
+      {/* Center — transport controls */}
       <div className="flex items-center gap-1">
         <button
           onClick={player.prevSentence}
@@ -158,20 +169,8 @@ export function PlayerBar({
         </button>
       </div>
 
-      {/* Progress & remaining time — fills middle space */}
-      <div className="flex-1 flex items-center justify-center gap-2 text-xs text-text-secondary tabular-nums">
-        <span>{progressPercent}%</span>
-        {remaining >= 0 && (
-          <>
-            <span className="text-border">·</span>
-            <span className="hidden sm:inline">{formatTime(remaining)} left</span>
-            <span className="sm:hidden">~{formatTime(remaining)}</span>
-          </>
-        )}
-      </div>
-
-      {/* Right-side controls — speed & voice */}
-      <div className="flex items-center gap-1">
+      {/* Right — speed & voice */}
+      <div className="flex-1 flex items-center justify-end gap-1">
         <button
           onClick={cycleSpeed}
           className="h-8 px-2 flex items-center justify-center rounded-lg text-xs font-medium text-text-secondary hover:text-text-primary hover:bg-surface-hover transition-colors duration-200 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent tabular-nums"

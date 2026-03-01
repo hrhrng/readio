@@ -41,6 +41,7 @@ export function TopBar({
               ? "text-accent bg-surface-active"
               : "text-text-secondary hover:text-text-primary"
           }`}
+          data-toc-toggle
           aria-label="Toggle table of contents"
         >
           <List size={18} />

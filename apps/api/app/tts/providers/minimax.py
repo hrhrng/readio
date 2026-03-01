@@ -158,6 +158,53 @@ def _build_payload(request: TTSRequest, *, stream: bool) -> dict[str, Any]:
     return payload
 
 
+def _build_enhanced_payload(request: TTSRequest, *, stream: bool) -> dict[str, Any]:
+    """Build a MiniMax payload with all available prosody/control parameters.
+
+    Starts from the base payload and layers on optional parameters from
+    ``request.provider_options``:
+
+    - **emotion** — happy / sad / angry / fearful / disgusted / surprised / neutral
+    - **language_boost** — ISO language name for multilingual emphasis
+    - **pronunciation_dict** — custom pronunciation map, e.g. ``{"tone": ["omg/oh my god"]}``
+    - **text_normalization** — normalise numbers/dates in English text (default True)
+    - **voice_modify** — fine-grained pitch / intensity / timbre / sound_effects
+    - **subtitle_enable** — return sentence-level timestamps (non-streaming only)
+    """
+    payload = _build_payload(request, stream=stream)
+
+    opts = request.provider_options
+
+    # emotion: vocal emotion preset
+    emotion = opts.get('emotion')
+    if emotion:
+        payload['voice_setting']['emotion'] = emotion
+
+    # language_boost: multilingual enhancement (fall back to env default)
+    language_boost = opts.get('language_boost') or settings.minimax_default_language_boost
+    if language_boost:
+        payload['language_boost'] = language_boost
+
+    # pronunciation_dict: custom pronunciation overrides
+    pronunciation_dict = opts.get('pronunciation_dict')
+    if pronunciation_dict:
+        payload['pronunciation_dict'] = pronunciation_dict
+
+    # text_normalization: English number/date normalisation (enabled by default)
+    payload['voice_setting']['text_normalization'] = opts.get('text_normalization', True)
+
+    # voice_modify: granular voice tuning (pitch / intensity / timbre / sound_effects)
+    voice_modify = opts.get('voice_modify')
+    if voice_modify:
+        payload['voice_modify'] = voice_modify
+
+    # subtitle_enable: sentence-level timestamps — only meaningful for non-streaming
+    if not stream:
+        payload['subtitle_enable'] = opts.get('subtitle_enable', False)
+
+    return payload
+
+
 def _raise_if_minimax_error(data: dict[str, Any]) -> None:
     base_resp = data.get('base_resp', {})
     status_code = base_resp.get('status_code')
@@ -225,6 +272,54 @@ class MiniMaxProvider:
         audio_bytes = decode_audio_payload(audio_payload)
 
         # MiniMax returns duration and sample rate in `extra_info`, not in `data`.
+        extra = data.get('extra_info') or {}
+        return TTSResult(
+            provider=self.id,
+            audio_bytes=audio_bytes,
+            duration_ms=extra.get('audio_length'),
+            sample_rate=extra.get('audio_sample_rate'),
+            trace_id=_extract_trace_id(data),
+        )
+
+    async def synthesize_enhanced(self, request: TTSRequest) -> TTSResult:
+        """Enhanced synthesis with full prosody control.
+
+        Uses ``_build_enhanced_payload`` to enable emotion, language_boost,
+        pronunciation_dict, text_normalization, voice_modify, and subtitle
+        parameters — all driven by ``request.provider_options``.
+        """
+        if not self.is_available():
+            raise RuntimeError('MINIMAX_API_KEY is not configured')
+
+        url = resolve_minimax_endpoint()
+        headers = {
+            'Authorization': f'Bearer {settings.minimax_api_key}',
+            'Content-Type': 'application/json',
+        }
+        payload = _build_enhanced_payload(request, stream=False)
+
+        try:
+            async with httpx.AsyncClient(timeout=settings.tts_timeout_seconds) as client:
+                response = await client.post(url, headers=headers, json=payload)
+                response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            detail = exc.response.text.strip() or exc.response.reason_phrase
+            raise RuntimeError(f'MiniMax service HTTP {exc.response.status_code}: {detail}') from exc
+        except httpx.RequestError as exc:
+            raise RuntimeError(f'MiniMax request failed: {exc}') from exc
+
+        try:
+            data = response.json()
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError('MiniMax response is not valid JSON') from exc
+
+        _raise_if_minimax_error(data)
+        audio_payload = _extract_audio_payload(data)
+        if not audio_payload:
+            raise RuntimeError('MiniMax response has no audio payload')
+
+        audio_bytes = decode_audio_payload(audio_payload)
+
         extra = data.get('extra_info') or {}
         return TTSResult(
             provider=self.id,

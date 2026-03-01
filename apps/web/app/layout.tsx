@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Playfair_Display, Inter } from "next/font/google";
 import { ThemeProvider } from "@/components/theme-provider";
+import { SettingsProvider } from "@/components/settings-provider";
 import { LayoutShell } from "@/components/layout-shell";
 import "./globals.css";
 
@@ -34,7 +35,9 @@ export default function RootLayout({
     >
       <body className="font-sans antialiased bg-surface text-text-primary">
         <ThemeProvider>
-          <LayoutShell>{children}</LayoutShell>
+          <SettingsProvider>
+            <LayoutShell>{children}</LayoutShell>
+          </SettingsProvider>
         </ThemeProvider>
       </body>
     </html>

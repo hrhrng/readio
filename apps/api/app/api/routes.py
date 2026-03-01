@@ -33,7 +33,7 @@ from app.tts.models import (
     TTSRequest,
 )
 from app.tts.providers.edge import EdgeTTSProvider
-from app.tts.providers.minimax import DEFAULT_MINIMAX_VOICE, fetch_system_voices
+from app.tts.providers.minimax import DEFAULT_MINIMAX_VOICE, MiniMaxProvider, fetch_system_voices
 from app.tts.registry import build_tts_router
 from app.api.text_utils import contains_cjk, split_sentences, split_cjk_clauses
 
@@ -260,6 +260,30 @@ async def update_library_item_voice(item_id: str, payload: VoiceUpdateRequest) -
     return {'status': 'ok'}
 
 
+class SpeedUpdateRequest(BaseModel):
+    speed: float | None = None
+
+
+@router.patch('/api/library/items/{item_id}/speed')
+async def update_library_item_speed(item_id: str, payload: SpeedUpdateRequest) -> dict[str, str]:
+    updated = await asyncio.to_thread(library_store.update_speed, item_id, payload.speed)
+    if not updated:
+        raise HTTPException(status_code=404, detail='item not found')
+    return {'status': 'ok'}
+
+
+class ChapterUpdateRequest(BaseModel):
+    chapter: str | None = None
+
+
+@router.patch('/api/library/items/{item_id}/chapter')
+async def update_library_item_chapter(item_id: str, payload: ChapterUpdateRequest) -> dict[str, str]:
+    updated = await asyncio.to_thread(library_store.update_chapter, item_id, payload.chapter)
+    if not updated:
+        raise HTTPException(status_code=404, detail='item not found')
+    return {'status': 'ok'}
+
+
 # ---------------------------------------------------------------------------
 # TTS voice catalogue — dynamically fetched from MiniMax API
 # ---------------------------------------------------------------------------
@@ -357,6 +381,21 @@ async def list_voices() -> VoiceListResponse:
     )
 
 
+# ---------------------------------------------------------------------------
+# User settings — persisted key-value pairs (font_size, accent_color, etc.)
+# ---------------------------------------------------------------------------
+
+@router.get('/api/settings')
+async def get_settings() -> dict[str, str]:
+    return await asyncio.to_thread(library_store.get_settings)
+
+
+@router.patch('/api/settings')
+async def patch_settings(payload: dict[str, str | None]) -> dict[str, str]:
+    await asyncio.to_thread(library_store.update_settings, payload)
+    return {'status': 'ok'}
+
+
 @router.post('/api/library/import/url', response_model=LibraryItem, status_code=201)
 async def import_library_url(payload: ImportUrlRequest) -> LibraryItem:
     logger.info('importing url=%s', payload.url)
@@ -375,6 +414,7 @@ async def import_library_url(payload: ImportUrlRequest) -> LibraryItem:
     if not content:
         raise HTTPException(status_code=400, detail='no readable content extracted')
 
+    content_format = document.get('content_format')
     created = library_store.create_item(
         CreateLibraryItemRequest(
             title=title,
@@ -383,6 +423,7 @@ async def import_library_url(payload: ImportUrlRequest) -> LibraryItem:
             category=payload.category,
             folder_id=payload.folder_id,
             source=str(payload.url),
+            content_format=content_format,
         )
     )
     return created
@@ -465,6 +506,34 @@ async def synthesize(payload: TTSRequest, provider: str | None = None) -> Synthe
             result = await tts_router.synthesize_with_provider(provider=provider, request=payload)
         else:
             result = await tts_router.synthesize_with_fallback(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    return SynthesizeResponse(
+        provider=result.provider,
+        audio_base64=base64.b64encode(result.audio_bytes).decode('utf-8'),
+        duration_ms=result.duration_ms,
+        sample_rate=result.sample_rate,
+        trace_id=result.trace_id,
+    )
+
+
+@router.post('/api/tts/synthesize/enhanced', response_model=SynthesizeResponse)
+async def synthesize_enhanced(payload: TTSRequest) -> SynthesizeResponse:
+    """MiniMax-only enhanced TTS with full prosody control.
+
+    Accepts all standard ``TTSRequest`` fields plus additional parameters via
+    ``provider_options``: emotion, language_boost, pronunciation_dict,
+    text_normalization, voice_modify, and subtitle_enable.
+    """
+    provider = MiniMaxProvider()
+    if not provider.is_available():
+        raise HTTPException(status_code=503, detail='MiniMax provider is not configured')
+
+    try:
+        result = await provider.synthesize_enhanced(payload)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001

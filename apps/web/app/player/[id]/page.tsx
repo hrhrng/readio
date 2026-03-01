@@ -1,15 +1,15 @@
 "use client";
 
 import { use, useCallback, useEffect, useRef, useState } from "react";
-import { useLibraryItem, useVoices } from "@/lib/hooks";
-import { updateProgress, updateVoice } from "@/lib/api";
+import { useLibraryItem, useSettings, useVoices } from "@/lib/hooks";
+import { updateProgress, updateVoice, updateSpeed, updateChapter } from "@/lib/api";
 import { Sentence } from "@/lib/types";
 import { useTTSPlayer } from "@/lib/use-tts-player";
 import { TopBar } from "@/components/reader/top-bar";
 import { PlayerBar } from "@/components/reader/player-bar";
 import { ContentRouter } from "@/components/reader/content-router";
 import { TOCPanel } from "@/components/reader/toc-panel";
-import { SettingsPanel } from "@/components/reader/settings-panel";
+import { SettingsDialog } from "@/components/settings-dialog";
 
 export default function PlayerPage({
   params,
@@ -21,11 +21,12 @@ export default function PlayerPage({
   const [sentences, setSentences] = useState<Sentence[]>([]);
   const [tocOpen, setTocOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const tocPanelRef = useRef<HTMLDivElement>(null);
+  const { settings } = useSettings();
   const [speed, setSpeed] = useState(1.0);
   const [tocItems, setTocItems] = useState<
     { id: string; title: string; depth?: number }[]
   >([]);
-  const [fontSize, setFontSize] = useState("18px");
 
   // Per-item voice preference — initialized from backend item data
   const [voice, setVoice] = useState<string | null>(null);
@@ -48,6 +49,36 @@ export default function PlayerPage({
     [id]
   );
 
+  // Derive font size from backend-persisted settings (SettingsProvider applies
+  // the CSS var globally; this local value drives the inline style for the reader)
+  const fontSize = `${settings.font_size ?? "18"}px`;
+
+  // Initialize TTS speed: per-book speed takes priority over global setting.
+  // The per-book value comes from item.speed (backend), the global fallback
+  // comes from settings.tts_speed. Only runs once on first load.
+  const speedInitialized = useRef(false);
+  useEffect(() => {
+    if (speedInitialized.current) return;
+    if (!item) return;
+
+    // Per-book speed has the highest priority
+    if (item.speed != null) {
+      setSpeed(item.speed);
+      speedInitialized.current = true;
+      return;
+    }
+
+    // Fall back to global TTS speed setting
+    const persisted = settings.tts_speed;
+    if (persisted) {
+      const parsed = parseFloat(persisted);
+      if (!isNaN(parsed)) {
+        setSpeed(parsed);
+        speedInitialized.current = true;
+      }
+    }
+  }, [item, settings.tts_speed]);
+
   const player = useTTSPlayer({
     itemId: id,
     sentences,
@@ -64,32 +95,26 @@ export default function PlayerPage({
     return match?.label ?? null;
   })();
 
-  // Load font size from localStorage and listen for changes
+  // Close TOC panel on click-outside
   useEffect(() => {
-    const sizeMap: Record<string, string> = {
-      small: "16px",
-      medium: "18px",
-      large: "22px",
-    };
+    if (!tocOpen) return;
 
-    const applyFontSize = () => {
-      const current = localStorage.getItem("readio-font-size");
-      if (current && current in sizeMap) {
-        setFontSize(sizeMap[current]);
+    const handleClickOutside = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+      // Ignore clicks on the TOC toggle button — let its onClick handle the toggle
+      if (target.closest("[data-toc-toggle]")) return;
+      if (
+        tocPanelRef.current &&
+        !tocPanelRef.current.contains(target)
+      ) {
+        setTocOpen(false);
       }
     };
 
-    // Apply saved value on mount
-    applyFontSize();
-
-    // Cross-tab changes fire "storage"; same-tab changes fire "readio-font-change"
-    window.addEventListener("storage", applyFontSize);
-    window.addEventListener("readio-font-change", applyFontSize);
-    return () => {
-      window.removeEventListener("storage", applyFontSize);
-      window.removeEventListener("readio-font-change", applyFontSize);
-    };
-  }, []);
+    // Use mousedown so the panel closes before any other click handlers fire
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [tocOpen]);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -158,7 +183,27 @@ export default function PlayerPage({
     };
   }, [player.currentSentenceIndex, sentences.length]);
 
-  // Progress persistence — only fires on page unload / component unmount
+  // Track current chapter for EPUB/PDF chapter position persistence.
+  // Updated when the active sentence changes — finds the chapter element
+  // closest to the current scroll position.
+  const currentChapterRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!item || (item.type !== "epub" && item.type !== "pdf") || tocItems.length === 0) return;
+
+    // Find which chapter element contains the active sentence
+    const sentenceEl = document.querySelector(
+      `[data-sentence-id="${player.currentSentenceIndex}"]`
+    );
+    if (!sentenceEl) return;
+
+    const chapterEl = sentenceEl.closest("[data-chapter]");
+    if (chapterEl) {
+      const chapterId = chapterEl.getAttribute("data-chapter");
+      if (chapterId) currentChapterRef.current = chapterId;
+    }
+  }, [player.currentSentenceIndex, item, tocItems.length]);
+
+  // Progress + chapter persistence — only fires on page unload / component unmount
   useEffect(() => {
     const saveProgress = () => {
       const { currentSentenceIndex, sentencesLength } = progressRef.current;
@@ -167,6 +212,11 @@ export default function PlayerPage({
         (currentSentenceIndex / sentencesLength) * 100
       );
       updateProgress(id, progress).catch(() => {});
+
+      // Persist current EPUB chapter position alongside progress
+      if (currentChapterRef.current) {
+        updateChapter(id, currentChapterRef.current).catch(() => {});
+      }
     };
 
     window.addEventListener("beforeunload", saveProgress);
@@ -175,6 +225,48 @@ export default function PlayerPage({
       saveProgress(); // save once on unmount
     };
   }, [id]);
+
+  // Restore reading position when sentences are extracted and item has progress.
+  // Calculates the target sentence index from progress percentage and scrolls
+  // to that position without auto-playing. Uses a ref to prevent re-triggering.
+  const progressRestored = useRef(false);
+  useEffect(() => {
+    if (progressRestored.current) return;
+    if (!item || sentences.length === 0) return;
+
+    // For EPUB/PDF with a saved chapter, scroll to the chapter element first
+    if ((item.type === "epub" || item.type === "pdf") && item.current_chapter) {
+      const chapterEl = document.querySelector(
+        `[data-chapter="${item.current_chapter}"]`
+      );
+      if (chapterEl) {
+        chapterEl.scrollIntoView({ behavior: "instant", block: "start" });
+      }
+    }
+
+    // Restore sentence-level position from progress percentage
+    if (item.progress > 0 && item.progress < 100) {
+      const restoredIndex = Math.round(
+        (item.progress / 100) * (sentences.length - 1)
+      );
+      if (restoredIndex > 0) {
+        player.seekToSentence(restoredIndex);
+
+        // Scroll to the restored sentence after a short delay to let the DOM settle
+        // (especially for EPUBs where chapter scroll may still be animating)
+        requestAnimationFrame(() => {
+          const el = document.querySelector(
+            `[data-sentence-id="${restoredIndex}"]`
+          );
+          if (el) {
+            el.scrollIntoView({ behavior: "instant", block: "center" });
+          }
+        });
+      }
+    }
+
+    progressRestored.current = true;
+  }, [item, sentences, player]);
 
   const handleSentencesExtracted = useCallback(
     (extracted: Sentence[]) => {
@@ -186,15 +278,6 @@ export default function PlayerPage({
   const handleChaptersExtracted = useCallback(
     (chapters: { id: string; title: string; depth?: number }[]) => {
       setTocItems(chapters);
-    },
-    []
-  );
-
-  const handleOutlineExtracted = useCallback(
-    (outline: { title: string; page: number }[]) => {
-      setTocItems(
-        outline.map((o, i) => ({ id: `outline-${i}`, title: o.title }))
-      );
     },
     []
   );
@@ -278,17 +361,20 @@ export default function PlayerPage({
         tocOpen={tocOpen}
       />
 
-      {settingsOpen && (
-        <SettingsPanel onClose={() => setSettingsOpen(false)} />
-      )}
+      <SettingsDialog
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+      />
 
       <div className="flex pt-12 h-screen overflow-hidden">
-        {/* TOC as fixed overlay — avoids reflowing the content area */}
+        {/* TOC as floating popover — click outside to dismiss */}
         {tocOpen && (
-          <div className="fixed left-0 top-12 bottom-[80px] z-30">
+          <div
+            ref={tocPanelRef}
+            className="fixed left-3 top-14 z-30"
+          >
             <TOCPanel
               items={tocItems}
-              onClose={() => setTocOpen(false)}
               onItemClick={handleTocItemClick}
             />
           </div>
@@ -306,7 +392,6 @@ export default function PlayerPage({
               currentWordProgress={player.currentWordProgress}
               onSentenceClick={player.playFromSentence}
               onChaptersExtracted={handleChaptersExtracted}
-              onOutlineExtracted={handleOutlineExtracted}
             />
           </div>
         </div>
@@ -318,6 +403,8 @@ export default function PlayerPage({
         onSpeedChange={(s) => {
           setSpeed(s);
           player.setSpeed(s);
+          // Persist per-book speed (fire-and-forget)
+          updateSpeed(id, s).catch(() => {});
         }}
         totalSentences={sentences.length}
         voice={voice}

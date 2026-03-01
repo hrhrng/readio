@@ -51,7 +51,7 @@ const PlainTextSentenceSpan = memo(function PlainTextSentenceSpan({
           <span
             key={wIdx}
             className={
-              isHighlightedWord ? "text-highlight-word font-semibold" : ""
+              isHighlightedWord ? "bg-highlight-word-bg rounded-sm" : ""
             }
           >
             {word}
@@ -121,7 +121,7 @@ export function PlainTextReader({
   return (
     <div className="space-y-6">
       {paragraphs.map((paraSentences, pIdx) => (
-        <p key={pIdx} className="text-lg leading-relaxed text-text-primary">
+        <p key={pIdx} className="leading-relaxed text-text-primary">
           {paraSentences.map((sentence) => (
             <PlainTextSentenceSpan
               key={sentence.index}
