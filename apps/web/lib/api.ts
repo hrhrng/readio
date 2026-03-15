@@ -12,6 +12,11 @@ const BASE = "";
 const API_DIRECT =
   process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
+/** Wrapper around fetch that includes credentials for cookie-based auth. */
+function apiFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  return fetch(input, { credentials: "include", ...init });
+}
+
 /**
  * Extract cover image from an EPUB file using epub.js.
  *
@@ -77,19 +82,19 @@ export async function fetchItems(
     }
   });
 
-  const res = await fetch(url.toString());
+  const res = await apiFetch(url.toString());
   if (!res.ok) throw new Error(`Failed to fetch items: ${res.status}`);
   return res.json();
 }
 
 export async function fetchItem(id: string): Promise<LibraryItem> {
-  const res = await fetch(`${BASE}/api/library/items/${id}`);
+  const res = await apiFetch(`${BASE}/api/library/items/${id}`);
   if (!res.ok) throw new Error(`Failed to fetch item: ${res.status}`);
   return res.json();
 }
 
 export async function deleteItem(id: string): Promise<void> {
-  const res = await fetch(`${BASE}/api/library/items/${id}`, {
+  const res = await apiFetch(`${BASE}/api/library/items/${id}`, {
     method: "DELETE",
   });
   if (!res.ok) throw new Error(`Failed to delete item: ${res.status}`);
@@ -124,7 +129,7 @@ export async function importFile(
     }
   }
 
-  const res = await fetch(`${API_DIRECT}/api/library/import/file`, {
+  const res = await apiFetch(`${API_DIRECT}/api/library/import/file`, {
     method: "POST",
     body: formData,
   });
@@ -139,7 +144,7 @@ export async function importUrl(
   url: string,
   options: { folder_id?: string; category?: string; title?: string } = {}
 ): Promise<LibraryItem> {
-  const res = await fetch(`${BASE}/api/library/import/url`, {
+  const res = await apiFetch(`${BASE}/api/library/import/url`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -157,7 +162,7 @@ export async function importUrl(
 }
 
 export async function fetchItemFile(id: string): Promise<ArrayBuffer> {
-  const res = await fetch(`${BASE}/api/library/items/${id}/file`);
+  const res = await apiFetch(`${BASE}/api/library/items/${id}/file`);
   if (!res.ok) throw new Error(`Failed to fetch file: ${res.status}`);
   return res.arrayBuffer();
 }
@@ -165,7 +170,7 @@ export async function fetchItemFile(id: string): Promise<ArrayBuffer> {
 export async function createTTSJob(
   params: TTSJobCreateParams
 ): Promise<TTSJobStatusResponse> {
-  const res = await fetch(`${BASE}/api/tts/jobs`, {
+  const res = await apiFetch(`${BASE}/api/tts/jobs`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(params),
@@ -180,7 +185,7 @@ export async function pollTTSJob(
 ): Promise<TTSJobStatusResponse> {
   const url = new URL(`/api/tts/jobs/${jobId}`, window.location.origin);
   if (includeAudio) url.searchParams.set("include_audio", "true");
-  const res = await fetch(url.toString());
+  const res = await apiFetch(url.toString());
   if (!res.ok) throw new Error(`Failed to poll TTS job: ${res.status}`);
   return res.json();
 }
@@ -190,7 +195,7 @@ export async function cancelTTSSession(
   keepItemId?: string,
   keepChapterId?: string
 ): Promise<{ cancelled_job_ids: string[] }> {
-  const res = await fetch(`${BASE}/api/tts/sessions/${sessionId}/cancel`, {
+  const res = await apiFetch(`${BASE}/api/tts/sessions/${sessionId}/cancel`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -207,7 +212,7 @@ export async function updateProgress(
   id: string,
   progress: number
 ): Promise<void> {
-  await fetch(`${BASE}/api/library/items/${id}/progress`, {
+  await apiFetch(`${BASE}/api/library/items/${id}/progress`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ progress }),
@@ -218,7 +223,7 @@ export async function updateVoice(
   id: string,
   voice: string | null
 ): Promise<void> {
-  await fetch(`${BASE}/api/library/items/${id}/voice`, {
+  await apiFetch(`${BASE}/api/library/items/${id}/voice`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ voice }),
@@ -229,7 +234,7 @@ export async function updateSpeed(
   id: string,
   speed: number | null
 ): Promise<void> {
-  await fetch(`${BASE}/api/library/items/${id}/speed`, {
+  await apiFetch(`${BASE}/api/library/items/${id}/speed`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ speed }),
@@ -240,7 +245,7 @@ export async function updateChapter(
   id: string,
   chapter: string | null
 ): Promise<void> {
-  await fetch(`${BASE}/api/library/items/${id}/chapter`, {
+  await apiFetch(`${BASE}/api/library/items/${id}/chapter`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ chapter }),
@@ -248,15 +253,41 @@ export async function updateChapter(
 }
 
 export async function fetchVoices(): Promise<VoiceListResponse> {
-  const res = await fetch(`${BASE}/api/tts/voices`);
+  const res = await apiFetch(`${BASE}/api/tts/voices`);
   if (!res.ok) throw new Error(`Failed to fetch voices: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchVoicesByProvider(provider: string): Promise<VoiceListResponse> {
+  const res = await apiFetch(`${BASE}/api/tts/voices?provider=${encodeURIComponent(provider)}`);
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new Error(body?.detail ?? `Failed to fetch voices: ${res.status}`);
+  }
+  return res.json();
+}
+
+export interface ModelInfo {
+  model_id: string;
+  label: string;
+  description: string | null;
+}
+
+export interface ModelListResponse {
+  models: ModelInfo[];
+  default_model_id: string;
+}
+
+export async function fetchModels(provider: string): Promise<ModelListResponse> {
+  const res = await apiFetch(`${BASE}/api/tts/models?provider=${encodeURIComponent(provider)}`);
+  if (!res.ok) throw new Error(`Failed to fetch models: ${res.status}`);
   return res.json();
 }
 
 // ── User settings persistence ────────────────────────────────────────────
 
 export async function fetchSettings(): Promise<Record<string, string>> {
-  const res = await fetch(`${BASE}/api/settings`);
+  const res = await apiFetch(`${BASE}/api/settings`);
   if (!res.ok) throw new Error(`Failed to fetch settings: ${res.status}`);
   return res.json();
 }
@@ -264,9 +295,23 @@ export async function fetchSettings(): Promise<Record<string, string>> {
 export async function patchSettings(
   data: Record<string, string>
 ): Promise<void> {
-  await fetch(`${BASE}/api/settings`, {
+  await apiFetch(`${BASE}/api/settings`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
   });
+}
+
+// ── API Keys management ──────────────────────────────────────────────────
+
+export interface ApiKeyStatus {
+  configured: boolean;
+  masked: string | null;
+  has_global_fallback: boolean;
+}
+
+export async function fetchApiKeys(): Promise<Record<string, ApiKeyStatus>> {
+  const res = await apiFetch(`${BASE}/api/settings/api-keys`);
+  if (!res.ok) throw new Error(`Failed to fetch API keys: ${res.status}`);
+  return res.json();
 }

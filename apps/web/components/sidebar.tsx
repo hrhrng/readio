@@ -19,6 +19,7 @@ import { SidebarLink } from "./sidebar-link";
 import { UserPopover } from "./user-popover";
 import { SettingsDialog } from "./settings-dialog";
 import { ImportDialog } from "./import-dialog";
+import { useSession } from "@/lib/auth-client";
 
 function SidebarSection({
   label,
@@ -42,6 +43,9 @@ export function Sidebar() {
   const [popoverOpen, setPopoverOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const avatarRef = useRef<HTMLButtonElement>(null);
+  const { data: session } = useSession();
+  const userName = session?.user?.name || "reader";
+  const userInitial = userName.charAt(0).toUpperCase();
 
   return (
     <>
@@ -114,10 +118,10 @@ export function Sidebar() {
             className="flex items-center gap-3 w-full rounded-lg px-3 py-2 hover:bg-surface-hover transition-colors cursor-pointer"
           >
             <div className="w-8 h-8 rounded-full bg-surface-hover flex items-center justify-center text-text-secondary text-xs font-bold">
-              R
+              {userInitial}
             </div>
             <span className="flex-1 text-left text-sm text-text-secondary truncate">
-              reader
+              {userName}
             </span>
             <ChevronUp
               size={14}

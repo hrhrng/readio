@@ -2,15 +2,11 @@
   "name": "readio-monorepo",
   "private": true,
   "version": "0.1.0",
-  "workspaces": [
-    "apps/web",
-    "apps/extension"
-  ],
   "scripts": {
-    "dev": "concurrently -n web,api -c cyan,green \"npm run dev --workspace @readio/web\" \"cd apps/api && TTS_FALLBACK_ORDER=minimax uv run --all-groups uvicorn app.main:app --reload --port 8000\"",
-    "dev:web": "npm run dev --workspace @readio/web",
-    "dev:extension": "npm run dev --workspace @readio/extension",
-    "build": "npm run build --workspace @readio/web && npm run build --workspace @readio/extension",
+    "dev": "concurrently -n web,api -c cyan,green \"pnpm --filter @readio/web dev\" \"cd apps/api && TTS_FALLBACK_ORDER=minimax uv run --all-groups uvicorn app.main:app --reload --port 8000\"",
+    "dev:web": "pnpm --filter @readio/web dev",
+    "dev:extension": "pnpm --filter @readio/extension dev",
+    "build": "pnpm --filter @readio/web build && pnpm --filter @readio/extension build",
     "test": "make test",
     "clean": "rimraf node_modules apps/web/.next apps/web/.next-dev apps/extension/dist apps/extension/.cache"
   },
@@ -18,8 +14,16 @@
     "concurrently": "^9.0.1",
     "rimraf": "^6.0.1"
   },
-  "overrides": {
-    "react": "19.0.0",
-    "react-dom": "19.0.0"
+  "pnpm": {
+    "overrides": {
+      "react": "19.0.0",
+      "react-dom": "19.0.0"
+    },
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "esbuild",
+      "sharp",
+      "unrs-resolver"
+    ]
   }
 }

@@ -129,17 +129,24 @@ def resolve_minimax_endpoint() -> str:
     return _append_group_id(f'{base}/v1/t2a_v2', settings.minimax_group_id.strip())
 
 
-def _resolve_voice_id(request: TTSRequest) -> str:
-    return request.voice or settings.minimax_voice_id or DEFAULT_MINIMAX_VOICE
+def _resolve_voice_id(request: TTSRequest, user_voice_id: str | None = None) -> str:
+    return request.voice or user_voice_id or settings.minimax_voice_id or DEFAULT_MINIMAX_VOICE
 
 
-def _build_payload(request: TTSRequest, *, stream: bool) -> dict[str, Any]:
+def _build_payload(
+    request: TTSRequest,
+    *,
+    stream: bool,
+    user_model_id: str | None = None,
+    user_voice_id: str | None = None,
+    user_group_id: str | None = None,
+) -> dict[str, Any]:
     payload: dict[str, Any] = {
-        'model': request.provider_options.get('model') or settings.minimax_model_id or DEFAULT_MINIMAX_MODEL,
+        'model': request.provider_options.get('model') or user_model_id or settings.minimax_model_id or DEFAULT_MINIMAX_MODEL,
         'text': request.text,
         'stream': stream,
         'voice_setting': {
-            'voice_id': _resolve_voice_id(request),
+            'voice_id': _resolve_voice_id(request, user_voice_id),
             'speed': request.speed if request.speed is not None else 1.0,
             'vol': 1.0,
             'pitch': 0,
@@ -152,7 +159,7 @@ def _build_payload(request: TTSRequest, *, stream: bool) -> dict[str, Any]:
         },
         'output_format': request.provider_options.get('output_format', 'hex'),
     }
-    group_id = settings.minimax_group_id.strip()
+    group_id = (user_group_id or settings.minimax_group_id).strip()
     if group_id:
         payload['group_id'] = group_id
     return payload
@@ -231,23 +238,45 @@ def _extract_trace_id(data: dict[str, Any]) -> str:
 
 
 class MiniMaxProvider:
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        group_id: str | None = None,
+        model_id: str | None = None,
+        voice_id: str | None = None,
+    ):
+        self._user_api_key = api_key
+        self._user_group_id = group_id
+        self._user_model_id = model_id
+        self._user_voice_id = voice_id
+
     @property
     def id(self) -> str:
         return 'minimax'
 
+    def _effective_api_key(self) -> str:
+        return self._user_api_key or settings.minimax_api_key
+
     def is_available(self) -> bool:
-        return bool(settings.minimax_api_key)
+        return bool(self._effective_api_key())
 
     async def synthesize(self, request: TTSRequest) -> TTSResult:
         if not self.is_available():
             raise RuntimeError('MINIMAX_API_KEY is not configured')
 
         url = resolve_minimax_endpoint()
+        api_key = self._effective_api_key()
         headers = {
-            'Authorization': f"Bearer {settings.minimax_api_key}",
+            'Authorization': f"Bearer {api_key}",
             'Content-Type': 'application/json'
         }
-        payload = _build_payload(request, stream=False)
+        payload = _build_payload(
+            request, stream=False,
+            user_model_id=self._user_model_id,
+            user_voice_id=self._user_voice_id,
+            user_group_id=self._user_group_id,
+        )
 
         try:
             async with httpx.AsyncClient(timeout=settings.tts_timeout_seconds) as client:
@@ -292,8 +321,9 @@ class MiniMaxProvider:
             raise RuntimeError('MINIMAX_API_KEY is not configured')
 
         url = resolve_minimax_endpoint()
+        api_key = self._effective_api_key()
         headers = {
-            'Authorization': f'Bearer {settings.minimax_api_key}',
+            'Authorization': f'Bearer {api_key}',
             'Content-Type': 'application/json',
         }
         payload = _build_enhanced_payload(request, stream=False)
@@ -373,11 +403,17 @@ class MiniMaxProvider:
             raise RuntimeError('MINIMAX_API_KEY is not configured')
 
         url = resolve_minimax_endpoint()
+        api_key = self._effective_api_key()
         headers = {
-            'Authorization': f"Bearer {settings.minimax_api_key}",
+            'Authorization': f"Bearer {api_key}",
             'Content-Type': 'application/json',
         }
-        payload = _build_payload(request, stream=True)
+        payload = _build_payload(
+            request, stream=True,
+            user_model_id=self._user_model_id,
+            user_voice_id=self._user_voice_id,
+            user_group_id=self._user_group_id,
+        )
         # MiniMax streaming is audio-chunk streaming. Hex is stable across accounts.
         payload['output_format'] = 'hex'
 

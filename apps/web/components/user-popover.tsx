@@ -1,8 +1,10 @@
 "use client";
 
 import { useEffect, useRef } from "react";
+import { useRouter } from "next/navigation";
 import { createPortal } from "react-dom";
 import { Settings, HelpCircle, LogOut } from "lucide-react";
+import { useSession, signOut } from "@/lib/auth-client";
 
 interface UserPopoverProps {
   open: boolean;
@@ -19,6 +21,8 @@ interface UserPopoverProps {
  */
 export function UserPopover({ open, onClose, onOpenSettings, triggerRef }: UserPopoverProps) {
   const panelRef = useRef<HTMLDivElement>(null);
+  const router = useRouter();
+  const { data: session } = useSession();
 
   // Close on ESC
   useEffect(() => {
@@ -56,6 +60,8 @@ export function UserPopover({ open, onClose, onOpenSettings, triggerRef }: UserP
     width: POPOVER_WIDTH,
   };
 
+  const userEmail = session?.user?.email ?? "reader@readio.app";
+
   return createPortal(
     <div
       ref={panelRef}
@@ -65,7 +71,7 @@ export function UserPopover({ open, onClose, onOpenSettings, triggerRef }: UserP
       {/* User info */}
       <div className="px-3.5 py-2.5">
         <p className="text-sm font-medium text-text-primary truncate">
-          reader@readio.app
+          {userEmail}
         </p>
       </div>
 
@@ -91,8 +97,16 @@ export function UserPopover({ open, onClose, onOpenSettings, triggerRef }: UserP
 
       <Divider />
 
-      {/* Log out (placeholder) */}
-      <PopoverItem icon={LogOut} label="Log out" onClick={onClose} />
+      {/* Log out */}
+      <PopoverItem
+        icon={LogOut}
+        label="Log out"
+        onClick={async () => {
+          onClose();
+          await signOut();
+          router.push("/login");
+        }}
+      />
     </div>,
     document.body
   );

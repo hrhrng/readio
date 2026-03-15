@@ -90,16 +90,6 @@ class LibraryStore:
                 connection.execute('ALTER TABLE library_items ADD COLUMN current_chapter TEXT DEFAULT NULL')
                 connection.commit()
 
-            # Migrate: add per-book TTS speed preference (NULL = use global default)
-            if 'speed' not in columns:
-                connection.execute('ALTER TABLE library_items ADD COLUMN speed REAL DEFAULT NULL')
-                connection.commit()
-
-            # Migrate: add current_chapter to track EPUB reading position
-            if 'current_chapter' not in columns:
-                connection.execute('ALTER TABLE library_items ADD COLUMN current_chapter TEXT DEFAULT NULL')
-                connection.commit()
-
             # Migrate: add content_format to distinguish markdown vs plaintext web imports
             if 'content_format' not in columns:
                 connection.execute('ALTER TABLE library_items ADD COLUMN content_format TEXT DEFAULT NULL')
@@ -112,6 +102,19 @@ class LibraryStore:
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
+                )
+                '''
+            )
+            connection.commit()
+
+            # Per-user settings table for per-user API keys and preferences
+            connection.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS user_settings (
+                    user_id TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    PRIMARY KEY (user_id, key)
                 )
                 '''
             )
@@ -406,3 +409,42 @@ class LibraryStore:
                         (key, value),
                     )
             connection.commit()
+
+    # ── Per-user settings persistence ────────────────────────────────────
+
+    def get_user_settings(self, user_id: str) -> dict[str, str]:
+        """Return all settings for a specific user."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                'SELECT key, value FROM user_settings WHERE user_id = ?',
+                (user_id,),
+            ).fetchall()
+        return {row['key']: row['value'] for row in rows}
+
+    def update_user_settings(self, user_id: str, data: dict[str, str | None]) -> None:
+        """Upsert per-user settings; a value of None deletes the key."""
+        with self._connect() as connection:
+            for key, value in data.items():
+                if value is None:
+                    connection.execute(
+                        'DELETE FROM user_settings WHERE user_id = ? AND key = ?',
+                        (user_id, key),
+                    )
+                else:
+                    connection.execute(
+                        '''
+                        INSERT INTO user_settings (user_id, key, value) VALUES (?, ?, ?)
+                        ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value
+                        ''',
+                        (user_id, key, value),
+                    )
+            connection.commit()
+
+    def get_user_api_keys(self, user_id: str) -> dict[str, str]:
+        """Return only TTS-related API key settings for a user."""
+        api_key_keys = {
+            'elevenlabs_api_key', 'elevenlabs_model_id', 'elevenlabs_voice_id',
+            'minimax_api_key', 'minimax_group_id', 'minimax_model_id', 'minimax_voice_id',
+        }
+        all_settings = self.get_user_settings(user_id)
+        return {k: v for k, v in all_settings.items() if k in api_key_keys}

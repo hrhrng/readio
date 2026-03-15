@@ -1,11 +1,13 @@
 "use client";
 
 import { useTheme } from "next-themes";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import { createPortal } from "react-dom";
-import { Sun, Moon, Monitor, Check, X } from "lucide-react";
+import { Sun, Moon, Monitor, Check, X, Eye, EyeOff, Trash2, ChevronDown, Search } from "lucide-react";
 import { useSettings } from "@/lib/hooks";
 import { applyAccentColor, applyFontSize } from "@/lib/settings-utils";
+import { fetchApiKeys, fetchVoicesByProvider, fetchModels, patchSettings, type ApiKeyStatus, type ModelInfo } from "@/lib/api";
+import type { VoiceInfo } from "@/lib/types";
 
 interface SettingsDialogProps {
   open: boolean;
@@ -15,6 +17,7 @@ interface SettingsDialogProps {
 const NAV_ITEMS = [
   { id: "appearance", label: "Appearance" },
   { id: "reading", label: "Reading" },
+  { id: "api-keys", label: "API Keys" },
   { id: "about", label: "About" },
 ] as const;
 
@@ -128,6 +131,7 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
                 }}
               />
             )}
+            {activeSection === "api-keys" && <ApiKeysSection />}
             {activeSection === "about" && <AboutSection />}
           </div>
         </div>
@@ -274,6 +278,498 @@ function ReadingSection({
           </span>
         </div>
       </div>
+    </div>
+  );
+}
+
+/* ─────────────── Section: API Keys ─────────────── */
+
+interface ApiKeyFieldConfig {
+  key: string;
+  label: string;
+  placeholder: string;
+  isSecret: boolean;
+  fieldType: "text" | "voice" | "model";
+  provider: string;
+}
+
+const ELEVENLABS_FIELDS: ApiKeyFieldConfig[] = [
+  { key: "elevenlabs_api_key", label: "API Key", placeholder: "sk-...", isSecret: true, fieldType: "text", provider: "elevenlabs" },
+  { key: "elevenlabs_model_id", label: "Model ID", placeholder: "eleven_multilingual_v2", isSecret: false, fieldType: "model", provider: "elevenlabs" },
+  { key: "elevenlabs_voice_id", label: "Voice ID", placeholder: "Default voice ID", isSecret: false, fieldType: "voice", provider: "elevenlabs" },
+];
+
+const MINIMAX_FIELDS: ApiKeyFieldConfig[] = [
+  { key: "minimax_api_key", label: "API Key", placeholder: "eyJ...", isSecret: true, fieldType: "text", provider: "minimax" },
+  { key: "minimax_group_id", label: "Group ID", placeholder: "Optional", isSecret: false, fieldType: "text", provider: "minimax" },
+  { key: "minimax_model_id", label: "Model ID", placeholder: "speech-2.6-hd", isSecret: false, fieldType: "model", provider: "minimax" },
+  { key: "minimax_voice_id", label: "Voice ID", placeholder: "Default voice ID", isSecret: false, fieldType: "voice", provider: "minimax" },
+];
+
+function ApiKeysSection() {
+  const [keyStatus, setKeyStatus] = useState<Record<string, ApiKeyStatus>>({});
+  const [loading, setLoading] = useState(true);
+
+  const loadKeys = useCallback(async () => {
+    try {
+      const data = await fetchApiKeys();
+      setKeyStatus(data);
+    } catch {
+      // ignore
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadKeys();
+  }, [loadKeys]);
+
+  if (loading) {
+    return (
+      <div className="space-y-4">
+        <SectionHeading>API Keys</SectionHeading>
+        <p className="text-sm text-text-tertiary">Loading...</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-8">
+      <div>
+        <SectionHeading>API Keys</SectionHeading>
+        <p className="text-sm text-text-tertiary mb-4">
+          Configure your own TTS provider API keys. When not set, the global server keys will be used as fallback.
+        </p>
+      </div>
+
+      <ProviderSection
+        title="ElevenLabs"
+        fields={ELEVENLABS_FIELDS}
+        keyStatus={keyStatus}
+        onUpdate={loadKeys}
+      />
+
+      <Divider />
+
+      <ProviderSection
+        title="MiniMax"
+        fields={MINIMAX_FIELDS}
+        keyStatus={keyStatus}
+        onUpdate={loadKeys}
+      />
+    </div>
+  );
+}
+
+function ProviderSection({
+  title,
+  fields,
+  keyStatus,
+  onUpdate,
+}: {
+  title: string;
+  fields: ApiKeyFieldConfig[];
+  keyStatus: Record<string, ApiKeyStatus>;
+  onUpdate: () => void;
+}) {
+  return (
+    <div>
+      <h4 className="text-sm font-medium text-text-primary mb-3">{title}</h4>
+      <div className="space-y-3">
+        {fields.map((field) => {
+          if (field.fieldType === "voice" || field.fieldType === "model") {
+            return (
+              <SelectableField
+                key={field.key}
+                config={field}
+                status={keyStatus[field.key]}
+                keyStatus={keyStatus}
+                onUpdate={onUpdate}
+              />
+            );
+          }
+          return (
+            <ApiKeyField
+              key={field.key}
+              config={field}
+              status={keyStatus[field.key]}
+              onUpdate={onUpdate}
+            />
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function ApiKeyField({
+  config,
+  status,
+  onUpdate,
+}: {
+  config: ApiKeyFieldConfig;
+  status?: ApiKeyStatus;
+  onUpdate: () => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [value, setValue] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [showValue, setShowValue] = useState(false);
+
+  const isConfigured = status?.configured ?? false;
+  const hasGlobalFallback = status?.has_global_fallback ?? false;
+
+  async function handleSave() {
+    if (!value.trim()) return;
+    setSaving(true);
+    try {
+      await patchSettings({ [config.key]: value.trim() });
+      setValue("");
+      setEditing(false);
+      onUpdate();
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleRemove() {
+    setSaving(true);
+    try {
+      await patchSettings({ [config.key]: null as unknown as string });
+      onUpdate();
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (editing) {
+    return (
+      <div className="flex items-center gap-2">
+        <label className="w-20 text-xs text-text-secondary shrink-0">{config.label}</label>
+        <input
+          type={config.isSecret && !showValue ? "password" : "text"}
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          placeholder={config.placeholder}
+          className="flex-1 rounded-lg border border-border bg-surface-card px-3 py-1.5 text-sm text-text-primary placeholder:text-text-tertiary focus:outline-none focus:ring-2 focus:ring-accent"
+          autoFocus
+          onKeyDown={(e) => {
+            if (e.key === "Enter") handleSave();
+            if (e.key === "Escape") { setEditing(false); setValue(""); }
+          }}
+        />
+        {config.isSecret && (
+          <button
+            type="button"
+            onClick={() => setShowValue(!showValue)}
+            className="p-1.5 text-text-tertiary hover:text-text-secondary cursor-pointer"
+          >
+            {showValue ? <EyeOff size={14} /> : <Eye size={14} />}
+          </button>
+        )}
+        <button
+          onClick={handleSave}
+          disabled={saving || !value.trim()}
+          className="px-3 py-1.5 text-xs font-medium rounded-lg bg-accent text-white hover:opacity-90 disabled:opacity-50 cursor-pointer"
+        >
+          Save
+        </button>
+        <button
+          onClick={() => { setEditing(false); setValue(""); }}
+          className="px-2 py-1.5 text-xs text-text-tertiary hover:text-text-primary cursor-pointer"
+        >
+          Cancel
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex items-center gap-2">
+      <label className="w-20 text-xs text-text-secondary shrink-0">{config.label}</label>
+      <div className="flex-1 text-sm">
+        {isConfigured ? (
+          <span className="text-text-primary font-mono text-xs">
+            {status?.masked ?? "Configured"}
+          </span>
+        ) : (
+          <span className="text-text-tertiary text-xs">
+            Not set
+            {hasGlobalFallback && " (using server default)"}
+          </span>
+        )}
+      </div>
+      <button
+        onClick={() => setEditing(true)}
+        className="px-3 py-1.5 text-xs font-medium rounded-lg border border-border text-text-secondary hover:text-text-primary hover:bg-surface-hover cursor-pointer"
+      >
+        {isConfigured ? "Change" : "Set"}
+      </button>
+      {isConfigured && (
+        <button
+          onClick={handleRemove}
+          disabled={saving}
+          className="p-1.5 text-text-tertiary hover:text-red-500 cursor-pointer disabled:opacity-50"
+          title="Remove"
+        >
+          <Trash2 size={14} />
+        </button>
+      )}
+    </div>
+  );
+}
+
+/* ─────────────── Selectable Field (Voice/Model picker) ─────────────── */
+
+function SelectableField({
+  config,
+  status,
+  keyStatus,
+  onUpdate,
+}: {
+  config: ApiKeyFieldConfig;
+  status?: ApiKeyStatus;
+  keyStatus: Record<string, ApiKeyStatus>;
+  onUpdate: () => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [manualMode, setManualMode] = useState(false);
+  const [manualValue, setManualValue] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [search, setSearch] = useState("");
+  const [items, setItems] = useState<Array<{ id: string; label: string; description: string | null }>>([]);
+  const [defaultId, setDefaultId] = useState("");
+  const [loadingItems, setLoadingItems] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const dropdownRef = useRef<HTMLDivElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+
+  const isConfigured = status?.configured ?? false;
+  const currentValue = status?.masked ?? null;
+
+  // Check if provider API key is available (for ElevenLabs voice browsing)
+  const apiKeyField = `${config.provider}_api_key`;
+  const hasApiKey = keyStatus[apiKeyField]?.configured || keyStatus[apiKeyField]?.has_global_fallback;
+
+  // Close dropdown on outside click
+  useEffect(() => {
+    if (!expanded) return;
+    const handler = (e: MouseEvent) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
+        setExpanded(false);
+        setSearch("");
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [expanded]);
+
+  // Focus search when expanded
+  useEffect(() => {
+    if (expanded && searchRef.current) {
+      searchRef.current.focus();
+    }
+  }, [expanded]);
+
+  async function loadItems() {
+    setLoadingItems(true);
+    setError(null);
+    try {
+      if (config.fieldType === "voice") {
+        const data = await fetchVoicesByProvider(config.provider);
+        setItems(data.voices.map((v: VoiceInfo) => ({ id: v.voice_id, label: v.label, description: v.description })));
+        setDefaultId(data.default_voice_id);
+      } else {
+        const data = await fetchModels(config.provider);
+        setItems(data.models.map((m: ModelInfo) => ({ id: m.model_id, label: m.label, description: m.description })));
+        setDefaultId(data.default_model_id);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to load");
+    } finally {
+      setLoadingItems(false);
+    }
+  }
+
+  function handleExpand() {
+    if (config.fieldType === "voice" && config.provider === "elevenlabs" && !hasApiKey) {
+      setError("Set API key first to browse voices");
+      setExpanded(true);
+      return;
+    }
+    setExpanded(true);
+    loadItems();
+  }
+
+  async function handleSelect(id: string) {
+    setSaving(true);
+    try {
+      await patchSettings({ [config.key]: id });
+      setExpanded(false);
+      setSearch("");
+      onUpdate();
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleManualSave() {
+    if (!manualValue.trim()) return;
+    setSaving(true);
+    try {
+      await patchSettings({ [config.key]: manualValue.trim() });
+      setManualValue("");
+      setManualMode(false);
+      onUpdate();
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleRemove() {
+    setSaving(true);
+    try {
+      await patchSettings({ [config.key]: null as unknown as string });
+      onUpdate();
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (manualMode) {
+    return (
+      <div className="flex items-center gap-2">
+        <label className="w-20 text-xs text-text-secondary shrink-0">{config.label}</label>
+        <input
+          type="text"
+          value={manualValue}
+          onChange={(e) => setManualValue(e.target.value)}
+          placeholder={config.placeholder}
+          className="flex-1 rounded-lg border border-border bg-surface-card px-3 py-1.5 text-sm text-text-primary placeholder:text-text-tertiary focus:outline-none focus:ring-2 focus:ring-accent"
+          autoFocus
+          onKeyDown={(e) => {
+            if (e.key === "Enter") handleManualSave();
+            if (e.key === "Escape") { setManualMode(false); setManualValue(""); }
+          }}
+        />
+        <button
+          onClick={handleManualSave}
+          disabled={saving || !manualValue.trim()}
+          className="px-3 py-1.5 text-xs font-medium rounded-lg bg-accent text-white hover:opacity-90 disabled:opacity-50 cursor-pointer"
+        >
+          Save
+        </button>
+        <button
+          onClick={() => { setManualMode(false); setManualValue(""); }}
+          className="px-2 py-1.5 text-xs text-text-tertiary hover:text-text-primary cursor-pointer"
+        >
+          Cancel
+        </button>
+      </div>
+    );
+  }
+
+  const filtered = items.filter(
+    (item) =>
+      item.label.toLowerCase().includes(search.toLowerCase()) ||
+      item.id.toLowerCase().includes(search.toLowerCase())
+  );
+
+  return (
+    <div className="relative" ref={dropdownRef}>
+      <div className="flex items-center gap-2">
+        <label className="w-20 text-xs text-text-secondary shrink-0">{config.label}</label>
+        <div className="flex-1 text-sm">
+          {isConfigured ? (
+            <span className="text-text-primary font-mono text-xs">{currentValue}</span>
+          ) : (
+            <span className="text-text-tertiary text-xs">
+              Not set
+              {status?.has_global_fallback && " (using server default)"}
+            </span>
+          )}
+        </div>
+        <button
+          onClick={handleExpand}
+          className="px-3 py-1.5 text-xs font-medium rounded-lg border border-border text-text-secondary hover:text-text-primary hover:bg-surface-hover cursor-pointer inline-flex items-center gap-1"
+        >
+          <ChevronDown size={12} />
+          {isConfigured ? "Change" : "Select"}
+        </button>
+        {isConfigured && (
+          <button
+            onClick={handleRemove}
+            disabled={saving}
+            className="p-1.5 text-text-tertiary hover:text-red-500 cursor-pointer disabled:opacity-50"
+            title="Remove"
+          >
+            <Trash2 size={14} />
+          </button>
+        )}
+      </div>
+
+      {expanded && (
+        <div className="absolute left-20 right-0 top-full mt-1 z-10 bg-surface-card border border-border rounded-xl shadow-lg overflow-hidden">
+          {/* Search */}
+          <div className="flex items-center gap-2 px-3 py-2 border-b border-border">
+            <Search size={14} className="text-text-tertiary shrink-0" />
+            <input
+              ref={searchRef}
+              type="text"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search..."
+              className="flex-1 text-sm bg-transparent text-text-primary placeholder:text-text-tertiary outline-none"
+            />
+          </div>
+
+          {/* List */}
+          <div className="max-h-52 overflow-y-auto">
+            {loadingItems && (
+              <div className="px-3 py-4 text-xs text-text-tertiary text-center">Loading...</div>
+            )}
+            {error && (
+              <div className="px-3 py-4 text-xs text-text-tertiary text-center">{error}</div>
+            )}
+            {!loadingItems && !error && filtered.length === 0 && (
+              <div className="px-3 py-4 text-xs text-text-tertiary text-center">No results</div>
+            )}
+            {!loadingItems && !error && filtered.map((item) => (
+              <button
+                key={item.id}
+                onClick={() => handleSelect(item.id)}
+                disabled={saving}
+                className="w-full text-left px-3 py-2 hover:bg-surface-hover transition-colors cursor-pointer flex flex-col gap-0.5"
+              >
+                <span className="text-sm text-text-primary flex items-center gap-2">
+                  {item.label}
+                  {item.id === defaultId && (
+                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-accent/10 text-accent font-medium">default</span>
+                  )}
+                  {item.id === currentValue && (
+                    <Check size={14} className="text-accent" />
+                  )}
+                </span>
+                <span className="text-xs text-text-tertiary font-mono">{item.id}</span>
+                {item.description && (
+                  <span className="text-xs text-text-tertiary">{item.description}</span>
+                )}
+              </button>
+            ))}
+          </div>
+
+          {/* Footer: type manually */}
+          <div className="border-t border-border px-3 py-2">
+            <button
+              onClick={() => { setExpanded(false); setSearch(""); setManualMode(true); }}
+              className="text-xs text-accent hover:underline cursor-pointer"
+            >
+              Type manually
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

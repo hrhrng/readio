@@ -53,6 +53,7 @@ class Settings:
     library_epub_max_chars: int = field(
         default_factory=lambda: int(os.getenv('READIO_LIBRARY_EPUB_MAX_CHARS', str(6_000_000)))
     )
+    auth_db_path: str = field(default_factory=lambda: os.getenv('READIO_AUTH_DB_PATH', './data/auth.db'))
     library_db_path: str = field(default_factory=lambda: os.getenv('READIO_LIBRARY_DB_PATH', './data/readio.db'))
     library_files_dir: str = field(default_factory=lambda: os.getenv('READIO_LIBRARY_FILES_DIR', './data/files'))
     cors_origins: str = field(

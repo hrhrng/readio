@@ -8,11 +8,12 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, Response, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from starlette.responses import StreamingResponse
 
+from app.core.auth import get_current_user_id, get_optional_user_id
 from app.core.settings import settings
 from app.library.files import delete_file, save_file, get_file_path
 from app.library.importers import extract_uploaded_document, fetch_url_document
@@ -33,6 +34,7 @@ from app.tts.models import (
     TTSRequest,
 )
 from app.tts.providers.edge import EdgeTTSProvider
+from app.tts.providers.elevenlabs import fetch_elevenlabs_voices
 from app.tts.providers.minimax import DEFAULT_MINIMAX_VOICE, MiniMaxProvider, fetch_system_voices
 from app.tts.registry import build_tts_router
 from app.api.text_utils import contains_cjk, split_sentences, split_cjk_clauses
@@ -46,6 +48,24 @@ tts_job_manager = TTSJobManager(
     cache_size=settings.tts_job_cache_size,
 )
 library_store = LibraryStore(settings.library_db_path)
+
+
+def _build_user_tts_router(user_id: str | None) -> 'TTSRouter':
+    """Build a TTSRouter with per-user API keys if available."""
+    if not user_id:
+        return tts_router
+    user_keys = library_store.get_user_api_keys(user_id)
+    if not user_keys:
+        return tts_router
+    return build_tts_router(
+        elevenlabs_api_key=user_keys.get('elevenlabs_api_key'),
+        elevenlabs_model_id=user_keys.get('elevenlabs_model_id'),
+        elevenlabs_voice_id=user_keys.get('elevenlabs_voice_id'),
+        minimax_api_key=user_keys.get('minimax_api_key'),
+        minimax_group_id=user_keys.get('minimax_group_id'),
+        minimax_model_id=user_keys.get('minimax_model_id'),
+        minimax_voice_id=user_keys.get('minimax_voice_id'),
+    )
 
 
 class ProviderItem(BaseModel):
@@ -102,8 +122,8 @@ def _split_text_for_stream(text: str, max_chars: int) -> list[str]:
     return out
 
 
-def _resolve_minimax_stream_provider() -> Any | None:
-    providers = getattr(tts_router, 'providers', None)
+def _resolve_minimax_stream_provider(router_instance: Any | None = None) -> Any | None:
+    providers = getattr(router_instance or tts_router, 'providers', None)
     if not isinstance(providers, dict):
         return None
 
@@ -361,17 +381,49 @@ def _convert_system_voice(raw: dict) -> VoiceInfo:
 
 
 @router.get('/api/tts/voices', response_model=VoiceListResponse)
-async def list_voices() -> VoiceListResponse:
-    raw_voices = await fetch_system_voices()
+async def list_voices(
+    provider: str = Query(default='minimax'),
+    user_id: str | None = Depends(get_optional_user_id),
+) -> VoiceListResponse:
+    if provider == 'elevenlabs':
+        # Resolve API key: user key first, then global fallback
+        api_key = None
+        if user_id:
+            user_keys = library_store.get_user_api_keys(user_id)
+            api_key = user_keys.get('elevenlabs_api_key')
+        if not api_key:
+            api_key = settings.elevenlabs_api_key
+        if not api_key:
+            raise HTTPException(status_code=400, detail='ElevenLabs API key is required to browse voices')
 
-    # Convert and filter to English + Chinese only (primary reading languages)
-    voices: list[VoiceInfo] = []
+        raw_voices = await fetch_elevenlabs_voices(api_key)
+        voices: list[VoiceInfo] = []
+        for v in raw_voices:
+            labels = v.get('labels') or {}
+            gender = labels.get('gender')
+            accent = labels.get('accent')
+            desc_parts = [f"{k}: {val}" for k, val in labels.items() if val]
+            voices.append(VoiceInfo(
+                voice_id=v.get('voice_id', ''),
+                label=v.get('name', v.get('voice_id', '')),
+                language=accent or 'other',
+                gender=gender,
+                description='; '.join(desc_parts) if desc_parts else None,
+            ))
+        voices.sort(key=lambda v: v.label.lower())
+        return VoiceListResponse(
+            voices=voices,
+            default_voice_id=settings.elevenlabs_voice_id or 'JBFqnCBsd6RMkjVDRZzb',
+        )
+
+    # Default: minimax
+    raw_voices = await fetch_system_voices()
+    voices = []
     for raw in raw_voices:
         info = _convert_system_voice(raw)
         if info.language in ('en', 'zh'):
             voices.append(info)
 
-    # Sort: English first, then Chinese, alphabetical within each group
     lang_order = {'en': 0, 'zh': 1}
     voices.sort(key=lambda v: (lang_order.get(v.language, 99), v.label))
 
@@ -382,18 +434,89 @@ async def list_voices() -> VoiceListResponse:
 
 
 # ---------------------------------------------------------------------------
+# TTS model catalogue — hardcoded (stable, not worth dynamic fetching)
+# ---------------------------------------------------------------------------
+
+class ModelInfo(BaseModel):
+    model_id: str
+    label: str
+    description: str | None
+
+
+class ModelListResponse(BaseModel):
+    models: list[ModelInfo]
+    default_model_id: str
+
+
+_MINIMAX_MODELS = [
+    ModelInfo(model_id='speech-2.6-hd', label='Speech 2.6 HD', description='Latest high-definition model'),
+    ModelInfo(model_id='speech-2.5', label='Speech 2.5', description='Previous generation model'),
+    ModelInfo(model_id='speech-2.0', label='Speech 2.0', description='Legacy model'),
+]
+
+_ELEVENLABS_MODELS = [
+    ModelInfo(model_id='eleven_multilingual_v2', label='Multilingual v2', description='Most capable multilingual model'),
+    ModelInfo(model_id='eleven_turbo_v2_5', label='Turbo v2.5', description='Low-latency optimized model'),
+    ModelInfo(model_id='eleven_turbo_v2', label='Turbo v2', description='Fast generation model'),
+    ModelInfo(model_id='eleven_monolingual_v1', label='Monolingual v1', description='English-only model'),
+]
+
+
+@router.get('/api/tts/models', response_model=ModelListResponse)
+async def list_models(provider: str = Query(default='minimax')) -> ModelListResponse:
+    if provider == 'elevenlabs':
+        return ModelListResponse(
+            models=_ELEVENLABS_MODELS,
+            default_model_id='eleven_multilingual_v2',
+        )
+    return ModelListResponse(
+        models=_MINIMAX_MODELS,
+        default_model_id='speech-2.6-hd',
+    )
+
+
+# ---------------------------------------------------------------------------
 # User settings — persisted key-value pairs (font_size, accent_color, etc.)
 # ---------------------------------------------------------------------------
 
 @router.get('/api/settings')
-async def get_settings() -> dict[str, str]:
-    return await asyncio.to_thread(library_store.get_settings)
+async def get_settings(user_id: str = Depends(get_current_user_id)) -> dict[str, str]:
+    return await asyncio.to_thread(library_store.get_user_settings, user_id)
 
 
 @router.patch('/api/settings')
-async def patch_settings(payload: dict[str, str | None]) -> dict[str, str]:
-    await asyncio.to_thread(library_store.update_settings, payload)
+async def patch_settings(
+    payload: dict[str, str | None],
+    user_id: str = Depends(get_current_user_id),
+) -> dict[str, str]:
+    await asyncio.to_thread(library_store.update_user_settings, user_id, payload)
     return {'status': 'ok'}
+
+
+def _mask_key(value: str) -> str:
+    """Mask an API key for display: show first 4 and last 4 chars."""
+    if len(value) <= 8:
+        return '****'
+    return value[:4] + '****' + value[-4:]
+
+
+@router.get('/api/settings/api-keys')
+async def get_api_keys(user_id: str = Depends(get_current_user_id)) -> dict[str, Any]:
+    user_keys = await asyncio.to_thread(library_store.get_user_api_keys, user_id)
+    result: dict[str, Any] = {}
+    for key in (
+        'elevenlabs_api_key', 'elevenlabs_model_id', 'elevenlabs_voice_id',
+        'minimax_api_key', 'minimax_group_id', 'minimax_model_id', 'minimax_voice_id',
+    ):
+        value = user_keys.get(key)
+        is_secret = key.endswith('_api_key')
+        global_fallback = getattr(settings, key, '')
+        result[key] = {
+            'configured': value is not None,
+            'masked': _mask_key(value) if value and is_secret else value,
+            'has_global_fallback': bool(global_fallback),
+        }
+    return result
 
 
 @router.post('/api/library/import/url', response_model=LibraryItem, status_code=201)
@@ -500,12 +623,17 @@ async def import_library_file(
 
 
 @router.post('/api/tts/synthesize', response_model=SynthesizeResponse)
-async def synthesize(payload: TTSRequest, provider: str | None = None) -> SynthesizeResponse:
+async def synthesize(
+    payload: TTSRequest,
+    provider: str | None = None,
+    user_id: str | None = Depends(get_optional_user_id),
+) -> SynthesizeResponse:
+    user_tts = _build_user_tts_router(user_id)
     try:
         if provider:
-            result = await tts_router.synthesize_with_provider(provider=provider, request=payload)
+            result = await user_tts.synthesize_with_provider(provider=provider, request=payload)
         else:
-            result = await tts_router.synthesize_with_fallback(payload)
+            result = await user_tts.synthesize_with_fallback(payload)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
@@ -521,14 +649,23 @@ async def synthesize(payload: TTSRequest, provider: str | None = None) -> Synthe
 
 
 @router.post('/api/tts/synthesize/enhanced', response_model=SynthesizeResponse)
-async def synthesize_enhanced(payload: TTSRequest) -> SynthesizeResponse:
+async def synthesize_enhanced(
+    payload: TTSRequest,
+    user_id: str | None = Depends(get_optional_user_id),
+) -> SynthesizeResponse:
     """MiniMax-only enhanced TTS with full prosody control.
 
     Accepts all standard ``TTSRequest`` fields plus additional parameters via
     ``provider_options``: emotion, language_boost, pronunciation_dict,
     text_normalization, voice_modify, and subtitle_enable.
     """
-    provider = MiniMaxProvider()
+    user_keys = library_store.get_user_api_keys(user_id) if user_id else {}
+    provider = MiniMaxProvider(
+        api_key=user_keys.get('minimax_api_key'),
+        group_id=user_keys.get('minimax_group_id'),
+        model_id=user_keys.get('minimax_model_id'),
+        voice_id=user_keys.get('minimax_voice_id'),
+    )
     if not provider.is_available():
         raise HTTPException(status_code=503, detail='MiniMax provider is not configured')
 
@@ -549,9 +686,18 @@ async def synthesize_enhanced(payload: TTSRequest) -> SynthesizeResponse:
 
 
 @router.post('/api/tts/jobs', response_model=TTSJobStatusResponse, status_code=202)
-async def create_tts_job(payload: TTSJobCreateRequest) -> TTSJobStatusResponse:
+async def create_tts_job(
+    payload: TTSJobCreateRequest,
+    user_id: str | None = Depends(get_optional_user_id),
+) -> TTSJobStatusResponse:
+    user_tts = _build_user_tts_router(user_id)
+    user_job_manager = TTSJobManager(
+        user_tts,
+        max_parallel=settings.tts_job_parallel_limit,
+        cache_size=settings.tts_job_cache_size,
+    ) if user_id and user_tts is not tts_router else tts_job_manager
     try:
-        return await tts_job_manager.enqueue(
+        return await user_job_manager.enqueue(
             session_id=payload.session_id,
             item_id=payload.item_id,
             chapter_id=payload.chapter_id,
@@ -599,6 +745,7 @@ async def synthesize_stream(
     payload: TTSRequest,
     provider: str | None = None,
     max_chars: int = 220,
+    user_id: str | None = Depends(get_optional_user_id),
 ) -> StreamingResponse:
     normalized_text = payload.text.strip()
     if not normalized_text:
@@ -607,7 +754,8 @@ async def synthesize_stream(
     if max_chars < 40 or max_chars > 4000:
         raise HTTPException(status_code=400, detail='max_chars must be between 40 and 4000')
 
-    minimax_stream_provider = _resolve_minimax_stream_provider() if provider == 'minimax' else None
+    user_tts = _build_user_tts_router(user_id)
+    minimax_stream_provider = _resolve_minimax_stream_provider(user_tts) if provider == 'minimax' else None
     use_provider_stream = minimax_stream_provider is not None
     chunks = [] if use_provider_stream else _split_text_for_stream(normalized_text, max_chars=max_chars)
 
@@ -675,9 +823,9 @@ async def synthesize_stream(
             chunk_request = payload.model_copy(update={'text': chunk_text})
             try:
                 if provider:
-                    result = await tts_router.synthesize_with_provider(provider=provider, request=chunk_request)
+                    result = await user_tts.synthesize_with_provider(provider=provider, request=chunk_request)
                 else:
-                    result = await tts_router.synthesize_with_fallback(chunk_request)
+                    result = await user_tts.synthesize_with_fallback(chunk_request)
             except Exception as exc:  # noqa: BLE001
                 yield _sse_event(
                     'error',
