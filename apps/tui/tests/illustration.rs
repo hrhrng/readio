@@ -141,11 +141,9 @@ fn read_until(app: &mut App, terminal: &mut Terminal<TestBackend>, frames: usize
 
 /// Pump until the turn machine goes quiet, so a keypress lands on an idle app.
 fn settle(app: &mut App, terminal: &mut Terminal<TestBackend>) {
-    for _ in 0..600 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while app.turn.busy() && std::time::Instant::now() < deadline {
         read_until(app, terminal, 1);
-        if !app.turn.busy() {
-            return;
-        }
     }
 }
 
@@ -215,11 +213,9 @@ fn the_picture_is_actually_painted_on_the_screen() {
 
     // Enter starts reading; the turn contains the illustration.
     press_enter(&mut app);
-    for _ in 0..600 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while pixel_cells(&terminal) == 0 && std::time::Instant::now() < deadline {
         read_until(&mut app, &mut terminal, 1);
-        if pixel_cells(&terminal) > 0 {
-            break;
-        }
     }
 
     let painted = pixel_cells(&terminal);

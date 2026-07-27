@@ -57,11 +57,11 @@ fn draw(app: &mut App, terminal: &mut Terminal<TestBackend>, frames: usize) -> S
 }
 
 fn settle(app: &mut App, terminal: &mut Terminal<TestBackend>) {
-    for _ in 0..600 {
+    // A deadline rather than a frame count: turn timing is wall-clock, so a
+    // frame budget gives a busy CI machine less time, not more.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while app.turn.busy() && std::time::Instant::now() < deadline {
         draw(app, terminal, 1);
-        if !app.turn.busy() {
-            return;
-        }
     }
 }
 

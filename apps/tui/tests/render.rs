@@ -45,12 +45,15 @@ fn screen(app: &mut App, terminal: &mut Terminal<TestBackend>, frames: usize) ->
 /// wall-clock based (tool calls have real durations), so tests wait on the
 /// state machine instead of guessing frame counts.
 fn run_until_idle(app: &mut App, terminal: &mut Terminal<TestBackend>) -> String {
-    for _ in 0..600 {
-        if !app.turn.busy() {
-            break;
-        }
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while app.turn.busy() && std::time::Instant::now() < deadline {
         screen(app, terminal, 1);
     }
+    assert!(
+        !app.turn.busy(),
+        "the turn never finished; it is paced by the wall clock, so a frame \
+         budget here would just be a slower machine's flake"
+    );
     screen(app, terminal, 1)
 }
 
