@@ -187,7 +187,7 @@ pub fn parse(text: &str, href: &str) -> Vec<Chapter> {
 
 fn finish(mut chapter: Chapter, index: usize) -> Chapter {
     if chapter.title.is_empty() {
-        chapter.title = format!("第 {} 节", index + 1);
+        chapter.title = crate::i18n::tf("book.section", &[&(index + 1)]);
     }
     chapter
 }

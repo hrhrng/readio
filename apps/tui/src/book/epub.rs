@@ -71,17 +71,21 @@ pub fn load(path: &Path) -> Result<Book> {
         if paras.is_empty() {
             continue;
         }
+        // A spine document need not announce its own name. Prefer what the ToC
+        // calls it, then its first heading, and only then fall back — to a
+        // section number, never to the filename, because `index_split_004` is
+        // a fact about the publisher's toolchain and not about the book.
         let title = toc_titles
             .get(&normalize(&item.href))
             .or_else(|| toc_titles.get(&normalize(&full)))
             .cloned()
-            .or_else(|| html::first_heading(&paras))
-            .unwrap_or_else(|| file_stem(&item.href));
+            .or_else(|| html::first_heading(&paras).filter(|h| h.chars().count() <= 60))
+            .map(|title| title.trim().to_string())
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| crate::i18n::tf("book.section", &[&(chapters.len() + 1)]));
 
         chapters.push(Chapter {
-            title: crate::book::html::first_heading(&paras)
-                .filter(|h| h.chars().count() <= 60 && title.trim().is_empty())
-                .unwrap_or(title),
+            title,
             href: full,
             paras,
         });

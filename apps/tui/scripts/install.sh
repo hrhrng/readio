@@ -8,8 +8,8 @@
 # toolchain, nothing written outside the install directory.
 #
 # The two knobs are arguments, not magic:
-#   install.sh --version tui-v0.1.0 a specific release instead of the latest
-#   install.sh --dir /usr/local/bin somewhere else (you provide the write access)
+#   install.sh --version tui-v0.2.0-beta.1   a release other than the latest
+#   install.sh --dir /usr/local/bin          somewhere else (bring write access)
 #
 # POSIX sh on purpose: this has to run under dash, busybox ash and macOS's old
 # bash without anyone thinking about it.
@@ -49,7 +49,7 @@ usage() {
     cat <<'EOF'
 Usage: install.sh [--version <tag>] [--dir <path>]
 
-  --version <tag>   release to install, e.g. tui-v0.1.0 (default: latest)
+  --version <tag>   release to install, e.g. tui-v0.2.0-beta.1 (default: latest)
   --dir <path>      install directory (default: ~/.local/bin)
   --help            this message
 EOF
@@ -113,7 +113,9 @@ fi
 resolve_version() {
     [ "$VERSION" != "latest" ] && { echo "$VERSION"; return; }
     # Ask the API for the latest tag. Parsed with sed rather than jq, which is
-    # not installed often enough to depend on.
+    # not installed often enough to depend on. The list endpoint is used rather
+    # than /releases/latest on purpose: readio is in beta, its releases are
+    # flagged as prereleases, and /releases/latest skips those entirely.
     # `tr` first: the API is pretty-printed today, but a compact body would put
     # every tag on one line and the greedy `.*` would then return the oldest
     # release instead of the newest. Splitting on commas keeps the API's

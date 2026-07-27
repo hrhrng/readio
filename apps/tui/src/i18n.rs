@@ -299,6 +299,7 @@ pub const TABLE: &[(&str, &str, &str)] = &[
     ("pdf.encrypted", "这份 PDF 有密码保护，readio 打不开",
         "this PDF is password protected, so readio cannot open it"),
     ("pdf.part", "第 {0} 部分 ({1})", "Part {0} ({1})"),
+    ("book.section", "第 {0} 节", "Section {0}"),
     ("media.epub_unopenable", "打不开 {0}", "cannot open {0}"),
     ("media.not_zip", "{0} 不是有效的 EPUB（zip）文件", "{0} is not a valid EPUB (zip) file"),
     ("media.cache_failed", "无法创建图片缓存目录 {0}",

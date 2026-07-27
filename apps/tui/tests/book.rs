@@ -344,6 +344,66 @@ fn epub_round_trip() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Split-by-tool EPUBs (`index_split_000.html`) list nothing in the ToC and
+/// carry no heading. The old fallback showed the filename, which reads as a
+/// fact about the publisher's toolchain rather than about the book.
+#[test]
+fn a_nameless_chapter_is_numbered_not_named_after_its_file() {
+    let dir = std::env::temp_dir().join(format!("readio-nameless-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("split.epub");
+
+    let file = std::fs::File::create(&path).expect("create epub");
+    let mut zip = zip::ZipWriter::new(file);
+    let options: zip::write::FileOptions<'_, ()> =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let entries: &[(&str, &str)] = &[
+        ("mimetype", "application/epub+zip"),
+        (
+            "META-INF/container.xml",
+            r#"<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
+                 <rootfiles><rootfile full-path="content.opf"
+                   media-type="application/oebps-package+xml"/></rootfiles>
+               </container>"#,
+        ),
+        (
+            "content.opf",
+            r#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+                 <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+                   <dc:title>拆开的书</dc:title>
+                 </metadata>
+                 <manifest>
+                   <item id="s0" href="index_split_000.html"
+                     media-type="application/xhtml+xml"/>
+                 </manifest>
+                 <spine><itemref idref="s0"/></spine>
+               </package>"#,
+        ),
+        (
+            "index_split_000.html",
+            "<html><body><p>正文直接开始，没有标题，也不在目录里。</p></body></html>",
+        ),
+    ];
+    for (name, body) in entries {
+        zip.start_file(*name, options).expect("start file");
+        zip.write_all(body.as_bytes()).expect("write");
+    }
+    zip.finish().expect("finish");
+
+    let book = Book::load(Some(&path)).expect("load epub");
+    let title = &book.chapters[0].title;
+    assert!(
+        !title.contains("index_split"),
+        "the filename leaked into the chapter title: {title}"
+    );
+    assert!(
+        title.contains('1'),
+        "a nameless chapter should carry its number: {title}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn write_epub(path: &std::path::Path) {
     let file = std::fs::File::create(path).expect("create epub");
     let mut zip = zip::ZipWriter::new(file);

@@ -39,6 +39,8 @@ Every number on screen is a real reading — real paragraph offsets, real line r
 
 ## Install
 
+> **readio is in beta.** Releases are tagged `tui-v0.Y.0-beta.N` and flagged as prereleases on GitHub; the installer takes the newest one. Things settle as they get used — read-aloud in particular has been exercised against command templates and tests, not against every engine in the table.
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/hrhrng/readio/main/apps/tui/scripts/install.sh | sh
 ```

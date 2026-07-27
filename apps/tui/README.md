@@ -34,6 +34,8 @@ cargo install --git https://github.com/hrhrng/readio readio
 
 四个产物：`aarch64-apple-darwin`、`x86_64-apple-darwin`、`x86_64-unknown-linux-musl`、`aarch64-unknown-linux-musl`。打一个 `tui-v*` tag 就由仓库根目录的 `.github/workflows/tui-release.yml` 全部构建、算 `SHA256SUMS`、传上去；CI 是同一层的 `tui-ci.yml`，只在 `apps/tui/**` 变动时触发。
 
+版本走 beta 通道：tag 形如 `tui-v0.2.0-beta.N`，带 `-beta` 的 tag 在 release 里自动标成 prerelease。因此 `install.sh` 用的是 releases 列表而不是 `/releases/latest`——后者会跳过 prerelease，在只有 beta 的阶段等于什么都装不上。东西还在被用出问题的阶段，不值得为每次修一个 bug 就往上抬一个稳定版号。
+
 ### install.sh 做和不做的事
 
 做：认出系统和架构、下载对应产物、**用 release 里的 `SHA256SUMS` 校验**、解包、`mv` 原子替换（所以升级时正在运行的 readio 不受影响）、装进 `~/.local/bin`、发现不在 `PATH` 里就告诉你怎么加。
@@ -43,7 +45,7 @@ cargo install --git https://github.com/hrhrng/readio readio
 它是 POSIX `sh`，因为装东西的脚本不该要求你先有一个特定的 shell：
 
 ```bash
-sh scripts/install.sh --version tui-v0.1.0  # 指定版本
+sh scripts/install.sh --version tui-v0.2.0-beta.1  # 指定版本
 sh scripts/install.sh --dir /usr/local/bin  # 换目录（写权限自己准备）
 ```
 

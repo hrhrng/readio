@@ -39,6 +39,8 @@
 
 ## 安装
 
+> **readio 还在 beta。** 版本按 `tui-v0.Y.0-beta.N` 打标签，在 GitHub 上标为 prerelease，安装脚本取最新的那个。用的人多了才会稳下来——尤其是朗读，目前只对着命令模板和测试验过，并没有把表格里每个引擎都跑通。
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/hrhrng/readio/main/apps/tui/scripts/install.sh | sh
 ```

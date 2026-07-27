@@ -103,6 +103,9 @@ jobs:
           tag_name: ${{ github.ref_name || github.event.inputs.tag }}
           name: readio tui ${{ github.ref_name || github.event.inputs.tag }}
           draft: false
+          # A tag with a hyphen in its version is a prerelease by semver's own
+          # rules — `tui-v0.2.0-beta.1` gets the badge, `tui-v0.2.0` does not.
+          prerelease: ${{ contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') }}
           generate_release_notes: true
           files: |
             dist/*.tar.gz
