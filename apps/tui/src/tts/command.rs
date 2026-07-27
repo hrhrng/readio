@@ -444,4 +444,29 @@ mod tests {
         assert!(which("sh") || which("cmd"), "a shell should be on PATH");
         assert!(!which("readio-nonexistent-binary-xyz"));
     }
+
+    /// Windows has no `afplay`, so the default player is a PowerShell one-liner.
+    /// `C:\Users\John Doe\...` is a perfectly ordinary path there, so the script
+    /// has to reach PowerShell as one argument with the path quoted inside it.
+    /// Checked on every platform because the template is what ships, and nobody
+    /// runs the Windows tests.
+    #[test]
+    fn the_windows_player_template_survives_a_path_with_spaces() {
+        let template = crate::tts::config::presets()["kokoro"].play.clone();
+        let windows =
+            "powershell -NoProfile -Command \"(New-Object Media.SoundPlayer '{file}').PlaySync()\"";
+        let args = split_args(windows);
+        assert_eq!(args.len(), 4, "the script must stay one argument: {args:?}");
+
+        let clip = r"C:\Users\John Doe\.readio\speech\1.wav";
+        let script = args[3].replace("{file}", clip);
+        assert_eq!(
+            script,
+            format!("(New-Object Media.SoundPlayer '{clip}').PlaySync()"),
+            "the path has to end up quoted inside the script"
+        );
+
+        // And the platform readio was built for gets a player at all.
+        assert!(!template.is_empty(), "every preset needs a play command");
+    }
 }

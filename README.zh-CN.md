@@ -55,6 +55,33 @@ cargo install --git https://github.com/hrhrng/readio readio
 不是唯一的路：其他平台——Windows、BSD、没人打包的架构——用上面那条命令自己编译就行，依赖树是纯 Rust，不需要 C 工具链。
 Windows 的准确说法是没测过，而不是不支持。
 
+## 在 Windows 上自己编译
+
+Windows 没有预编译产物，也没有安装脚本——准确的说法是没测过，而不是不支持。依赖树是纯 Rust，所以编译只需要 Rust 和一个链接器，别的都不用。
+
+1. **装 Rust**，用 [rustup](https://rustup.rs)。默认的 `x86_64-pc-windows-msvc` 就好，它会提示你装 Visual Studio Build Tools（勾 *使用 C++ 的桌面开发*）。readio 里没有 C 代码，但 `rustc` 调用的链接器仍然是 MSVC 那一个。不想装 Visual Studio 就 `rustup default stable-x86_64-pc-windows-gnu`，配 MinGW-w64 也行。
+
+2. **编译。** 在 PowerShell 里：
+
+   ```powershell
+   git clone https://github.com/hrhrng/readio
+   cd readio\apps\tui
+   cargo build --release
+   .\target\release\readio.exe
+   ```
+
+3. **放进 PATH。** `cargo install --path .` 会把 `readio.exe` 装到 `%USERPROFILE%\.cargo\bin`，这个目录 rustup 已经加进 PATH 了。
+
+4. **用支持 VT 的终端。** readio 需要真彩色、alternate screen，以及用半块字符画插图，Windows Terminal 三样都支持。如果只能用老的 `conhost`，先 `chcp 65001`，否则框线和中文会变成乱码。
+
+5. **文件在哪儿。** `%USERPROFILE%\.readio` 下面是 `config.yaml`、`books\`、`state.json`。`readio --home D:\readio` 可以整体换个地方。
+
+6. **朗读不用额外装播放器**：默认的 `play` 就是一条用 `Media.SoundPlayer` 的 PowerShell 命令。语音引擎仍然要你自己装，并把 `tts.engines.<名字>.synth` 改成它在 Windows 上的命令行。
+
+有两样东西跟不过来：`scripts/install.sh` 是 POSIX sh，`scripts/pty_probe.py` 需要 POSIX pty，在这儿都跑不了——直接编译、直接运行就好。音频输出白名单在 Windows 上也没有内置的设备探测：把 `tts.output.query` 设成一条能打印当前输出设备名的命令（比如 PowerShell 加 `AudioDeviceCmdlets` 模块）；在你设好之前，`/device` 会说它读不到设备列表，并提醒白名单仍然让朗读保持静音。
+
+`cargo test` 应该能跑——整帧渲染测试走的是 ratatui 的 `TestBackend`，不需要真终端——但没人在 Windows 上跑过全套，所以那里挂了算 bug，欢迎报。
+
 ## 用法
 
 ```sh

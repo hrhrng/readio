@@ -119,7 +119,11 @@ fn default_player() -> String {
     if cfg!(target_os = "macos") {
         "afplay {file}".to_string()
     } else if cfg!(target_os = "windows") {
-        "powershell -c (New-Object Media.SoundPlayer {file}).PlaySync()".to_string()
+        // The whole script is one quoted argument and the path is quoted inside
+        // it, because `C:\Users\John Doe\...` is an ordinary Windows path and an
+        // unquoted one would be read as two arguments.
+        "powershell -NoProfile -Command \"(New-Object Media.SoundPlayer '{file}').PlaySync()\""
+            .to_string()
     } else {
         // ALSA is the most common; ffplay is the usual fallback and is quiet
         // enough with these flags.

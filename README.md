@@ -56,6 +56,33 @@ linked). They are a convenience, not the only path: anything else — Windows, a
 packages — builds from source with the command above, since the dependency tree is pure Rust and needs no C
 toolchain. Windows in particular is untested rather than unsupported.
 
+## Building on Windows
+
+Windows has no prebuilt archive and no installer script — it is untested rather than unsupported. The dependency tree is pure Rust, so a build needs Rust and a linker, nothing else.
+
+1. **Install Rust** with [rustup](https://rustup.rs). Keep the default `x86_64-pc-windows-msvc` host and let it install the Visual Studio Build Tools it asks for (*Desktop development with C++*). readio contains no C, but the MSVC linker is still what `rustc` invokes. If you would rather not install Visual Studio, `rustup default stable-x86_64-pc-windows-gnu` works with MinGW-w64 instead.
+
+2. **Build it.** In PowerShell:
+
+   ```powershell
+   git clone https://github.com/hrhrng/readio
+   cd readio\apps\tui
+   cargo build --release
+   .\target\release\readio.exe
+   ```
+
+3. **Put it on PATH.** `cargo install --path .` places `readio.exe` in `%USERPROFILE%\.cargo\bin`, which rustup already added to your PATH.
+
+4. **Use a VT-capable terminal.** readio needs truecolour, the alternate screen, and half-block characters for illustrations: Windows Terminal handles all three. In the legacy `conhost` console, run `chcp 65001` first or the box drawing and any CJK text will come out as mojibake.
+
+5. **Where things live.** `%USERPROFILE%\.readio` holds `config.yaml`, `books\` and `state.json`. `readio --home D:\readio` moves the lot somewhere else.
+
+6. **Read-aloud** needs no extra player: the default `play` command is a PowerShell one-liner using `Media.SoundPlayer`. You still supply the speech engine yourself and point `tts.engines.<name>.synth` at its Windows command line.
+
+Two things do not come along. `scripts/install.sh` is POSIX sh, and `scripts/pty_probe.py` needs a POSIX pty, so neither runs here — build and run the binary directly. The audio-output whitelist also has no built-in device probe on Windows: set `tts.output.query` to a command that prints the current output device (PowerShell with the `AudioDeviceCmdlets` module, for instance), and until you do, `/device` will say it cannot read the list and that the whitelist keeps speech muted.
+
+`cargo test` should work — the frame tests render through ratatui's `TestBackend` rather than a real terminal — but nobody has run the suite on Windows, so treat a failure there as a bug worth reporting rather than a surprise.
+
 ## Usage
 
 ```sh
