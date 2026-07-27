@@ -133,19 +133,28 @@ fn progress_and_search_agree_with_the_content() {
     );
     // Search is case-insensitive, so compare that way rather than byte for byte.
     let lowered = needle.to_lowercase();
-    for (ci, pi, excerpt) in &hits {
+    for hit in &hits.shown {
+        let text = book.chapters[hit.chapter].paras[hit.para].text();
         assert!(
-            book.chapters[*ci].paras[*pi]
-                .text()
-                .to_lowercase()
-                .contains(&lowered),
+            text.to_lowercase().contains(&lowered),
             "hit should point at the matching paragraph"
         );
         assert!(
-            excerpt.to_lowercase().contains(&lowered),
+            hit.excerpt.to_lowercase().contains(&lowered),
             "excerpt should carry the match"
         );
+        // The range has to land on the match itself, since it drives the
+        // highlight when the reader jumps there.
+        assert_eq!(
+            text[hit.range.0..hit.range.1].to_lowercase(),
+            lowered,
+            "the range should cover exactly the term"
+        );
     }
+    assert!(
+        hits.total >= hits.shown.len() && hits.paragraphs > 0,
+        "totals should be counted, not inferred from the shown list"
+    );
 }
 
 // ── reading flow ─────────────────────────────────────────────────────────────

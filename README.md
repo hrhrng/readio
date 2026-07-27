@@ -103,13 +103,14 @@ Copies land in `~/.readio/books`. Use `readio --home <dir>` to keep a separate l
 | `↑` `↓` · wheel · `pgup` `pgdn` · `home` `end` | scroll |
 | `^t` · `^o` | fold or unfold reasoning · tool calls |
 | `^s` · `^r` | toggle read-aloud · cycle its speed (0.75× → 2×) |
+| `^g` · `^b` | jump to the next · previous search hit |
 | `^p` `^n` · `^l` · `^c` `^d` | input history · clear · quit |
 
 | Command | Purpose |
 | --- | --- |
 | `/lib` `/open <n>` `/import <path>` `/forget <n>` | manage the library |
 | `/toc` `/goto <n>` `/next` `/prev` | move between chapters |
-| `/find <term>` | search the whole book |
+| `/find <term>` | search the whole book; type a number to jump to that hit |
 | `/auto` `/speed <n>` | keep reading unattended · reveal speed |
 | `/context` `/progress` `/plan` | where you are |
 | `/tts` `/voice <name>` `/rate <0.5-3>` `/device` | read-aloud and audio output |
@@ -124,6 +125,14 @@ Copies land in `~/.readio/books`. Use `readio --home <dir>` to keep a separate l
 | Time since you opened the book | `0:15`, a session clock |
 | Fetching the next passage | a tool call: `● Read book.epub#ch1  L1-9  ·  0.3s` |
 | Full-text search | the question you asked, with real hit counts |
+
+## Search
+
+`/find <term>` — or simply a question typed at the prompt — searches the whole book and counts **every** occurrence, not one per paragraph. The header reports what a reader wants to know before deciding whether to look: `pattern: memory · 45 matches · 30 lines · showing 12`. Matching ignores case and treats full-width punctuation and Latin letters as their ASCII equivalents, so a term typed on an English keyboard still finds text typeset in Chinese.
+
+Type the number of a hit to jump there; `^g` and `^b` walk forward and back through the list and say so when they wrap. Arriving at a hit lights the term deeply inside its lightly washed sentence — the same two-level highlight read-aloud uses — so the eye lands on the word rather than on the paragraph.
+
+A question in Chinese rarely reads as a search term, so readio narrows it before searching: interrogative tails such as 是什么样子 or 怎么 are stripped, then progressively shorter windows of the remaining text are tried, widest first. What comes back is the answer to the longest phrase that actually occurs in the book.
 
 ## Read-aloud
 
@@ -152,7 +161,7 @@ One file, `~/.readio/config.yaml`, written with comments on first run. readio re
 
 ```sh
 cd apps/tui
-cargo test                                     # 200 tests
+cargo test                                     # 211 tests
 python3 scripts/pty_probe.py 96 24 "wait:0.6,type:/sample,key:enter,wait:2"
 ```
 

@@ -162,8 +162,8 @@ fn a_question_runs_a_real_search() {
 
     assert!(view.contains("Grep"), "expected a Grep tool call:\n{view}");
     assert!(
-        view.contains("hits"),
-        "expected a hit count in the tool header:\n{view}"
+        view.contains("matches"),
+        "expected a match count in the tool header:\n{view}"
     );
     assert!(
         view.contains("进度条"),
@@ -475,7 +475,7 @@ fn read_aloud_highlights_the_sentence_lightly_and_the_word_deeply() {
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use readio::theme::theme;
-    use readio::ui::block::{Block, Speaking};
+    use readio::ui::block::{Block, Highlight};
     use readio::ui::scrollback::Scrollback;
 
     common::isolated_home();
@@ -487,9 +487,9 @@ fn read_aloud_highlights_the_sentence_lightly_and_the_word_deeply() {
     let mut sb = Scrollback::new();
     let id = sb.push(Block::passage_text(passage));
     assert!(
-        sb.set_speaking(
+        sb.set_highlight(
             id,
-            Some(Speaking {
+            Some(Highlight {
                 sentence,
                 word: Some(word)
             })
@@ -537,7 +537,7 @@ fn read_aloud_highlights_the_sentence_lightly_and_the_word_deeply() {
     );
 
     // Dropping the word keeps the sentence lit — what happens between clips.
-    assert!(sb.set_speaking(id, Some(Speaking::new(sentence))));
+    assert!(sb.set_highlight(id, Some(Highlight::new(sentence))));
     let mut buf = Buffer::empty(area);
     sb.render(area, &mut buf, 2);
     let deep = buf
@@ -558,7 +558,7 @@ fn read_aloud_highlights_the_sentence_lightly_and_the_word_deeply() {
     );
 
     // And clearing it puts the page back to normal.
-    sb.clear_speaking();
+    sb.clear_highlight();
     let mut buf = Buffer::empty(area);
     sb.render(area, &mut buf, 3);
     assert!(
@@ -574,7 +574,7 @@ fn the_word_highlight_survives_a_line_wrap() {
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use readio::theme::theme;
-    use readio::ui::block::{Block, Speaking};
+    use readio::ui::block::{Block, Highlight};
     use readio::ui::scrollback::Scrollback;
 
     common::isolated_home();
@@ -595,9 +595,9 @@ fn the_word_highlight_survives_a_line_wrap() {
         units.len()
     );
     for unit in units {
-        sb.set_speaking(
+        sb.set_highlight(
             id,
-            Some(Speaking {
+            Some(Highlight {
                 sentence: (0, passage.len()),
                 word: Some(unit.range),
             }),

@@ -8,7 +8,7 @@ use ratatui::layout::Rect;
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget};
 
-use super::block::{Block, Ctx, ImagePlan, Mode, Speaking};
+use super::block::{Block, Ctx, Highlight, ImagePlan, Mode};
 use super::image::{TermImage, placeholder};
 
 /// Rendered lines for one entry, keyed by the inputs that produced them.
@@ -140,11 +140,11 @@ impl Scrollback {
     }
 
     /// Point the read-aloud highlight at one block's sentence and word.
-    pub fn set_speaking(&mut self, id: u64, state: Option<Speaking>) -> bool {
+    pub fn set_highlight(&mut self, id: u64, state: Option<Highlight>) -> bool {
         let Some(entry) = self.entry_mut(id) else {
             return false;
         };
-        if entry.block.set_speaking(state) {
+        if entry.block.set_highlight(state) {
             entry.touch();
             return true;
         }
@@ -152,9 +152,9 @@ impl Scrollback {
     }
 
     /// Clear every highlight, for when speech stops.
-    pub fn clear_speaking(&mut self) {
+    pub fn clear_highlight(&mut self) {
         for entry in self.entries.iter_mut() {
-            if entry.block.set_speaking(None) {
+            if entry.block.set_highlight(None) {
                 entry.touch();
             }
         }

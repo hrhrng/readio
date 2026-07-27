@@ -220,23 +220,111 @@ impl Book {
         }
     }
 
-    /// Full-text search, returned as (chapter, para, excerpt) triples.
-    pub fn search(&self, needle: &str, limit: usize) -> Vec<(usize, usize, String)> {
-        let needle_lc = needle.to_lowercase();
-        let mut hits = Vec::new();
+    /// Full-text search over the whole book.
+    ///
+    /// Every occurrence counts, including several in one paragraph: a reader who
+    /// is told "12 times" when the word appears 45 times has been misinformed,
+    /// and `limit` only caps how many are handed back for display.
+    pub fn search(&self, needle: &str, limit: usize) -> Hits {
+        let folded_needle = fold(needle).0;
+        let mut hits = Hits::default();
+        if folded_needle.is_empty() {
+            return hits;
+        }
         for (ci, ch) in self.chapters.iter().enumerate() {
             for (pi, para) in ch.paras.iter().enumerate() {
                 let text = para.text();
-                if let Some(at) = text.to_lowercase().find(&needle_lc) {
-                    hits.push((ci, pi, excerpt(text, at, needle.len())));
-                    if hits.len() >= limit {
-                        return hits;
+                let (folded, offsets) = fold(text);
+                let mut found_here = 0usize;
+                let mut from = 0usize;
+                while let Some(rel) = folded[from..].find(&folded_needle) {
+                    let start_folded = from + rel;
+                    let end_folded = start_folded + folded_needle.len();
+                    // Map folded offsets back: case and width folding can change
+                    // byte lengths, so the original positions are recorded as the
+                    // folded string is built rather than assumed to match.
+                    let start = offsets[start_folded];
+                    let end = offsets.get(end_folded).copied().unwrap_or(text.len());
+                    found_here += 1;
+                    hits.total += 1;
+                    if hits.shown.len() < limit {
+                        hits.shown.push(Hit {
+                            chapter: ci,
+                            para: pi,
+                            range: (start, end),
+                            excerpt: excerpt(text, start, end - start),
+                        });
                     }
+                    from = end_folded.max(start_folded + 1);
+                }
+                if found_here > 0 {
+                    hits.paragraphs += 1;
                 }
             }
         }
         hits
     }
+}
+
+/// One occurrence, with enough information to go there and light it up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hit {
+    pub chapter: usize,
+    pub para: usize,
+    /// Byte range of the match inside the paragraph's text.
+    pub range: (usize, usize),
+    pub excerpt: String,
+}
+
+/// What a search found: the true totals, plus as many hits as were asked for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Hits {
+    /// Every occurrence in the book.
+    pub total: usize,
+    /// Paragraphs containing at least one.
+    pub paragraphs: usize,
+    /// The first `limit` of them, for display.
+    pub shown: Vec<Hit>,
+}
+
+impl Hits {
+    pub fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+
+    /// True when there are more occurrences than were handed back.
+    pub fn truncated(&self) -> bool {
+        self.total > self.shown.len()
+    }
+}
+
+/// Case- and width-folded copy of `text`, plus the original byte offset of every
+/// byte in it (and one past the end).
+///
+/// Searching a lowercased copy and reusing its offsets is wrong in general:
+/// lowercasing changes byte lengths for some characters, and full-width forms are
+/// three bytes where their ASCII equivalents are one. Recording the mapping while
+/// folding keeps "ＣＩＴＹ" findable as "city" and the highlight in the right place.
+fn fold(text: &str) -> (String, Vec<usize>) {
+    let mut folded = String::with_capacity(text.len());
+    let mut offsets = Vec::with_capacity(text.len() + 1);
+    for (index, c) in text.char_indices() {
+        let plain = match c {
+            // Full-width ASCII forms sit at U+FF01..U+FF5E, exactly 0xFEE0 above
+            // their ASCII counterparts. The ideographic space folds to a space.
+            '\u{ff01}'..='\u{ff5e}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
+            '\u{3000}' => ' ',
+            other => other,
+        };
+        for lowered in plain.to_lowercase() {
+            let before = folded.len();
+            folded.push(lowered);
+            offsets.resize(folded.len(), index);
+            debug_assert!(offsets.len() > before);
+        }
+    }
+    offsets.push(text.len());
+    (folded, offsets)
 }
 
 /// A window of text around a match, snapped to character boundaries.
@@ -327,4 +415,95 @@ pub fn slug(title: &str) -> String {
         out.push_str("book");
     }
     out
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    fn book_of(paras: &[&str]) -> Book {
+        Book {
+            id: "test".into(),
+            title: "t".into(),
+            author: None,
+            source: Source::Sample,
+            path: None,
+            chapters: vec![Chapter {
+                title: "one".into(),
+                href: "one.html".into(),
+                paras: paras
+                    .iter()
+                    .map(|text| Para::Text(text.to_string()))
+                    .collect(),
+            }],
+        }
+    }
+
+    /// The bug this replaces: `find()` stopped at the first match in a paragraph,
+    /// so a book with 45 occurrences was reported as having 12.
+    #[test]
+    fn every_occurrence_counts_even_several_in_one_paragraph() {
+        let book = book_of(&["城市和记忆，记忆里的城市，还有记忆。", "无关的一段。"]);
+        let hits = book.search("记忆", 10);
+        assert_eq!(hits.total, 3, "three occurrences in one paragraph");
+        assert_eq!(hits.paragraphs, 1, "all of them in the same paragraph");
+        assert_eq!(hits.shown.len(), 3);
+        assert!(!hits.truncated());
+    }
+
+    #[test]
+    fn the_limit_caps_the_list_but_not_the_count() {
+        let many = "记忆记忆记忆记忆记忆记忆";
+        let book = book_of(&[many]);
+        let hits = book.search("记忆", 2);
+        assert_eq!(hits.total, 6, "the count is the truth about the book");
+        assert_eq!(hits.shown.len(), 2, "the list is only what was asked for");
+        assert!(hits.truncated(), "and it must admit to being partial");
+    }
+
+    #[test]
+    fn ranges_point_at_the_match_itself() {
+        let book = book_of(&["a city of memory", "MEMORY again"]);
+        let hits = book.search("memory", 10);
+        assert_eq!(hits.total, 2);
+        assert_eq!(hits.paragraphs, 2);
+        for hit in &hits.shown {
+            let text = book.chapters[0].paras[hit.para].text();
+            assert_eq!(
+                text[hit.range.0..hit.range.1].to_lowercase(),
+                "memory",
+                "the range has to be usable as a highlight"
+            );
+        }
+    }
+
+    /// Full-width forms are what a Chinese keyboard produces for Latin letters
+    /// and digits, and folding them keeps a search from silently missing them.
+    #[test]
+    fn case_and_width_fold_together() {
+        let book = book_of(&["ＣＩＴＹ of glass", "the City of Glass"]);
+        let hits = book.search("city", 10);
+        assert_eq!(hits.total, 2, "full-width and capitalised both match");
+        let first = &hits.shown[0];
+        let text = book.chapters[0].paras[first.para].text();
+        assert_eq!(
+            &text[first.range.0..first.range.1],
+            "ＣＩＴＹ",
+            "the range must span the original characters, not the folded ones"
+        );
+    }
+
+    #[test]
+    fn an_empty_needle_finds_nothing_rather_than_everything() {
+        let book = book_of(&["anything"]);
+        assert!(book.search("", 10).is_empty());
+        assert!(book.search("   ", 10).is_empty());
+    }
+
+    #[test]
+    fn overlapping_needles_do_not_loop_forever() {
+        let book = book_of(&["aaaa"]);
+        let hits = book.search("aa", 10);
+        assert_eq!(hits.total, 2, "non-overlapping matches: aa|aa");
+    }
 }

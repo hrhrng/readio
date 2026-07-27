@@ -128,22 +128,32 @@ pub enum Event {
 
 /// Where the voice is in a passage: the sentence, and the word inside it.
 ///
-/// Two levels rather than one because they answer different questions. The
-/// sentence tells you where to look; the word tells you where the voice is, and
-/// lets your eye run slightly ahead of it the way it does when reading along.
+/// Two levels rather than one because they answer different questions: the
+/// sentence tells you where to look, the inner span tells you exactly where. Read
+/// aloud uses it for the voice's position, letting your eye run slightly ahead;
+/// search uses it for the term it found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Speaking {
-    /// Byte range of the sentence being read, lightly washed.
+pub struct Highlight {
+    /// Byte range washed lightly: the sentence in question.
     pub sentence: (usize, usize),
-    /// Byte range of the word or character being sounded, strongly washed.
+    /// Byte range washed deeply: the word being sounded, or the term searched for.
     pub word: Option<(usize, usize)>,
 }
 
-impl Speaking {
+impl Highlight {
+    /// A sentence, with nothing singled out inside it.
     pub fn new(sentence: (usize, usize)) -> Self {
         Self {
             sentence,
             word: None,
+        }
+    }
+
+    /// A sentence with one span picked out inside it.
+    pub fn focused(sentence: (usize, usize), word: (usize, usize)) -> Self {
+        Self {
+            sentence,
+            word: Some(word),
         }
     }
 }
@@ -218,7 +228,7 @@ pub enum Block {
     Passage {
         text: String,
         /// What the voice is on, when speech is on.
-        speaking: Option<Speaking>,
+        highlight: Option<Highlight>,
     },
     System(String),
     Event(Event),
@@ -252,7 +262,7 @@ impl Block {
     pub fn passage() -> Self {
         Block::Passage {
             text: String::new(),
-            speaking: None,
+            highlight: None,
         }
     }
 
@@ -300,7 +310,7 @@ impl Block {
     pub fn passage_text(text: &str) -> Self {
         Block::Passage {
             text: text.to_string(),
-            speaking: None,
+            highlight: None,
         }
     }
 
@@ -348,11 +358,11 @@ impl Block {
     }
 
     /// Mark which bytes are being spoken right now.
-    pub fn set_speaking(&mut self, state: Option<Speaking>) -> bool {
+    pub fn set_highlight(&mut self, state: Option<Highlight>) -> bool {
         match self {
-            Block::Passage { speaking, .. } => {
-                let changed = *speaking != state;
-                *speaking = state;
+            Block::Passage { highlight, .. } => {
+                let changed = *highlight != state;
+                *highlight = state;
                 changed
             }
             _ => false,
@@ -372,7 +382,7 @@ impl Block {
             Block::User(text) => render_user(text, ctx),
             Block::Thinking { text, elapsed_ms } => render_thinking(text, *elapsed_ms, ctx),
             Block::Tool(tool) => render_tool(tool, ctx),
-            Block::Passage { text, speaking } => render_passage(text, *speaking, ctx),
+            Block::Passage { text, highlight } => render_passage(text, *highlight, ctx),
             Block::System(text) => render_system(text, ctx),
             Block::Event(event) => render_event(event, ctx),
             Block::Plan { title, items } => render_plan(title, items, ctx),
@@ -559,10 +569,10 @@ fn render_tool(tool: &Tool, ctx: &Ctx) -> Vec<Line<'static>> {
 
 /// Book content. A tiny markdown dialect: `## ` heading, `> ` quote, ``` fence.
 ///
-/// When `speaking` is set, the byte range it names is highlighted: that is the
+/// When `highlight` is set, the byte range it names is highlighted: that is the
 /// sentence the speech engine is saying right now, and following it with the eye
 /// is the whole point of reading along.
-fn render_passage(text: &str, speaking: Option<Speaking>, ctx: &Ctx) -> Vec<Line<'static>> {
+fn render_passage(text: &str, highlight: Option<Highlight>, ctx: &Ctx) -> Vec<Line<'static>> {
     let th = theme();
     let width = ctx.body_width();
     let mut out = vec![Line::from("")];
@@ -641,7 +651,9 @@ fn render_passage(text: &str, speaking: Option<Speaking>, ctx: &Ctx) -> Vec<Line
                 indent()
             };
             let mut spans = vec![lead];
-            spans.extend(highlight_spans(&segment, origin, speaking, style, lit, hot));
+            spans.extend(highlight_spans(
+                &segment, origin, highlight, style, lit, hot,
+            ));
             out.push(Line::from(spans));
         }
         base += advance;
@@ -671,16 +683,16 @@ fn render_passage(text: &str, speaking: Option<Speaking>, ctx: &Ctx) -> Vec<Line
 fn highlight_spans(
     segment: &Segment,
     origin: usize,
-    speaking: Option<Speaking>,
+    highlight: Option<Highlight>,
     plain: Style,
     lit: Style,
     hot: Style,
 ) -> Vec<Span<'static>> {
-    let Some(speaking) = speaking else {
+    let Some(highlight) = highlight else {
         return vec![Span::styled(segment.text.clone(), plain)];
     };
     let (line_from, line_to) = (origin + segment.start, origin + segment.end);
-    let (from, to) = speaking.sentence;
+    let (from, to) = highlight.sentence;
     if to <= line_from || from >= line_to {
         return vec![Span::styled(segment.text.clone(), plain)];
     }
@@ -689,7 +701,7 @@ fn highlight_spans(
     // eat a space, so the rendered line is not the source slice byte for byte.
     let local = |offset: usize| floor_boundary(&segment.text, offset.saturating_sub(line_from));
     let sentence = (local(from), local(to.max(from)));
-    let word = speaking
+    let word = highlight
         .word
         .filter(|(a, b)| *b > line_from && *a < line_to)
         .map(|(a, b)| (local(a), local(b.max(a))));

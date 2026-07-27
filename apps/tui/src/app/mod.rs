@@ -23,7 +23,7 @@ use crate::theme::theme;
 use crate::tts::device::{self, Gate, Verdict};
 use crate::tts::sentence::Unit;
 use crate::tts::{Speaker, SpeechEvent, command::CommandSynth, sentence};
-use crate::ui::block::{Block, Event, LibraryRow, Speaking};
+use crate::ui::block::{Block, Event, Highlight, LibraryRow};
 use crate::ui::chrome::{self, Chrome};
 use crate::ui::prompt::Prompt;
 use crate::ui::scrollback::Scrollback;
@@ -83,6 +83,22 @@ pub struct App {
     /// Output-device whitelist. `None` when no whitelist is configured, which
     /// is also when nothing is ever probed.
     gate: Option<Gate>,
+    /// The last search, kept so its hits can be walked and lit up.
+    find: Option<Find>,
+    /// Term to highlight in the next passage that contains it, set when a jump
+    /// lands on a hit.
+    marking: Option<String>,
+}
+
+/// A search and where the reader is inside its results.
+///
+/// Kept after the turn that produced it, because a list of locations the reader
+/// cannot walk is a list they have to transcribe by hand.
+struct Find {
+    needle: String,
+    hits: crate::book::Hits,
+    /// Zero-based index into `hits.shown`.
+    at: usize,
 }
 
 /// A sentence in flight: its audio clock and the words to walk through.
@@ -140,6 +156,8 @@ impl App {
             cursor: None,
             idle: false,
             gate: None,
+            find: None,
+            marking: None,
         };
 
         if app.cfg.tts.output.is_active() {
@@ -273,6 +291,7 @@ impl App {
 
         let effects = self.turn.pump(&mut self.sb, dt.min(200.0));
         if let Some((id, text)) = self.turn.take_spoken() {
+            self.mark_match(id, &text);
             self.enqueue_speech(id, &text);
         }
         self.poll_audio_device();
@@ -622,7 +641,7 @@ impl App {
                     chars,
                     ms,
                 } => {
-                    if self.sb.set_speaking(id, Some(Speaking::new(range))) {
+                    if self.sb.set_highlight(id, Some(Highlight::new(range))) {
                         self.lit = Some(id);
                     }
                     self.cursor = self.build_cursor(id, range, ms);
@@ -702,7 +721,7 @@ impl App {
         if cursor.done && cursor.started.elapsed().as_millis() as u64 >= cursor.ms {
             let (id, sentence) = (cursor.id, cursor.sentence);
             self.cursor = None;
-            self.sb.set_speaking(id, Some(Speaking::new(sentence)));
+            self.sb.set_highlight(id, Some(Highlight::new(sentence)));
             if self.idle {
                 self.idle = false;
                 self.speech_done();
@@ -717,17 +736,17 @@ impl App {
             return;
         }
         cursor.shown = Some(unit.range);
-        let state = Speaking {
+        let state = Highlight {
             sentence: cursor.sentence,
             word: Some(unit.range),
         };
         let id = cursor.id;
-        self.sb.set_speaking(id, Some(state));
+        self.sb.set_highlight(id, Some(state));
     }
 
     /// Speech stopped: clear the highlight and go back to timed reading.
     fn speech_done(&mut self) {
-        self.sb.clear_speaking();
+        self.sb.clear_highlight();
         self.cursor = None;
         self.idle = false;
         self.lit = None;
@@ -798,7 +817,7 @@ impl App {
             Some(book) => flow::normalize(book, self.pos),
             None => Pos::default(),
         };
-        let speaking = self.speaking_engine();
+        let highlight = self.speaking_engine();
         let chrome = Chrome {
             book: self
                 .book
@@ -829,7 +848,7 @@ impl App {
             has_book: self.book.is_some(),
             library_count: self.library.len(),
             elapsed: self.started.elapsed(),
-            speaking: speaking.as_deref(),
+            speaking: highlight.as_deref(),
             audio_muted: self.cfg.tts.enabled && !self.audio_permitted(),
         };
 
@@ -885,6 +904,8 @@ impl App {
             }
             (KeyCode::Char('s'), true) => self.toggle_speech(),
             (KeyCode::Char('r'), true) => self.step_speed(),
+            (KeyCode::Char('g'), true) => self.step_hit(true),
+            (KeyCode::Char('b'), true) => self.step_hit(false),
             (KeyCode::Char('p'), true) => self.prompt.history_prev(),
             (KeyCode::Char('n'), true) => self.prompt.history_next(),
             (KeyCode::Char('u'), true) => self.prompt.kill_to_start(),
@@ -1005,16 +1026,27 @@ impl App {
             self.command(rest.trim());
             return;
         }
-        // A bare number picks from the library listing.
-        if let Ok(index) = line.trim().parse::<usize>()
-            && self.library.get(index).is_some()
-        {
-            self.open_entry(index);
-            return;
+        // A bare number means the numbered list on screen. With a book open and
+        // a search in hand that list is the hits; otherwise it is the library.
+        if let Ok(index) = line.trim().parse::<usize>() {
+            if self.book.is_some()
+                && self
+                    .find
+                    .as_ref()
+                    .is_some_and(|find| !find.hits.shown.is_empty())
+            {
+                self.goto_hit(index.saturating_sub(1));
+                return;
+            }
+            if self.library.get(index).is_some() {
+                self.open_entry(index);
+                return;
+            }
         }
         match self.book.as_ref() {
             Some(book) => {
-                let steps = flow::answer(book, &line);
+                let (steps, needle, hits) = flow::answer(book, &line);
+                self.remember_search(needle, hits);
                 self.turn.enqueue(steps);
             }
             None => {
@@ -1124,7 +1156,8 @@ impl App {
                 (None, _) => self.no_book(),
                 (Some(_), true) => self.system(t("cmd.usage_find")),
                 (Some(book), false) => {
-                    let steps = flow::answer(book, arg);
+                    let (steps, needle, hits) = flow::answer(book, arg);
+                    self.remember_search(needle, hits);
                     self.turn.enqueue(steps);
                 }
             },
@@ -1364,6 +1397,111 @@ impl App {
                 None => self.system(t("cmd.usage_lang")),
             },
         }
+    }
+
+    /// Keep a search's results so the reader can walk them.
+    fn remember_search(&mut self, needle: String, hits: crate::book::Hits) {
+        self.find = if hits.is_empty() {
+            None
+        } else {
+            Some(Find {
+                needle,
+                hits,
+                at: usize::MAX, // nothing visited yet; the first jump lands on 0
+            })
+        };
+    }
+
+    /// Go to hit `index` (zero-based) and light the term up there.
+    fn goto_hit(&mut self, index: usize) {
+        let Some(find) = self.find.as_mut() else {
+            self.system(t("find.none_active"));
+            return;
+        };
+        let Some(hit) = find.hits.shown.get(index).cloned() else {
+            let total = find.hits.shown.len();
+            self.system(&tf("find.no_such", &[&total, &(index + 1)]));
+            return;
+        };
+        find.at = index;
+        let (needle, count) = (find.needle.clone(), find.hits.shown.len());
+
+        self.pos = Pos {
+            chapter: hit.chapter,
+            para: hit.para,
+        };
+        self.resumed = false;
+        self.save_progress();
+        // The passage has not been rendered yet: mark the term so the block that
+        // carries it is highlighted as soon as it appears.
+        self.marking = Some(needle);
+        self.system(&tf(
+            "find.jumped",
+            &[&(index + 1), &count, &(hit.chapter + 1), &(hit.para + 1)],
+        ));
+        self.read_more();
+    }
+
+    /// `^g` / `^b`: the next or previous hit, wrapping round with a word about it.
+    fn step_hit(&mut self, forward: bool) {
+        let Some(find) = self.find.as_ref() else {
+            self.system(t("find.none_active"));
+            return;
+        };
+        let count = find.hits.shown.len();
+        if count == 0 {
+            self.system(t("find.none_active"));
+            return;
+        }
+        let next = match (find.at, forward) {
+            (usize::MAX, true) => 0,
+            (usize::MAX, false) => count - 1,
+            (at, true) if at + 1 < count => at + 1,
+            (_, true) => {
+                self.system(t("find.wrapped"));
+                0
+            }
+            (at, false) if at > 0 => at - 1,
+            (_, false) => {
+                self.system(t("find.wrapped_back"));
+                count - 1
+            }
+        };
+        self.goto_hit(next);
+    }
+
+    /// Light the search term where it appears in a passage just rendered.
+    ///
+    /// Reuses the read-aloud highlight: the sentence holding the match gets the
+    /// light wash and the term itself the deep one, which is exactly the pair of
+    /// questions a search result raises — where is it, and where exactly.
+    fn mark_match(&mut self, id: u64, text: &str) {
+        let Some(needle) = self.marking.clone() else {
+            return;
+        };
+        let folded_text = text.to_lowercase();
+        let Some(at) = folded_text.find(&needle.to_lowercase()) else {
+            return;
+        };
+        // Snap to a character boundary in case folding shifted the offset.
+        let start = (0..=at)
+            .rev()
+            .find(|i| text.is_char_boundary(*i))
+            .unwrap_or(0);
+        let end = (start + needle.len()).min(text.len());
+        let end = (start..=end)
+            .rev()
+            .find(|i| text.is_char_boundary(*i))
+            .unwrap_or(text.len());
+        let sentence = crate::tts::sentence::split(text)
+            .into_iter()
+            .map(|utterance| utterance.range)
+            .find(|(from, to)| *from <= start && end <= *to)
+            .unwrap_or((0, text.len()));
+        self.marking = None;
+        self.sb
+            .set_highlight(id, Some(Highlight::focused(sentence, (start, end))));
+        self.lit = Some(id);
     }
 
     fn jump(&mut self, chapter: usize) {

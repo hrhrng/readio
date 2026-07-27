@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use crate::book::{Book, Para};
+use crate::book::{Book, Hits, Para};
 use crate::i18n::{t, tf};
 use crate::metrics;
 use crate::ui::block::{ContextInfo, Event, PlanItem, Tool, Verb};
@@ -182,8 +182,15 @@ pub fn continue_reading(book: &Book, pos: Pos, resumed: bool) -> (Vec<Step>, Pos
     (steps, next)
 }
 
+/// How many hits are listed. More than a dozen locations is a list nobody reads;
+/// the true total is reported separately.
+pub const HITS_SHOWN: usize = 12;
+
 /// Steps for a free-form question: a real full-text search, presented as Grep.
-pub fn answer(book: &Book, question: &str) -> Vec<Step> {
+///
+/// Returns the steps and what was found, so the caller can keep the hits for
+/// navigation instead of leaving the reader to copy locations by eye.
+pub fn answer(book: &Book, question: &str) -> (Vec<Step>, String, Hits) {
     let asked = keyword(question);
     let (needle, hits) = resolve(book, &asked);
 
@@ -194,27 +201,40 @@ pub fn answer(book: &Book, question: &str) -> Vec<Step> {
     };
     let root = book.uri_root();
     let body: Vec<String> = hits
+        .shown
         .iter()
-        .map(|(ci, pi, excerpt)| {
-            let chapter = &book.chapters[*ci];
+        .map(|hit| {
+            let chapter = &book.chapters[hit.chapter];
             format!(
                 "{}:{}  {}",
                 short_href(&chapter.href),
-                book.line_of(*ci, *pi),
-                excerpt
+                book.line_of(hit.chapter, hit.para),
+                hit.excerpt
             )
         })
         .collect();
 
+    // The tool line reports the true totals; `shown` is only what fits.
+    let detail = if hits.truncated() {
+        tf(
+            "flow.grep_detail_capped",
+            &[&needle, &hits.total, &hits.paragraphs, &hits.shown.len()],
+        )
+    } else {
+        tf(
+            "flow.grep_detail",
+            &[&needle, &hits.total, &hits.paragraphs],
+        )
+    };
     let grep = Tool::new(Verb::Grep, root)
-        .detail(format!("pattern: {needle}  ·  {} hits", hits.len()))
+        .detail(detail)
         .body(if body.is_empty() {
-            vec!["no matches".to_string()]
+            vec![t("flow.grep_none").to_string()]
         } else {
             body
         });
     let grep = if hits.is_empty() {
-        grep.failed("0 matches")
+        grep.failed(t("flow.grep_zero"))
     } else {
         grep
     };
@@ -229,27 +249,29 @@ pub fn answer(book: &Book, question: &str) -> Vec<Step> {
 
     if hits.is_empty() {
         steps.push(Step::Say(tf("flow.no_hits", &[&needle])));
-        return steps;
+        return (steps, needle, hits);
     }
 
-    let mut answer = tf("flow.hits_intro", &[&needle, &hits.len()]);
-    for (ci, pi, _) in hits.iter().take(3) {
-        let chapter = &book.chapters[*ci];
-        let para = &chapter.paras[*pi];
-        answer.push('\n');
-        answer.push_str(&format!("> {}\n", trim_to(para.text(), 220)));
+    let mut answer = tf(
+        "flow.hits_intro",
+        &[&needle, &hits.total, &hits.paragraphs, &hits.shown.len()],
+    );
+    for (n, hit) in hits.shown.iter().enumerate() {
+        let chapter = &book.chapters[hit.chapter];
         answer.push_str(&tf(
-            "flow.hit_location",
-            &[&(ci + 1), &chapter.title, &(pi + 1)],
+            "flow.hit_line",
+            &[
+                &format!("{:>2}", n + 1),
+                &(hit.chapter + 1),
+                &chapter.title,
+                &(hit.para + 1),
+                &hit.excerpt,
+            ],
         ));
     }
-    answer.push_str(t("flow.where_to_start"));
-    if let Some((ci, pi, _)) = hits.first() {
-        answer.push_str(&tf("flow.goto_hint", &[&(ci + 1)]));
-        answer.push_str(&tf("flow.goto_para", &[&(pi + 1)]));
-    }
+    answer.push_str(t("flow.jump_hint"));
     steps.push(Step::Say(answer));
-    steps
+    (steps, needle, hits)
 }
 
 /// Chapter listing, presented as a directory listing.
@@ -473,18 +495,18 @@ fn short_href(href: &str) -> String {
 /// "忽必烈帝国是什么样子" matches nothing — while 忽必烈 is on every other page.
 /// Try what was asked, then progressively shorter pieces of it, and report which
 /// one was used rather than pretending the book is silent.
-fn resolve(book: &Book, asked: &str) -> (String, Vec<(usize, usize, String)>) {
-    let hits = book.search(asked, 12);
+fn resolve(book: &Book, asked: &str) -> (String, Hits) {
+    let hits = book.search(asked, HITS_SHOWN);
     if !hits.is_empty() || asked.is_empty() {
         return (asked.to_string(), hits);
     }
     for candidate in candidates(asked) {
-        let hits = book.search(&candidate, 12);
+        let hits = book.search(&candidate, HITS_SHOWN);
         if !hits.is_empty() {
             return (candidate, hits);
         }
     }
-    (asked.to_string(), Vec::new())
+    (asked.to_string(), Hits::default())
 }
 
 /// Shorter needles to try, best first.
