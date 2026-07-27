@@ -51,7 +51,9 @@ curl -fsSL https://raw.githubusercontent.com/hrhrng/readio/main/apps/tui/scripts
 cargo install --git https://github.com/hrhrng/readio readio
 ```
 
-预编译产物覆盖 macOS 的 `aarch64` / `x86_64` 和 Linux 的 `aarch64` / `x86_64`（musl 静态链接）。Windows 暂未打包，请从 `apps/tui` 自行编译。
+预编译产物覆盖 macOS 的 `aarch64` / `x86_64` 和 Linux 的 `aarch64` / `x86_64`（musl 静态链接）。它们只是图方便，
+不是唯一的路：其他平台——Windows、BSD、没人打包的架构——用上面那条命令自己编译就行，依赖树是纯 Rust，不需要 C 工具链。
+Windows 的准确说法是没测过，而不是不支持。
 
 ## 用法
 

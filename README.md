@@ -51,7 +51,10 @@ From source, with Rust 1.85 or newer:
 cargo install --git https://github.com/hrhrng/readio readio
 ```
 
-Prebuilt archives are published for `aarch64`/`x86_64` macOS and `aarch64`/`x86_64` Linux (musl, statically linked). Windows is not packaged yet; build it from `apps/tui`.
+Prebuilt archives are published for `aarch64`/`x86_64` macOS and `aarch64`/`x86_64` Linux (musl, statically
+linked). They are a convenience, not the only path: anything else — Windows, a BSD, an architecture nobody
+packages — builds from source with the command above, since the dependency tree is pure Rust and needs no C
+toolchain. Windows in particular is untested rather than unsupported.
 
 ## Usage
 
