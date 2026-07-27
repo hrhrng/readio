@@ -1,0 +1,43 @@
+[package]
+name = "readio"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A terminal ebook reader that reads like a coding agent at work"
+repository = "https://github.com/hrhrng/readio"
+license = "MIT"
+readme = "README.md"
+keywords = ["ebook", "epub", "reader", "tui", "tts"]
+categories = ["command-line-utilities", "text-processing"]
+exclude = ["docs/", "scripts/", "images/"]
+
+[dependencies]
+anyhow = "1.0.104"
+crossterm = { version = "0.28", features = ["event-stream", "bracketed-paste"] }
+dirs = "6.0.0"
+futures = "0.3.33"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+pdf-extract = "0.12.0"
+quick-xml = "0.41.0"
+ratatui = { version = "0.29", features = ["crossterm", "unstable-widget-ref"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+serde_yaml_ng = "0.10.0"
+textwrap = "0.16.2"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+unicode-segmentation = "1.13.3"
+unicode-width = "=0.2.0"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+unicode-width = "=0.2.0"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+
+# Distribution build: one small static-ish binary is the whole product, so the
+# release profile trades compile time for size. `panic = "abort"` is deliberately
+# not set — the panic hook that restores the terminal has to run.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

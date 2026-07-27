@@ -1,0 +1,107 @@
+name: tui-release
+
+# Tag `tui-vX.Y.Z` and the binaries appear. Nothing here is macOS-specific
+# except the two Apple targets, and nothing needs a C compiler: the dependency
+# tree is pure Rust, which is why the musl builds are a one-liner rather than a
+# cross toolchain.
+on:
+  push:
+    tags: ["tui-v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (for a dry run), e.g. tui-v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    working-directory: apps/tui
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup target add ${{ matrix.target }}
+
+      # musl-tools provides the linker; there is no C to compile, but the
+      # linker name is still what rustc looks for.
+      - name: Install musl tooling
+        if: contains(matrix.target, 'linux-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}"
+          name="readio-${version}-${{ matrix.target }}.tar.gz"
+          # The archive holds the binary at its root, README and LICENSE
+          # alongside: install.sh expects ./readio after unpacking.
+          tar -czf "$name" \
+            -C "target/${{ matrix.target }}/release" readio \
+            -C "$GITHUB_WORKSPACE/apps/tui" README.md LICENSE
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: apps/tui/${{ steps.package.outputs.name }}
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # One checksum file for the whole release: install.sh verifies the archive
+      # against it before unpacking anything.
+      - name: Checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum *.tar.gz | tee SHA256SUMS
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name || github.event.inputs.tag }}
+          name: readio tui ${{ github.ref_name || github.event.inputs.tag }}
+          draft: false
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS

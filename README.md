@@ -5,6 +5,7 @@ Open-source Speechify-like reading stack with:
 - `apps/web` (Next.js)
 - `apps/api` (FastAPI)
 - `apps/extension` (Chrome MV3)
+- `apps/tui` (Rust terminal reader — see [`apps/tui/README.md`](apps/tui/README.md))
 
 ## Quick Start (Edge + Cloud Fallback)
 

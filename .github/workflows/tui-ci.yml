@@ -1,0 +1,63 @@
+name: tui-ci
+
+# Scoped to apps/tui so the Rust toolchain only spins up when the terminal
+# reader actually changes.
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "apps/tui/**"
+      - ".github/workflows/tui-ci.yml"
+  pull_request:
+    paths:
+      - "apps/tui/**"
+      - ".github/workflows/tui-ci.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    working-directory: apps/tui
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable --no-self-update && rustup component add rustfmt clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/tui
+
+      - name: Format
+        run: cargo fmt --check
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked
+
+      # The interesting failures live in a real terminal: raw mode, the
+      # alternate screen, and whether the terminal is restored on exit.
+      - name: Terminal smoke test
+        run: |
+          cargo build --release --locked
+          python3 scripts/pty_probe.py 96 24 "wait:0.6,type:/sample,key:enter,wait:2" \
+            --home "${{ runner.temp }}/readio-ci" | tee /tmp/probe.txt
+          grep -q "\[exit: clean\]" /tmp/probe.txt
+          grep -q "\[alt-screen restored: True\]" /tmp/probe.txt
+
+  shell:
+    name: installer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shellcheck
+        run: shellcheck --shell=sh scripts/install.sh
+      - name: Help works under dash
+        run: dash scripts/install.sh --help
