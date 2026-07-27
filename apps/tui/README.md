@@ -16,7 +16,7 @@ curl -fsSL https://raw.githubusercontent.com/hrhrng/readio/main/apps/tui/scripts
 cargo install --git https://github.com/hrhrng/readio readio
 ```
 
-装的东西只有一个：`~/.local/bin/readio`，3.9MB，不带模型、不带资源、没有运行时依赖。要卸载就删掉这个文件，再删 `~/.readio`。
+装的东西只有一个：`~/.local/bin/readio`，4.0MB，不带模型、不带资源、没有运行时依赖。要卸载就删掉这个文件，再删 `~/.readio`。
 
 分发方式选得很朴素，理由是这个项目的形状决定的：
 
@@ -30,7 +30,7 @@ cargo install --git https://github.com/hrhrng/readio readio
 
 ### 为什么能这么简单
 
-依赖树里**没有 C 代码**。原来 `zip` 默认带 `zstd-sys` 和 bzip2，需要 C 编译器；EPUB 只用 store 和 deflate，所以把它裁成 `default-features = false, features = ["deflate"]` 之后整棵树变成纯 Rust。直接的好处是 musl 静态编译只是加一个 target，不用 cross 工具链，一个 Linux 产物在任何发行版上都能跑；顺带二进制从 5.4MB 掉到 3.9MB（`lto = "thin"` + `strip` 又省了一截）。
+依赖树里**没有 C 代码**。原来 `zip` 默认带 `zstd-sys` 和 bzip2，需要 C 编译器；EPUB 只用 store 和 deflate，所以把它裁成 `default-features = false, features = ["deflate"]` 之后整棵树变成纯 Rust。直接的好处是 musl 静态编译只是加一个 target，不用 cross 工具链，一个 Linux 产物在任何发行版上都能跑；顺带二进制从 5.4MB 掉到 3.9MB（`lto = "thin"` + `strip` 又省了一截；加上朗读流水线和检索之后是 4.0MB）。
 
 四个产物：`aarch64-apple-darwin`、`x86_64-apple-darwin`、`x86_64-unknown-linux-musl`、`aarch64-unknown-linux-musl`。打一个 `tui-v*` tag 就由仓库根目录的 `.github/workflows/tui-release.yml` 全部构建、算 `SHA256SUMS`、传上去；CI 是同一层的 `tui-ci.yml`，只在 `apps/tui/**` 变动时触发。
 
@@ -164,7 +164,7 @@ tts:
 
 ## 朗读
 
-readio **不带模型**，只调用你已经装好的引擎——所以二进制只有 2MB 出头，换成下个月更好的模型是改一行配置而不是等一个新版本。`config.yaml` 里预置了四个引擎模板（都来自 [tts-bench](https://github.com/5uck1ess/tts-bench) 2026 年 6 月那一轮的实测）：
+readio **不带模型**，只调用你已经装好的引擎——所以二进制只有 4MB 出头，换成下个月更好的模型是改一行配置而不是等一个新版本。`config.yaml` 里预置了四个引擎模板（都来自 [tts-bench](https://github.com/5uck1ess/tts-bench) 2026 年 6 月那一轮的实测）：
 
 | 引擎 | 大小 / 许可 | 为什么在这 |
 | --- | --- | --- |

@@ -3,14 +3,14 @@
 **一个终端阅读器，交互语法照着 coding agent 做。** 你按回车，它「思考」、发起一次工具调用、然后把书里的下一段流式吐出来。
 
 [![tui-ci](https://github.com/hrhrng/readio/actions/workflows/tui-ci.yml/badge.svg?branch=main)](https://github.com/hrhrng/readio/actions/workflows/tui-ci.yml)
-[![release](https://img.shields.io/github/v/release/hrhrng/readio?filter=tui-v*&label=release&color=6f5ec7)](https://github.com/hrhrng/readio/releases)
+[![release](https://img.shields.io/github/v/release/hrhrng/readio?include_prereleases&filter=tui-v*&label=release&color=6f5ec7)](https://github.com/hrhrng/readio/releases)
 [![license](https://img.shields.io/badge/license-MIT-6f5ec7)](LICENSE)
 [![rust](https://img.shields.io/badge/rust-1.85%2B-6f5ec7)](https://www.rust-lang.org)
 ![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-6f5ec7)
 
 [English](README.md)
 
-支持 EPUB、文字型 PDF、Markdown 和纯文本。朗读交给你自己选的本地模型，正在读的那句浅高亮、读到的那个字深高亮。插图直接画在终端里。一个 3.9 MB 的二进制，不带模型、不带资源、没有运行时依赖，也不读任何环境变量。
+支持 EPUB、文字型 PDF、Markdown 和纯文本。朗读交给你自己选的本地模型，正在读的那句浅高亮、读到的那个字深高亮。插图直接画在终端里。一个 4 MB 的二进制，不带模型、不带资源、没有运行时依赖，也不读任何环境变量。
 
 屏幕上的每一个数字都是真读出来的——真实的段落偏移、真实的行号区间、真实的全文检索命中数。伪装的只是词表，不是数据。
 

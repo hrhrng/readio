@@ -3,14 +3,14 @@
 **A terminal reader with the interaction grammar of a coding agent.** Press enter and it thinks, issues a tool call, and streams the next passage of your book.
 
 [![tui-ci](https://github.com/hrhrng/readio/actions/workflows/tui-ci.yml/badge.svg?branch=main)](https://github.com/hrhrng/readio/actions/workflows/tui-ci.yml)
-[![release](https://img.shields.io/github/v/release/hrhrng/readio?filter=tui-v*&label=release&color=6f5ec7)](https://github.com/hrhrng/readio/releases)
+[![release](https://img.shields.io/github/v/release/hrhrng/readio?include_prereleases&filter=tui-v*&label=release&color=6f5ec7)](https://github.com/hrhrng/readio/releases)
 [![license](https://img.shields.io/badge/license-MIT-6f5ec7)](LICENSE)
 [![rust](https://img.shields.io/badge/rust-1.85%2B-6f5ec7)](https://www.rust-lang.org)
 ![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-6f5ec7)
 
 [中文文档](README.zh-CN.md)
 
-EPUB, text-layer PDF, Markdown and plain text. Read-aloud through a local model of your choice, with the spoken sentence and the sounded character highlighted. Illustrations drawn in the terminal. One 3.9 MB binary with no bundled model, no assets, no runtime dependencies, and no environment variables.
+EPUB, text-layer PDF, Markdown and plain text. Read-aloud through a local model of your choice, with the spoken sentence and the sounded character highlighted. Illustrations drawn in the terminal. One 4 MB binary with no bundled model, no assets, no runtime dependencies, and no environment variables.
 
 Every number on screen is a real reading — real paragraph offsets, real line ranges, real full-text search hits. Only the vocabulary is costume.
 
