@@ -454,9 +454,21 @@ impl App {
                 }
             },
             Err(err) => {
-                self.system(&tf("dev.probe_failed", &[&format!("{err:#}")]));
+                self.report_probe_failure(&err);
                 None
             }
+        }
+    }
+
+    /// A machine with no queryable audio stack — a headless Linux box, say —
+    /// still has to hear about the consequence: the whitelist keeps muting,
+    /// because an output that cannot be named cannot be trusted. Saying only
+    /// "cannot list audio outputs" would leave the reader stuck.
+    fn report_probe_failure(&mut self, err: &anyhow::Error) {
+        self.system(&tf("dev.probe_failed", &[&format!("{err:#}")]));
+        self.system(t("dev.probe_hint"));
+        if self.cfg.tts.output.is_active() {
+            self.system(t("dev.probe_muted"));
         }
     }
 
@@ -482,8 +494,7 @@ impl App {
         let devices = match device::list(&self.cfg.tts.output.query) {
             Ok(devices) => devices,
             Err(err) => {
-                self.system(&tf("dev.probe_failed", &[&format!("{err:#}")]));
-                self.system(t("dev.probe_hint"));
+                self.report_probe_failure(&err);
                 return;
             }
         };

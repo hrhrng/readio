@@ -42,9 +42,16 @@ fn exclusive() -> std::sync::MutexGuard<'static, ()> {
 
 /// A fresh app with no whitelist, whatever an earlier test left behind.
 fn fixture() -> (App, Terminal<TestBackend>) {
+    configured(|_| {})
+}
+
+/// The same, with a chance to bend the config before the app reads it.
+fn configured(edit: impl FnOnce(&mut readio::config::Config)) -> (App, Terminal<TestBackend>) {
     common::isolated_home();
     let mut config = readio::config::Config::load().0;
     config.tts.output.allow.clear();
+    config.tts.output.query.clear();
+    edit(&mut config);
     let _ = config.save();
     let book = Book::load(None).expect("sample book");
     let app = App::new(Library::ephemeral(), Store::ephemeral(), Some(book), None);
@@ -105,6 +112,35 @@ fn an_unlisted_output_is_named_and_the_fix_is_offered() {
     assert!(
         view.contains("/device any"),
         "the way out of the restriction has to be on screen:\n{view}"
+    );
+}
+
+/// The Linux CI box has no `pactl`, so the probe fails there and used to leave
+/// the reader with a mute and no way out. `output.query` pins that failure on
+/// any machine, which is the point: this path must not depend on the host's
+/// audio stack to be exercised.
+#[test]
+fn an_unreadable_device_list_still_offers_the_way_out() {
+    let _guard = exclusive();
+    let (mut app, mut terminal) = configured(|config| {
+        config.tts.output.query = "readio-no-such-probe-command".into();
+    });
+    settle(&mut app, &mut terminal);
+
+    type_line(&mut app, "/device allow readio-no-such-headphones");
+    let view = draw(&mut app, &mut terminal, 6);
+
+    assert!(
+        view.contains("读不到音频设备列表"),
+        "the failure itself should be reported:\n{view}"
+    );
+    assert!(
+        view.contains("认不出的设备一律不出声"),
+        "and its consequence — still muted — spelled out:\n{view}"
+    );
+    assert!(
+        view.contains("/device any"),
+        "the way out has to be on screen even when nothing can be probed:\n{view}"
     );
 }
 

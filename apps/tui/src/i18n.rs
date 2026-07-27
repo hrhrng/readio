@@ -265,6 +265,8 @@ pub const TABLE: &[(&str, &str, &str)] = &[
     ("dev.probe_failed", "读不到音频设备列表：{0}", "Cannot list audio outputs: {0}"),
     ("dev.probe_hint", "在 config.yaml 里 tts.output.query 写一条能打印设备名的命令即可。",
         "Set tts.output.query in config.yaml to a command that prints the device name."),
+    ("dev.probe_muted", "白名单开着，认不出的设备一律不出声。/device any 解除限制。",
+        "The whitelist is on and an output that cannot be identified counts as not allowed, so speech stays muted. /device any lifts the restriction."),
     ("dev.allowed_added", "已加入白名单：{0}", "Added to the whitelist: {0}"),
     ("dev.allowed_exists", "「{0}」已经在白名单里了", "{0} is already on the whitelist"),
     ("dev.denied", "已从白名单移出：{0}", "Removed from the whitelist: {0}"),
