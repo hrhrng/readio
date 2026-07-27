@@ -298,7 +298,10 @@ const TTS_NOTE: &str = "  # readio ships no model: it drives whatever engine you
   # switching models is an edit here rather than a new release.
   # readio 自己不带模型，只调用你装好的引擎，所以换模型就是改这里。
   # an empty voice means the engine default / voice 留空就用引擎默认音色
-  # rate is a speed multiplier, 0.5 slow ~ 2.0 fast / rate 是速率倍数
+  # rate is the playback speed, 0.5 to 3.0; ^r cycles 0.75× 1× 1.25× 1.5× 2×
+  # rate 是朗读倍速（0.5~3.0）；^r 在 0.75× 1× 1.25× 1.5× 2× 之间循环
+  # prefetch: sentences rendered ahead of the one playing, so there is no gap
+  # at a sentence boundary. Raise it if your engine is slow / 提前合成几句
 ";
 
 const OUTPUT_NOTE: &str =

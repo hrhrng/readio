@@ -102,7 +102,7 @@ Copies land in `~/.readio/books`. Use `readio --home <dir>` to keep a separate l
 | `esc` | interrupt |
 | `↑` `↓` · wheel · `pgup` `pgdn` · `home` `end` | scroll |
 | `^t` · `^o` | fold or unfold reasoning · tool calls |
-| `^s` | toggle read-aloud |
+| `^s` · `^r` | toggle read-aloud · cycle its speed (0.75× → 2×) |
 | `^p` `^n` · `^l` · `^c` `^d` | input history · clear · quit |
 
 | Command | Purpose |
@@ -138,6 +138,10 @@ readio ships no speech model. It drives whichever engine you have installed thro
 
 While a passage is spoken, its sentence is washed lightly and the word or character being sounded is washed deeply, and the reveal speed follows each clip's real duration rather than a guess.
 
+Speed works the way an audiobook app's does. `^r` cycles 0.75×, 1×, 1.25×, 1.5×, 2× — the same ladder the web player offers — and `/rate` takes any value from 0.5 to 3. The multiplier sits in the status line next to the engine while audio is playing. Because clips are *rendered* at a speed rather than resampled on playback, a change throws away everything already prefetched and re-queues from the start of the sentence you are hearing, so the new speed arrives within a sentence instead of at the next passage.
+
+Sentences are rendered ahead of playback — `tts.prefetch`, two by default — on a thread of their own, so a sentence boundary is not a hole the length of your engine's synthesis time.
+
 `/device` restricts playback to named audio outputs. When headphones disconnect and the system quietly falls back to the speakers, readio mutes, names the device it found, and offers the way out on screen. An output it cannot identify counts as not allowed.
 
 ## Configuration
@@ -148,7 +152,7 @@ One file, `~/.readio/config.yaml`, written with comments on first run. readio re
 
 ```sh
 cd apps/tui
-cargo test                                     # 182 tests
+cargo test                                     # 192 tests
 python3 scripts/pty_probe.py 96 24 "wait:0.6,type:/sample,key:enter,wait:2"
 ```
 

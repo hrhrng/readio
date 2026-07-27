@@ -241,6 +241,7 @@ const HELP: &[(&str, &str, &str)] = &[
     ("^t", "展开/折叠思考过程", "fold or unfold reasoning"),
     ("^o", "展开/折叠工具调用", "fold or unfold tool calls"),
     ("^s", "开关朗读", "toggle read-aloud"),
+    ("^r", "朗读倍速：0.75× → 2× 循环", "read-aloud speed: cycle 0.75× → 2×"),
     ("^l", "清屏", "clear the screen"),
     ("^c ^d", "退出（输出中时 ^c 先打断）", "quit (^c interrupts first while running)"),
     ("", "", ""),

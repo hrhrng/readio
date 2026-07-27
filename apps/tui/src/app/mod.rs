@@ -526,9 +526,22 @@ impl App {
     // ── read aloud ───────────────────────────────────────────────────────────
 
     /// Engine name while a sentence is actually sounding, for the status line.
-    fn speaking_engine(&self) -> Option<&str> {
+    /// What the status line says while audio is playing: the engine, plus the
+    /// speed whenever it is not 1× — the number an audiobook listener wants to
+    /// glance at without opening a menu.
+    fn speaking_engine(&self) -> Option<String> {
         match (&self.speaker, self.lit) {
-            (Some(speaker), Some(_)) => Some(speaker.engine()),
+            (Some(speaker), Some(_)) => {
+                let engine = speaker.engine();
+                if (self.cfg.tts.rate - 1.0).abs() < 0.001 {
+                    Some(engine.to_string())
+                } else {
+                    Some(format!(
+                        "{engine} {}",
+                        crate::tts::speed_label(self.cfg.tts.rate)
+                    ))
+                }
+            }
             _ => None,
         }
     }
@@ -555,12 +568,24 @@ impl App {
             self.system(&tf("tts.missing_binary", &[&program, &config]));
             return false;
         }
-        self.speaker = Some(Speaker::spawn(Box::new(synth), paths::speech_dir()));
+        self.speaker = Some(Speaker::spawn(
+            Box::new(synth),
+            paths::speech_dir(),
+            self.cfg.tts.prefetch,
+        ));
         true
     }
 
     /// Hand a passage to the speech worker, one sentence at a time.
     fn enqueue_speech(&mut self, id: u64, text: &str) {
+        self.enqueue_speech_from(id, text, 0);
+    }
+
+    /// The same, but skipping everything that ends before `from`.
+    ///
+    /// Used when the speed changes mid-passage: the sentences already spoken
+    /// stay spoken, and the one in progress starts again at the new speed.
+    fn enqueue_speech_from(&mut self, id: u64, text: &str, from: usize) {
         if !self.cfg.tts.enabled || !self.audio_permitted() {
             return;
         }
@@ -576,6 +601,9 @@ impl App {
             return;
         }
         for utterance in sentences {
+            if utterance.range.1 <= from {
+                continue;
+            }
             speaker.speak(id, &utterance.text, utterance.range);
         }
         self.voiced = Some((id, text.to_string()));
@@ -771,7 +799,7 @@ impl App {
             Some(book) => flow::normalize(book, self.pos),
             None => Pos::default(),
         };
-        let speaking = self.speaking_engine().map(str::to_string);
+        let speaking = self.speaking_engine();
         let chrome = Chrome {
             book: self
                 .book
@@ -857,6 +885,7 @@ impl App {
                 });
             }
             (KeyCode::Char('s'), true) => self.toggle_speech(),
+            (KeyCode::Char('r'), true) => self.step_speed(),
             (KeyCode::Char('p'), true) => self.prompt.history_prev(),
             (KeyCode::Char('n'), true) => self.prompt.history_next(),
             (KeyCode::Char('u'), true) => self.prompt.kill_to_start(),
@@ -1261,15 +1290,59 @@ impl App {
 
     /// `/rate <0.5-3.0>` — speech tempo, which then drives the reveal speed.
     fn rate_command(&mut self, arg: &str) {
-        match arg.parse::<f32>() {
-            Ok(v) if (0.5..=3.0).contains(&v) => {
-                self.cfg.tts.rate = v;
-                let _ = self.cfg.save();
-                self.silence();
-                self.speaker = None;
-                self.system(&tf("tts.rate_set", &[&format!("{v:.2}")]));
+        match arg {
+            "" => {
+                let ladder = crate::tts::SPEEDS
+                    .iter()
+                    .map(|speed| crate::tts::speed_label(*speed))
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                self.system(&tf(
+                    "tts.speed_now",
+                    &[&crate::tts::speed_label(self.cfg.tts.rate), &ladder],
+                ));
             }
-            _ => self.system(t("tts.usage_rate")),
+            _ => match arg.trim_end_matches(['x', 'X', '×']).parse::<f32>() {
+                Ok(v) if (0.5..=3.0).contains(&v) => self.set_speed(v),
+                _ => self.system(t("tts.usage_rate")),
+            },
+        }
+    }
+
+    /// `^r`: the next speed on the ladder, the way an audiobook app cycles.
+    fn step_speed(&mut self) {
+        self.set_speed(crate::tts::next_speed(self.cfg.tts.rate));
+    }
+
+    /// Change the playback speed and make it audible immediately.
+    ///
+    /// Clips are rendered at a speed, not resampled at playback, so everything
+    /// already prefetched is wrong the moment this changes. Dropping the speaker
+    /// throws those away; re-queueing from the start of the sentence that was
+    /// playing means the reader hears the new speed within a sentence instead of
+    /// at the next passage.
+    fn set_speed(&mut self, speed: f32) {
+        self.cfg.tts.rate = speed;
+        let _ = self.cfg.save();
+
+        let resume = self
+            .cursor
+            .as_ref()
+            .map(|cursor| cursor.sentence.0)
+            .filter(|_| self.cfg.tts.enabled);
+        let voiced = self.voiced.clone();
+
+        self.silence();
+        self.speaker = None;
+
+        let label = crate::tts::speed_label(speed);
+        if let (Some(from), Some((id, text))) = (resume, voiced) {
+            self.enqueue_speech_from(id, &text, from);
+            self.notice(&tf("tts.speed_set", &[&label]));
+        } else if self.cfg.tts.enabled {
+            self.notice(&tf("tts.speed_set", &[&label]));
+        } else {
+            self.system(&tf("tts.speed_later", &[&label]));
         }
     }
 

@@ -25,6 +25,7 @@ KEYS = {
     "ctrl-s": b"\x13",
     "ctrl-t": b"\x14",
     "ctrl-o": b"\x0f",
+    "ctrl-r": b"\x12",
 }
 
 pid, fd = pty.fork()
