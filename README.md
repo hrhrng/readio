@@ -171,7 +171,7 @@ The probe drives the binary in a real pty and prints the screen it produced, inc
 
 ## Repository layout
 
-`apps/tui` holds this reader; [`apps/tui/README.md`](apps/tui/README.md) documents its architecture, the disguise vocabulary, and how distribution is built and verified (in Chinese).
+`apps/tui` holds this reader; [`apps/tui/README.md`](apps/tui/README.md) is its implementation guide — module map, the invariants each layer holds, and how the thing is tested and shipped.
 
 `apps/web`, `apps/api` and `apps/extension` are the Speechify-like web stack this repository started as; their setup lives in [`docs/web-api-extension.md`](docs/web-api-extension.md).
 

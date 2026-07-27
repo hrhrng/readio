@@ -170,7 +170,7 @@ python3 scripts/pty_probe.py 96 24 "wait:0.6,type:/sample,key:enter,wait:2"
 
 ## 仓库结构
 
-`apps/tui` 是这个阅读器；[`apps/tui/README.md`](apps/tui/README.md) 讲它的架构、伪装词表怎么映射、分发怎么做又怎么验证。
+`apps/tui` 是这个阅读器；[`apps/tui/README.md`](apps/tui/README.md) 是它的实现说明——模块地图、各层守住的不变量、怎么测、怎么发（英文）。
 
 `apps/web`、`apps/api`、`apps/extension` 是这个仓库最初的 Speechify-like 网页栈，安装说明在 [`docs/web-api-extension.md`](docs/web-api-extension.md)。
 
