@@ -1,81 +1,63 @@
-# Readio Monorepo
+# readio
 
-Open-source Speechify-like reading stack with:
+一个终端阅读器，交互语法照着 coding agent 做：**你按回车，它「思考」、发起一次工具调用、然后把书里的文字流式吐出来。**
 
-- `apps/web` (Next.js)
-- `apps/api` (FastAPI)
-- `apps/extension` (Chrome MV3)
-- `apps/tui` (Rust terminal reader — see [`apps/tui/README.md`](apps/tui/README.md))
+界面上看到的每一个数字都是真的——真实的段落偏移、真实的行号区间、真实的全文检索命中数。伪装的只是叙事外壳，不是数据。
 
-## Quick Start (Edge + Cloud Fallback)
+```
+ readio   The Shape of Attention  readio sample                   ch 1/4  ·  ctx 0.0%
+   ○  3. Three  The feel of a tool  783 tok
+   ○  4. Four  One continuous piece of work  485 tok
 
-1. Install monorepo dependencies:
+ ❙ Thought for 1.3s
 
-```bash
-make install
+ ● Read readio://sample/attention.md  L1-9  ·  0.3s
+   # One  Attention in eighty columns
+   The first time I noticed that attention has a shape, I was watching a cursor…
+   I was waiting on a slow build. There was nothing on the screen but that one …
+
+   One  Attention in eighty columns
+
+   The first time I noticed that attention has a shap▌
+╭────────────────────────────────────────────────────────────────────────────────────╮
+│❯ enter to keep reading, or ask a question / type a command                         │
+╰────────────────────────────────────────────────────────────────────────────────────╯
+  ⠼ One  Attention in eighty co…  ·  esc to stop  ·  ↑↓ … ⸬ readio-1  64 tok  ·  0:06
 ```
 
-2. Create `apps/api/.env` from example:
+（这一屏是 `apps/tui/scripts/pty_probe.py` 从一个真实 pty 里抓下来的，不是手写的。）
+
+## 安装
 
 ```bash
-cp apps/api/.env.example apps/api/.env
+# 装好就能用，不需要 Rust 工具链
+curl -fsSL https://raw.githubusercontent.com/hrhrng/readio/main/apps/tui/scripts/install.sh | sh
+
+# 或者自己编译（需要 Rust 1.85+）
+cargo install --git https://github.com/hrhrng/readio readio
 ```
 
-Set at least:
+装的东西只有一个：`~/.local/bin/readio`，3.9MB，不带模型、不带资源、没有运行时依赖。要卸载就删掉这个文件，再删 `~/.readio`。
 
-- `MINIMAX_API_KEY=...`
-- `MINIMAX_VOICE_ID=...` (default is `English_expressive_narrator`)
-
-Optional:
-
-- `MINIMAX_GROUP_ID=...` (if your account requires GroupId)
-- `MINIMAX_API_URL=https://api.minimax.chat/v1/t2a_v2` (full endpoint override)
-
-3. Start web + API with Edge-first fallback:
+## 用法
 
 ```bash
-make dev-minimax
+readio                 # 进书库，列出导入过的书
+readio book.epub       # 导入并开始读（默认 -c：复制一份到 ~/.readio/books）
+readio book.pdf -l     # -l 引用：不复制，只记一条指向原路径的记录
+readio book.md  -m     # -m 移动：搬进书库，原文件不再保留
 ```
 
-This starts:
+支持 `.epub`、`.pdf`（文字型）、`.txt`、`.md`；书里的插图用半块字符直接画在终端里。不想先找书就 `/sample`，有一篇内置的短文。
 
-- API on `http://127.0.0.1:8000` (fallback order: `edge -> minimax -> elevenlabs`)
-- Web on `http://127.0.0.1:3000`
+**回车继续读下一段，输入文字则当成提问去全文检索。** `esc` 打断，`^t` / `^o` 折叠思考与工具调用，`^s` 开关朗读，`^c` 退出，`/help` 是完整的命令表。
 
-4. Open Web app:
+配置只有一个文件：`~/.readio/config.yaml`，**没有任何环境变量**。界面默认英文，`language: zh` 换成中文。
 
-- [http://127.0.0.1:3000](http://127.0.0.1:3000)
+朗读用你自己装的本地模型（kokoro / piper / supertonic，或任何 OpenAI 兼容端点）——readio 不打包模型，只按配置里的命令模板去调用。正在读的那句会浅高亮，读到的那个字深高亮，吐字速度跟着音频真实时长走。`/device` 可以设置音频输出白名单，拔了耳机就静音并告诉你，而不是把书念给整间屋子。
 
-## Detailed Setup
+细节都在 [`apps/tui/README.md`](apps/tui/README.md)：架构、伪装词表怎么映射、分发怎么做、以及那套在真 pty 里跑的验证。
 
-MiniMax cloud mode:
+## 这个仓库里还有什么
 
-- `docs/minimax-cloud-setup.md`
-
-Edge TTS works without API keys after `make install` and is the default multilingual path.
-
-## Streaming TTS
-
-API supports `text/event-stream` synthesis:
-
-- `POST /api/tts/stream`
-- query:
-  - `provider` (optional): `edge | minimax | elevenlabs`
-  - `max_chars` (optional, default `220`)
-
-Response is `text/event-stream` with events:
-
-- `start`
-- `chunk` (contains `audio_base64`, `text`, `provider`, `trace_id`)
-- `end`
-- `error`
-
-Behavior:
-
-- `provider=minimax`: uses MiniMax upstream streaming when available (audio chunks from provider).
-- other providers (or auto fallback): uses sentence split + per-chunk synth.
-- Web app currently uses this stream endpoint when you explicitly select `minimax`.
-
-Note:
-
-- MiniMax stream here is **audio-chunk streaming**, not text-token streaming.
+`apps/web`、`apps/api`、`apps/extension` 是同名的 Speechify-like 网页栈，说明搬到了 [`docs/web-api-extension.md`](docs/web-api-extension.md)。
