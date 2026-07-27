@@ -1,17 +1,18 @@
 # readio
 
-**一个终端阅读器，交互语法照着 coding agent 做。** 你按回车，它「思考」、发起一次工具调用、然后把书里的文字流式吐出来。
+**A terminal reader with the interaction grammar of a coding agent.** Press enter and it thinks, issues a tool call, and streams the next passage of your book.
 
 [![tui-ci](https://github.com/hrhrng/readio/actions/workflows/tui-ci.yml/badge.svg?branch=main)](https://github.com/hrhrng/readio/actions/workflows/tui-ci.yml)
 [![release](https://img.shields.io/github/v/release/hrhrng/readio?filter=tui-v*&label=release&color=6f5ec7)](https://github.com/hrhrng/readio/releases)
 [![license](https://img.shields.io/badge/license-MIT-6f5ec7)](apps/tui/LICENSE)
 [![rust](https://img.shields.io/badge/rust-1.85%2B-6f5ec7)](https://www.rust-lang.org)
 ![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-6f5ec7)
-![size](https://img.shields.io/badge/binary-3.9MB-6f5ec7)
 
-EPUB、文字型 PDF、Markdown、纯文本；本地模型朗读，读到哪儿高亮到哪儿；插图直接画在终端里。一个 3.9MB 的二进制，不带模型、不带资源、没有运行时依赖，也不读任何环境变量。
+[中文文档](README.zh-CN.md)
 
-界面上看到的每一个数字都是真的——真实的段落偏移、真实的行号区间、真实的全文检索命中数。伪装的只是叙事外壳，不是数据。
+EPUB, text-layer PDF, Markdown and plain text. Read-aloud through a local model of your choice, with the spoken sentence and the sounded character highlighted. Illustrations drawn in the terminal. One 3.9 MB binary with no bundled model, no assets, no runtime dependencies, and no environment variables.
+
+Every number on screen is a real reading — real paragraph offsets, real line ranges, real full-text search hits. Only the vocabulary is costume.
 
 ```
  readio   The Shape of Attention  readio sample                   ch 1/4  ·  ctx 0.0%
@@ -34,55 +35,101 @@ EPUB、文字型 PDF、Markdown、纯文本；本地模型朗读，读到哪儿�
   ⠼ One  Attention in eighty co…  ·  esc to stop  ·  ↑↓ … ⸬ readio-1  64 tok  ·  0:06
 ```
 
-（这一屏是 `apps/tui/scripts/pty_probe.py` 从一个真实 pty 里抓下来的，不是手写的。）
+<sub>Captured from a real pty by `apps/tui/scripts/pty_probe.py`, not typed by hand.</sub>
 
-## 安装
+## Install
 
-```bash
-# 装好就能用，不需要 Rust 工具链
+```sh
 curl -fsSL https://raw.githubusercontent.com/hrhrng/readio/main/apps/tui/scripts/install.sh | sh
+```
 
-# 或者自己编译（需要 Rust 1.85+）
+The installer detects your platform, downloads the release archive, verifies it against the release's `SHA256SUMS`, and installs a single file to `~/.local/bin/readio`. It needs no sudo, no compiler and no Rust toolchain; it writes nothing outside the install directory. To uninstall, delete that file and `~/.readio`.
+
+From source, with Rust 1.85 or newer:
+
+```sh
 cargo install --git https://github.com/hrhrng/readio readio
 ```
 
-装的东西只有一个：`~/.local/bin/readio`，3.9MB，不带模型、不带资源、没有运行时依赖。要卸载就删掉这个文件，再删 `~/.readio`。
+Prebuilt archives are published for `aarch64`/`x86_64` macOS and `aarch64`/`x86_64` Linux (musl, statically linked). Windows is not packaged yet; build it from `apps/tui`.
 
-## 用法
+## Usage
 
-```bash
-readio                 # 进书库，列出导入过的书
-readio book.epub       # 导入并开始读（默认 -c：复制一份到 ~/.readio/books）
-readio book.pdf -l     # -l 引用：不复制，只记一条指向原路径的记录
-readio book.md  -m     # -m 移动：搬进书库，原文件不再保留
+```sh
+readio                 # open the library
+readio book.epub       # import and start reading (-c copy, the default)
+readio book.pdf -l     # link: record the path, do not copy
+readio book.md -m      # move: relocate the file into the library
 ```
 
-支持 `.epub`、`.pdf`（文字型）、`.txt`、`.md`；书里的插图用半块字符直接画在终端里。不想先找书就 `/sample`，有一篇内置的短文。
+Copies land in `~/.readio/books`. Use `readio --home <dir>` to keep a separate library. With no book to hand, `/sample` opens a short built-in text.
 
-**回车继续读下一段，输入文字则当成提问去全文检索。** `esc` 打断，`^t` / `^o` 折叠思考与工具调用，`^s` 开关朗读，`^c` 退出，`/help` 是完整的命令表。
+**Enter reads the next passage. Anything you type is treated as a question and runs a full-text search.**
 
-## 伪装成什么
-
-| 阅读器里的概念 | 屏幕上的说法 |
+| Key | Action |
 | --- | --- |
-| 读到全书的百分之几 | `ctx 23.3%`，context window 占用 |
-| 这一段有多少字 | `735 tok`，token 数 |
-| 打开这本书多久了 | `0:15`，会话计时 |
-| 取下一段正文 | 一次工具调用：`● Read book.epub#ch1  L1-9  ·  0.3s` |
-| 全文检索 | 你提的问题，命中数是真的 |
+| `enter` | keep reading; again mid-passage to rush it to the end |
+| `esc` | interrupt |
+| `↑` `↓` · wheel · `pgup` `pgdn` · `home` `end` | scroll |
+| `^t` · `^o` | fold or unfold reasoning · tool calls |
+| `^s` | toggle read-aloud |
+| `^p` `^n` · `^l` · `^c` `^d` | input history · clear · quit |
 
-## 朗读
+| Command | Purpose |
+| --- | --- |
+| `/lib` `/open <n>` `/import <path>` `/forget <n>` | manage the library |
+| `/toc` `/goto <n>` `/next` `/prev` | move between chapters |
+| `/find <term>` | search the whole book |
+| `/auto` `/speed <n>` | keep reading unattended · reveal speed |
+| `/context` `/progress` `/plan` | where you are |
+| `/tts` `/voice <name>` `/rate <0.5-3>` `/device` | read-aloud and audio output |
+| `/lang en\|zh` `/help` `/quit` | interface language · help · exit |
 
-用你自己装的本地模型（kokoro / piper / supertonic，或任何 OpenAI 兼容端点）——readio 不打包模型，只按配置里的命令模板去调用，换模型是改一行配置而不是等一个新版本。
+## What the interface pretends to be
 
-正在读的那句浅高亮，读到的那个字深高亮，吐字速度跟着音频真实时长走。`/device` 可以设置音频输出白名单：拔了耳机、系统悄悄切回外放，它会静音并把话说清楚，而不是把书念给整间屋子。
+| Reading concept | Shown as |
+| --- | --- |
+| How far through the book you are | `ctx 23.3%`, context-window usage |
+| Characters in a passage | `735 tok`, a token count |
+| Time since you opened the book | `0:15`, a session clock |
+| Fetching the next passage | a tool call: `● Read book.epub#ch1  L1-9  ·  0.3s` |
+| Full-text search | the question you asked, with real hit counts |
 
-## 配置
+## Read-aloud
 
-只有一个文件：`~/.readio/config.yaml`，**没有任何环境变量**。界面默认英文，`language: zh` 换成中文；`/speed`、`/voice`、`/rate`、`/device` 这些命令会自己写回去。
+readio ships no speech model. It drives whichever engine you have installed through command templates in the config file, so changing models is an edit rather than a new release.
 
-细节都在 [`apps/tui/README.md`](apps/tui/README.md)：架构、伪装词表怎么映射、分发怎么做、以及那套在真 pty 里跑的验证。
+| Engine | Size · licence | Notes |
+| --- | --- | --- |
+| `kokoro` | 82M · Apache-2.0 | default; multilingual, best on long passages |
+| `piper` | ~15M · GPL-3.0 | fastest to first sound; text on stdin |
+| `supertonic` | 99M · MIT | pure ONNX, no torch, 31 languages |
+| `openai` | — | any OpenAI-compatible `/v1/audio/speech` endpoint |
 
-## 这个仓库里还有什么
+While a passage is spoken, its sentence is washed lightly and the word or character being sounded is washed deeply, and the reveal speed follows each clip's real duration rather than a guess.
 
-`apps/web`、`apps/api`、`apps/extension` 是同名的 Speechify-like 网页栈，说明搬到了 [`docs/web-api-extension.md`](docs/web-api-extension.md)。
+`/device` restricts playback to named audio outputs. When headphones disconnect and the system quietly falls back to the speakers, readio mutes, names the device it found, and offers the way out on screen. An output it cannot identify counts as not allowed.
+
+## Configuration
+
+One file, `~/.readio/config.yaml`, written with comments on first run. readio reads no environment variables. The interface is English by default; set `language: zh` for Chinese. Commands like `/speed`, `/voice`, `/rate` and `/device` write their changes back to the same file.
+
+## Development
+
+```sh
+cd apps/tui
+cargo test                                     # 181 tests
+python3 scripts/pty_probe.py 96 24 "wait:0.6,type:/sample,key:enter,wait:2"
+```
+
+The probe drives the binary in a real pty and prints the screen it produced, including a map of which cells were highlighted — the failures that matter here are raw mode, the alternate screen and whether the terminal is restored on exit, none of which a unit test can see. CI runs the suite on macOS and Linux and the probe on both.
+
+## Repository layout
+
+`apps/tui` holds this reader; [`apps/tui/README.md`](apps/tui/README.md) documents its architecture, the disguise vocabulary, and how distribution is built and verified (in Chinese).
+
+`apps/web`, `apps/api` and `apps/extension` are the Speechify-like web stack this repository started as; their setup lives in [`docs/web-api-extension.md`](docs/web-api-extension.md).
+
+## Licence
+
+MIT. See [`apps/tui/LICENSE`](apps/tui/LICENSE).

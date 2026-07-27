@@ -60,7 +60,7 @@ pub fn presets() -> BTreeMap<String, EngineSpec> {
             model: String::new(),
             extra: String::new(),
             stdin: false,
-            about: "Kokoro-82M · Apache-2.0 · 多语种，长文本首选".to_string(),
+            about: "Kokoro-82M · Apache-2.0 · multilingual, best on long passages".to_string(),
         },
     );
 
@@ -75,7 +75,7 @@ pub fn presets() -> BTreeMap<String, EngineSpec> {
             model: "~/.readio/voices/zh_CN-huayan-medium.onnx".to_string(),
             extra: String::new(),
             stdin: true,
-            about: "Piper · GPL-3.0 · 最快，模型只有十几 MB".to_string(),
+            about: "Piper · GPL-3.0 · fastest to first sound, models are a few MB".to_string(),
         },
     );
 
@@ -89,7 +89,7 @@ pub fn presets() -> BTreeMap<String, EngineSpec> {
             model: String::new(),
             extra: String::new(),
             stdin: false,
-            about: "Supertonic 99M · MIT · 纯 ONNX，不依赖 torch".to_string(),
+            about: "Supertonic 99M · MIT · pure ONNX, no torch".to_string(),
         },
     );
 
@@ -107,7 +107,7 @@ pub fn presets() -> BTreeMap<String, EngineSpec> {
             model: "kokoro".to_string(),
             extra: String::new(),
             stdin: false,
-            about: "任何 OpenAI 兼容的 /v1/audio/speech 服务".to_string(),
+            about: "Any OpenAI-compatible /v1/audio/speech endpoint".to_string(),
         },
     );
 
