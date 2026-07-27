@@ -1,6 +1,6 @@
 # readio — implementation guide
 
-<sub>For what readio is and how to use it, read the [repository README](../../README.md) ([中文](../../README.zh-CN.md)). This document is for people changing the code: what the modules are, which invariants they hold, and how the thing is tested and shipped.</sub>
+<sub>For what readio is and how to use it, read the [repository README](https://github.com/hrhrng/readio#readme) ([中文](https://github.com/hrhrng/readio/blob/main/README.zh-CN.md)) — absolute links, because this file also ships inside every release archive. This document is for people changing the code: what the modules are, which invariants they hold, and how the thing is tested and shipped.</sub>
 
 readio is a terminal ebook reader whose interface borrows the grammar of a coding agent. Press enter and it thinks, issues a tool call, and streams the next passage of the book. Only the vocabulary is costume: every number on screen is a real paragraph offset, a real line range, a real search count.
 
