@@ -4,7 +4,7 @@
 
 [![tui-ci](https://github.com/hrhrng/readio/actions/workflows/tui-ci.yml/badge.svg?branch=main)](https://github.com/hrhrng/readio/actions/workflows/tui-ci.yml)
 [![release](https://img.shields.io/github/v/release/hrhrng/readio?filter=tui-v*&label=release&color=6f5ec7)](https://github.com/hrhrng/readio/releases)
-[![license](https://img.shields.io/badge/license-MIT-6f5ec7)](apps/tui/LICENSE)
+[![license](https://img.shields.io/badge/license-MIT-6f5ec7)](LICENSE)
 [![rust](https://img.shields.io/badge/rust-1.85%2B-6f5ec7)](https://www.rust-lang.org)
 ![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-6f5ec7)
 
@@ -166,4 +166,4 @@ The probe drives the binary in a real pty and prints the screen it produced, inc
 
 ## Licence
 
-MIT. See [`apps/tui/LICENSE`](apps/tui/LICENSE).
+MIT, for everything in this repository. See [`LICENSE`](LICENSE).

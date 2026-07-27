@@ -4,7 +4,7 @@
 
 [![tui-ci](https://github.com/hrhrng/readio/actions/workflows/tui-ci.yml/badge.svg?branch=main)](https://github.com/hrhrng/readio/actions/workflows/tui-ci.yml)
 [![release](https://img.shields.io/github/v/release/hrhrng/readio?filter=tui-v*&label=release&color=6f5ec7)](https://github.com/hrhrng/readio/releases)
-[![license](https://img.shields.io/badge/license-MIT-6f5ec7)](apps/tui/LICENSE)
+[![license](https://img.shields.io/badge/license-MIT-6f5ec7)](LICENSE)
 [![rust](https://img.shields.io/badge/rust-1.85%2B-6f5ec7)](https://www.rust-lang.org)
 ![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-6f5ec7)
 
@@ -165,4 +165,4 @@ python3 scripts/pty_probe.py 96 24 "wait:0.6,type:/sample,key:enter,wait:2"
 
 ## 协议
 
-MIT，见 [`apps/tui/LICENSE`](apps/tui/LICENSE)。
+MIT，整个仓库都是。见 [`LICENSE`](LICENSE)。

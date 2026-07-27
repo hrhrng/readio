@@ -1,5 +1,7 @@
 # readio
 
+<sub>These are engineering notes, in Chinese. For what readio is and how to use it, see the [repository README](../../README.md) — English, with a Chinese translation alongside.</sub>
+
 一个终端阅读器，交互语法照着 coding agent 做：**你按回车，它「思考」、发起一次工具调用、然后把书里的文字流式吐出来。**
 
 界面上看到的每一个数字都是真的——真实的段落偏移、真实的行号区间、真实的全文检索命中数。伪装的只是叙事外壳，不是数据。
