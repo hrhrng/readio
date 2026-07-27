@@ -27,7 +27,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, ubuntu-latest]
+        os: [macos-15, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
       - run: rustup update stable --no-self-update && rustup component add rustfmt clippy
