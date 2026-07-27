@@ -45,6 +45,10 @@ impl Para {
         self.text().chars().count()
     }
 
+    pub fn word_count(&self) -> usize {
+        crate::metrics::words_in(self.text())
+    }
+
     pub fn is_image(&self) -> bool {
         matches!(self, Para::Image { .. })
     }
@@ -61,6 +65,10 @@ pub struct Chapter {
 impl Chapter {
     pub fn char_count(&self) -> usize {
         self.paras.iter().map(Para::char_count).sum()
+    }
+
+    pub fn word_count(&self) -> usize {
+        self.paras.iter().map(Para::word_count).sum()
     }
 
     /// Line number a paragraph would occupy in the source file. Fabricated but
@@ -146,6 +154,10 @@ impl Book {
 
     pub fn char_count(&self) -> usize {
         self.chapters.iter().map(Chapter::char_count).sum()
+    }
+
+    pub fn word_count(&self) -> usize {
+        self.chapters.iter().map(Chapter::word_count).sum()
     }
 
     pub fn chapter(&self, idx: usize) -> Option<&Chapter> {

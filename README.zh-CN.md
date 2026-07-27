@@ -151,7 +151,7 @@ readio 自己不带语音模型，只按配置文件里的命令模板去调用�
 
 ```sh
 cd apps/tui
-cargo test                                     # 192 个测试
+cargo test                                     # 200 个测试
 python3 scripts/pty_probe.py 96 24 "wait:0.6,type:/sample,key:enter,wait:2"
 ```
 

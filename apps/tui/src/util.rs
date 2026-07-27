@@ -38,14 +38,3 @@ pub fn rand_range(low: u64, high: u64) -> u64 {
 pub fn pick<T>(items: &[T]) -> &T {
     &items[(next_u64() as usize) % items.len()]
 }
-
-/// `1234` → `1.2k`, `23456` → `2.3w` (Chinese reading conventions).
-pub fn human(n: usize) -> String {
-    if n >= 10_000 {
-        format!("{:.1}w", n as f64 / 10_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
-    }
-}

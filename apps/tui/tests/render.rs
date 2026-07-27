@@ -88,6 +88,7 @@ fn library_fixture(entries: usize) -> (App, Terminal<TestBackend>) {
             mode: readio::library::Mode::Copy,
             bytes: 1234,
             chars: 5000 * (i + 1),
+            words: 1000 * (i + 1),
             chapters: 3,
             imported: 1,
             last_opened: 0,

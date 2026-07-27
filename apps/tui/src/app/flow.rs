@@ -9,8 +9,9 @@ use std::path::PathBuf;
 
 use crate::book::{Book, Para};
 use crate::i18n::{t, tf};
+use crate::metrics;
 use crate::ui::block::{ContextInfo, Event, PlanItem, Tool, Verb};
-use crate::util::{human, rand_range};
+use crate::util::rand_range;
 
 use super::turn::Step;
 
@@ -91,7 +92,7 @@ pub fn continue_reading(book: &Book, pos: Pos, resumed: bool) -> (Vec<Step>, Pos
                 &(pos.chapter + 1),
                 &chapter.title,
                 &chapter.paras.len(),
-                &human(chapter.char_count()),
+                &metrics::amount(chapter.char_count(), chapter.word_count()),
                 &slice.len(),
             ],
         )
@@ -183,10 +184,14 @@ pub fn continue_reading(book: &Book, pos: Pos, resumed: bool) -> (Vec<Step>, Pos
 
 /// Steps for a free-form question: a real full-text search, presented as Grep.
 pub fn answer(book: &Book, question: &str) -> Vec<Step> {
-    let needle = keyword(question);
-    let hits = book.search(&needle, 12);
+    let asked = keyword(question);
+    let (needle, hits) = resolve(book, &asked);
 
-    let thought = tf("flow.think_search", &[&needle]);
+    let thought = if needle == asked {
+        tf("flow.think_search", &[&needle])
+    } else {
+        tf("flow.think_narrow", &[&asked, &needle])
+    };
     let root = book.uri_root();
     let body: Vec<String> = hits
         .iter()
@@ -257,7 +262,7 @@ pub fn toc(book: &Book, current: usize) -> Vec<Step> {
             format!(
                 "{:>3}  {:<7}  {}{}",
                 i + 1,
-                tf("block.chars", &[&human(ch.char_count())]),
+                metrics::amount(ch.char_count(), ch.word_count()),
                 ch.title,
                 if i == current {
                     t("flow.toc_current")
@@ -270,7 +275,10 @@ pub fn toc(book: &Book, current: usize) -> Vec<Step> {
     vec![
         Step::Think(tf(
             "flow.toc_intro",
-            &[&book.chapters.len(), &human(book.char_count())],
+            &[
+                &book.chapters.len(),
+                &metrics::amount(book.char_count(), book.word_count()),
+            ],
         )),
         Step::Tool {
             tool: Tool::new(Verb::ListDir, book.uri_root())
@@ -354,7 +362,11 @@ pub fn welcome(book: &Book, pos: Pos, resumed: bool) -> Vec<Step> {
     } else {
         tf(
             "flow.welcome_fresh",
-            &[&book.title, &book.chapters.len(), &human(book.char_count())],
+            &[
+                &book.title,
+                &book.chapters.len(),
+                &metrics::amount(book.char_count(), book.word_count()),
+            ],
         )
     };
     vec![Step::Note(head)]
@@ -455,6 +467,92 @@ fn short_href(href: &str) -> String {
 }
 
 /// Reduce a question to something worth grepping for.
+/// Find a needle that actually matches, narrowing the question if it does not.
+///
+/// Chinese has no spaces, so a question arrives as one unbroken string and
+/// "忽必烈帝国是什么样子" matches nothing — while 忽必烈 is on every other page.
+/// Try what was asked, then progressively shorter pieces of it, and report which
+/// one was used rather than pretending the book is silent.
+fn resolve(book: &Book, asked: &str) -> (String, Vec<(usize, usize, String)>) {
+    let hits = book.search(asked, 12);
+    if !hits.is_empty() || asked.is_empty() {
+        return (asked.to_string(), hits);
+    }
+    for candidate in candidates(asked) {
+        let hits = book.search(&candidate, 12);
+        if !hits.is_empty() {
+            return (candidate, hits);
+        }
+    }
+    (asked.to_string(), Vec::new())
+}
+
+/// Shorter needles to try, best first.
+///
+/// For a spaced language the words themselves are the candidates, longest
+/// first. For Chinese, drop the interrogative tail — a question ends with what
+/// it is asking, and begins with what it is asking about — then slide a window
+/// down from the whole phrase to two characters.
+fn candidates(asked: &str) -> Vec<String> {
+    if asked.split_whitespace().count() > 1 {
+        let mut words: Vec<String> = asked
+            .split_whitespace()
+            .filter(|word| word.chars().count() > 2)
+            .map(str::to_string)
+            .collect();
+        words.sort_by_key(|word| std::cmp::Reverse(word.chars().count()));
+        return words;
+    }
+
+    const TAILS: &[&str] = &[
+        "是什么样子",
+        "什么样子",
+        "是什么",
+        "什么样",
+        "怎么样",
+        "为什么",
+        "什么",
+        "怎么",
+        "如何",
+        "多少",
+        "哪些",
+        "哪个",
+        "样子",
+        "是",
+        "有",
+    ];
+    let mut trimmed = asked.to_string();
+    loop {
+        let before = trimmed.chars().count();
+        for tail in TAILS {
+            if let Some(rest) = trimmed.strip_suffix(tail)
+                && rest.chars().count() >= 2
+            {
+                trimmed = rest.to_string();
+                break;
+            }
+        }
+        if trimmed.chars().count() == before {
+            break;
+        }
+    }
+
+    let chars: Vec<char> = trimmed.chars().collect();
+    let mut out = Vec::new();
+    if trimmed != asked && chars.len() >= 2 {
+        out.push(trimmed.clone());
+    }
+    for width in (2..chars.len()).rev() {
+        for start in 0..=chars.len() - width {
+            let piece: String = chars[start..start + width].iter().collect();
+            if !out.contains(&piece) {
+                out.push(piece);
+            }
+        }
+    }
+    out
+}
+
 fn keyword(question: &str) -> String {
     let stripped: String = question
         .chars()
@@ -471,4 +569,42 @@ fn keyword(question: &str) -> String {
         .max_by_key(|t| t.chars().count())
         .map(|t| trim_to(t, 12))
         .unwrap_or_else(|| trim_to(cleaned, 12))
+}
+
+#[cfg(test)]
+mod narrowing_tests {
+    use super::*;
+
+    #[test]
+    fn a_chinese_question_offers_its_topic_before_its_fragments() {
+        let list = candidates("忽必烈帝国是什么样子");
+        assert_eq!(
+            list.first().map(String::as_str),
+            Some("忽必烈帝国"),
+            "the interrogative tail goes first: {list:?}"
+        );
+        let kublai = list.iter().position(|c| c == "忽必烈");
+        let noise = list.iter().position(|c| c == "国是");
+        assert!(kublai.is_some(), "忽必烈 must be tried: {list:?}");
+        assert!(
+            kublai < noise || noise.is_none(),
+            "a longer prefix should come before a two-character fragment: {list:?}"
+        );
+    }
+
+    #[test]
+    fn a_spaced_question_falls_back_to_its_longest_words() {
+        let list = candidates("what shape does attention have");
+        assert_eq!(list.first().map(String::as_str), Some("attention"));
+        assert!(
+            !list.iter().any(|word| word.chars().count() <= 2),
+            "two-letter words are noise: {list:?}"
+        );
+    }
+
+    #[test]
+    fn a_phrase_that_needs_no_narrowing_produces_nothing_to_try() {
+        // Two characters cannot be narrowed further.
+        assert!(candidates("记忆").is_empty());
+    }
 }

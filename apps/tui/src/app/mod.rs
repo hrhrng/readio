@@ -27,7 +27,6 @@ use crate::ui::block::{Block, Event, LibraryRow, Speaking};
 use crate::ui::chrome::{self, Chrome};
 use crate::ui::prompt::Prompt;
 use crate::ui::scrollback::Scrollback;
-use crate::util::human;
 
 use flow::Pos;
 use turn::{Effect, Turn};
@@ -1193,8 +1192,11 @@ impl App {
                                 "{:.1}",
                                 book.progress(self.pos.chapter, self.pos.para) * 100.0
                             ),
-                            &human(read),
-                            &human(book.char_count()),
+                            &crate::metrics::amount(
+                                read,
+                                crate::metrics::words_from_char_count(read),
+                            ),
+                            &crate::metrics::amount(book.char_count(), book.word_count()),
                             &(self.pos.chapter + 1),
                             &(self.pos.para + 1),
                         ],
@@ -1433,7 +1435,7 @@ impl App {
                         &entry.title,
                         &paths::display(&entry.path),
                         &index,
-                        &human(entry.chars),
+                        &entry.amount(),
                     ],
                 );
                 self.system(&note);
@@ -1571,7 +1573,7 @@ pub fn import_and_open(path: &str, mode: Mode, library: &mut Library) -> Result<
             &mode.describe(),
             &entry.title,
             &paths::display(&entry.path),
-            &human(entry.chars),
+            &entry.amount(),
             &entry.chapters,
         ],
     );

@@ -81,6 +81,11 @@ pub struct Entry {
     pub bytes: u64,
     #[serde(default)]
     pub chars: usize,
+    /// Words, counted per script at import time. Zero on records written before
+    /// readio counted them; [`Entry::amount`] falls back to an estimate, and
+    /// opening the book fills it in.
+    #[serde(default)]
+    pub words: usize,
     #[serde(default)]
     pub chapters: usize,
     #[serde(default)]
@@ -93,6 +98,16 @@ impl Entry {
     /// True when the file behind this entry is still readable.
     pub fn available(&self) -> bool {
         self.path.exists()
+    }
+
+    /// How long this book is, in the reader's own unit.
+    pub fn amount(&self) -> String {
+        let words = if self.words > 0 {
+            self.words
+        } else {
+            crate::metrics::words_from_char_count(self.chars)
+        };
+        crate::metrics::amount(self.chars, words)
     }
 }
 
@@ -233,6 +248,7 @@ impl Library {
             mode,
             bytes,
             chars: book.char_count(),
+            words: book.word_count(),
             chapters: book.chapters.len(),
             imported: now_secs(),
             last_opened: 0,

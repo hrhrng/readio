@@ -191,3 +191,144 @@ mod tests {
         assert_eq!(free, 0.0);
     }
 }
+
+/// Characters per word, by script.
+///
+/// English words average about 5.1 characters with their space. Chinese has no
+/// spaces at all, and publishers quoting a translation's length convert at
+/// roughly 1.6 characters per English word.
+const LATIN_CHARS_PER_WORD: f64 = 5.1;
+const CJK_CHARS_PER_WORD: f64 = 1.6;
+
+/// Is this one of the scripts that writes without spaces?
+fn is_ideographic(c: char) -> bool {
+    matches!(c,
+        '\u{3040}'..='\u{30ff}'      // hiragana, katakana
+        | '\u{3400}'..='\u{4dbf}'    // CJK extension A
+        | '\u{4e00}'..='\u{9fff}'    // CJK unified
+        | '\u{f900}'..='\u{faff}'    // compatibility ideographs
+        | '\u{ac00}'..='\u{d7af}'    // hangul syllables
+    )
+}
+
+/// Words in a piece of text, counted the way each script counts them.
+///
+/// Latin runs are counted at word boundaries; ideographic characters are
+/// converted at [`CJK_CHARS_PER_WORD`], because counting each 字 as a word would
+/// triple a Chinese novel's apparent length.
+pub fn words_in(text: &str) -> usize {
+    let mut cjk = 0usize;
+    let mut latin = String::new();
+    for c in text.chars() {
+        if is_ideographic(c) {
+            cjk += 1;
+        } else {
+            latin.push(c);
+        }
+    }
+    let latin_words = latin
+        .split(|c: char| c.is_whitespace() || (c.is_ascii_punctuation() && c != '\''))
+        .filter(|word| word.chars().any(char::is_alphanumeric))
+        .count();
+    latin_words + (cjk as f64 / CJK_CHARS_PER_WORD).round() as usize
+}
+
+/// Words implied by a bare character count, for records that predate counting
+/// them. Assumes prose in a spaced script, which is the safer guess: it never
+/// inflates a number.
+pub fn words_from_char_count(chars: usize) -> usize {
+    (chars as f64 / LATIN_CHARS_PER_WORD).round() as usize
+}
+
+/// How much text there is, in the unit the reader's language uses: 字 for
+/// Chinese, words for English.
+///
+/// Both are rough measures of the same thing, but the unit has to be one the
+/// reader thinks in. An English interface used to say "8.8w chars", which is a
+/// Chinese unit (万) wearing an English label.
+pub fn amount(chars: usize, words: usize) -> String {
+    if crate::i18n::current() == crate::i18n::Lang::Zh {
+        if chars >= 10_000 {
+            format!("{:.1}万字", chars as f64 / 10_000.0)
+        } else {
+            format!("{chars}字")
+        }
+    } else if words >= 1_000_000 {
+        format!("{:.1}M words", words as f64 / 1_000_000.0)
+    } else if words >= 1_000 {
+        format!("{:.1}k words", words as f64 / 1_000.0)
+    } else {
+        format!("{words} words")
+    }
+}
+
+/// The same, for a piece of text in hand.
+pub fn amount_of(text: &str) -> String {
+    amount(text.chars().count(), words_in(text))
+}
+
+#[cfg(test)]
+mod amount_tests {
+    use super::*;
+    use crate::i18n::{self, Lang};
+
+    /// The tests share one global language, so they take turns.
+    fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn latin_words_come_from_word_boundaries() {
+        assert_eq!(words_in("The first time I noticed"), 5);
+        assert_eq!(words_in("don't stop — it's fine"), 4);
+        assert_eq!(words_in("   "), 0);
+    }
+
+    /// A Chinese paragraph has no spaces, so counting each 字 as a word would
+    /// call this sentence twenty words. It is closer to twelve.
+    #[test]
+    fn chinese_characters_convert_rather_than_counting_one_each() {
+        let text = "从那儿出发，向东走三天，你便会抵达迪奥米拉";
+        let chars = text.chars().filter(|c| !"，。".contains(*c)).count();
+        let words = words_in(text);
+        assert!(
+            words < chars && words > chars / 3,
+            "{words} words for {chars} characters is not a plausible conversion"
+        );
+    }
+
+    #[test]
+    fn mixed_scripts_add_up() {
+        assert_eq!(words_in("readio 读书"), 1 + 1);
+    }
+
+    #[test]
+    fn each_language_gets_its_own_unit() {
+        let _guard = exclusive();
+        let before = i18n::current();
+
+        i18n::set(Lang::Zh);
+        assert_eq!(amount(88_000, 55_000), "8.8万字");
+        assert_eq!(amount(560, 350), "560字");
+
+        i18n::set(Lang::En);
+        assert_eq!(amount(88_000, 55_000), "55.0k words");
+        assert_eq!(amount(560, 350), "350 words");
+
+        i18n::set(before);
+    }
+
+    /// The bug this replaced: an English interface announcing a novel as
+    /// "8.8w chars" — a Chinese unit with an English label.
+    #[test]
+    fn english_never_shows_the_chinese_unit() {
+        let _guard = exclusive();
+        let before = i18n::current();
+        i18n::set(Lang::En);
+        let text = amount(88_000, 55_000);
+        i18n::set(before);
+        assert!(!text.contains('w') || text.contains("words"));
+        assert!(!text.contains('字'));
+    }
+}

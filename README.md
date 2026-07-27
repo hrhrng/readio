@@ -152,7 +152,7 @@ One file, `~/.readio/config.yaml`, written with comments on first run. readio re
 
 ```sh
 cd apps/tui
-cargo test                                     # 192 tests
+cargo test                                     # 200 tests
 python3 scripts/pty_probe.py 96 24 "wait:0.6,type:/sample,key:enter,wait:2"
 ```
 
