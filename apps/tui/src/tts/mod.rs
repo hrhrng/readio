@@ -516,9 +516,27 @@ mod tests {
         log: Arc<Mutex<Vec<(&'static str, Instant)>>>,
         synth: Duration,
         play: Duration,
+        /// While this stays true, `play` does not return. Parking the player
+        /// inside a clip lets a test reason about the pipeline's shape without
+        /// depending on how fast the machine happens to be.
+        hold: Option<Arc<AtomicBool>>,
     }
 
     impl Fake {
+        fn new(log: &Arc<Mutex<Vec<(&'static str, Instant)>>>, synth: u64, play: u64) -> Self {
+            Self {
+                log: Arc::clone(log),
+                synth: Duration::from_millis(synth),
+                play: Duration::from_millis(play),
+                hold: None,
+            }
+        }
+
+        fn parked(mut self, hold: &Arc<AtomicBool>) -> Self {
+            self.hold = Some(Arc::clone(hold));
+            self
+        }
+
         fn note(&self, what: &'static str) {
             self.log
                 .lock()
@@ -542,12 +560,46 @@ mod tests {
         fn play(&self, _clip: &Clip, _cancel: &AtomicBool) -> Result<()> {
             self.note("play-start");
             std::thread::sleep(self.play);
+            if let Some(hold) = &self.hold {
+                // The deadline is a safety net, not part of the contract: a bug
+                // should fail an assertion rather than hang the suite, and it is
+                // short because a failing run has to wait it out once per clip.
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while hold.load(Ordering::SeqCst) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
             self.note("play-end");
             Ok(())
         }
 
         fn describe(&self) -> String {
             "fake".to_string()
+        }
+    }
+
+    type Log = Arc<Mutex<Vec<(&'static str, Instant)>>>;
+
+    /// How many events of one kind have been logged.
+    fn count(log: &Log, what: &str) -> usize {
+        log.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|(kind, _)| *kind == what)
+            .count()
+    }
+
+    /// Wait until at least `wanted` events of one kind are logged, then report
+    /// the count. Gives up on a deadline so a stall shows up as a failed
+    /// assertion instead of a hung test.
+    fn count_at_least(log: &Log, what: &str, wanted: usize) -> usize {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let seen = count(log, what);
+            if seen >= wanted || Instant::now() >= deadline {
+                return seen;
+            }
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
 
@@ -578,11 +630,7 @@ mod tests {
     #[test]
     fn the_next_sentence_is_rendered_while_this_one_plays() {
         let log = Arc::new(Mutex::new(Vec::new()));
-        let fake = Fake {
-            log: Arc::clone(&log),
-            synth: Duration::from_millis(60),
-            play: Duration::from_millis(140),
-        };
+        let fake = Fake::new(&log, 60, 140);
         let dir = scratch("overlap");
         let mut speaker = Speaker::spawn(Box::new(fake), dir.clone(), 2);
         for (n, text) in ["one.", "two.", "three."].iter().enumerate() {
@@ -617,31 +665,42 @@ mod tests {
 
     /// Prefetch is a window, not a licence to render the whole chapter: a slow
     /// player must not have a hundred wavs piling up behind it.
+    ///
+    /// The player is parked inside the first clip for the duration of the
+    /// assertion. Nothing can be popped while it is parked, so the window is a
+    /// fact about the pipeline rather than about the clock — an earlier version
+    /// slept for 90 ms and counted, and failed on a loaded CI machine that had
+    /// simply got further along by the time it woke up.
     #[test]
     fn rendering_stays_within_the_prefetch_window() {
         let log = Arc::new(Mutex::new(Vec::new()));
-        let fake = Fake {
-            log: Arc::clone(&log),
-            synth: Duration::from_millis(10),
-            play: Duration::from_millis(120),
-        };
+        let hold = Arc::new(AtomicBool::new(true));
         let dir = scratch("window");
-        let mut speaker = Speaker::spawn(Box::new(fake), dir.clone(), 2);
+        let mut speaker = Speaker::spawn(
+            Box::new(Fake::new(&log, 10, 0).parked(&hold)),
+            dir.clone(),
+            2,
+        );
         for n in 0..6u64 {
             speaker.speak(n, "a sentence.", (0, 11));
         }
-        // While the first clip is still playing, only the window may be ahead.
-        std::thread::sleep(Duration::from_millis(90));
-        let rendered = log
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .filter(|(kind, _)| *kind == "render-end")
-            .count();
-        assert!(
-            rendered <= 3,
-            "with prefetch 2, at most the playing clip plus two may be rendered, got {rendered}"
+
+        // One clip in the player, `prefetch` queued behind it, and there the
+        // render thread must stop: pushing a fourth needs room, and room needs
+        // a pop the parked player cannot make.
+        let rendered = count_at_least(&log, "render-end", 3);
+        assert_eq!(
+            rendered, 3,
+            "with prefetch 2, the playing clip plus two is the whole window"
         );
+        std::thread::sleep(Duration::from_millis(120));
+        assert_eq!(
+            count(&log, "render-end"),
+            3,
+            "a parked player must not let a fourth clip through"
+        );
+
+        hold.store(false, Ordering::SeqCst);
         drop(speaker);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -652,11 +711,7 @@ mod tests {
     #[test]
     fn stopping_discards_clips_rendered_at_the_old_speed() {
         let log = Arc::new(Mutex::new(Vec::new()));
-        let fake = Fake {
-            log: Arc::clone(&log),
-            synth: Duration::from_millis(10),
-            play: Duration::from_millis(200),
-        };
+        let fake = Fake::new(&log, 10, 200);
         let dir = scratch("flush");
         let mut speaker = Speaker::spawn(Box::new(fake), dir.clone(), 4);
         for n in 0..5u64 {
