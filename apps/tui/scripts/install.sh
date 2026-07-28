@@ -136,7 +136,11 @@ Releases: https://github.com/$REPO/releases"
 # then match the last tag in the document rather than the first. Splitting keeps
 # the newest-first order the sources already have.
 newest_tag() {
-    tr ',<' '\n\n' \
+    # Two passes rather than one: `tr ',<' '\n\n'` says the same thing, but a
+    # repeated replacement character is exactly what shellcheck flags (SC2020),
+    # and a CI run that fails over punctuation teaches nobody anything.
+    tr ',' '\n' \
+        | tr '<' '\n' \
         | sed -n \
             -e 's/.*"tag_name" *: *"\([^"]*\)".*/\1/p' \
             -e 's|.*/releases/tag/\([^"/]*\).*|\1|p' \
