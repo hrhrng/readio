@@ -13,25 +13,41 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 
-use super::config::EngineSpec;
+use super::config::{self, EngineSpec, LanguageSpec};
 use super::{Clip, Synthesizer, wav};
+use crate::i18n::{t, tf};
 
 /// A synthesizer built from an [`EngineSpec`].
 pub struct CommandSynth {
     name: String,
     spec: EngineSpec,
     voice: String,
+    language: String,
     rate: f32,
 }
 
 impl CommandSynth {
+    /// `voice` is the reader's explicit choice; empty means "whatever suits the
+    /// passage", which the engine's `languages` table answers.
     pub fn new(name: &str, spec: EngineSpec, voice: String, rate: f32) -> Self {
         Self {
             name: name.to_string(),
             spec,
             voice,
+            language: String::new(),
             rate,
         }
+    }
+
+    /// Pin the language, or leave it to the sentence.
+    ///
+    /// `auto` and the empty string both mean per-sentence detection; anything
+    /// else names an entry in the engine's `languages` table. A name with no
+    /// entry behind it falls back to detection rather than to silence: a typo
+    /// in a config file should not stop a book being read.
+    pub fn in_language(mut self, language: &str) -> Self {
+        self.language = language.trim().to_string();
+        self
     }
 
     /// Check the engine's program exists before switching read-aloud on, so the
@@ -53,17 +69,13 @@ impl Synthesizer for CommandSynth {
         let args = self.build(&self.spec.synth, text, out, None);
         let stdin = self.spec.stdin.then_some(text);
         run(&args, stdin, Duration::from_secs(120))
-            .with_context(|| format!("{} 合成失败", self.name))?;
+            .with_context(|| tf("synth.failed", &[&self.name]))?;
 
         if !out.exists() {
-            return Err(anyhow!(
-                "{} 没有写出音频文件（检查 tts.toml 里的 synth 命令）",
-                self.name
-            ));
+            return Err(anyhow!("{}", tf("synth.no_audio", &[&self.name])));
         }
-        let ms = wav::duration_ms(out).with_context(|| {
-            format!("{} 写出的不是可识别的 wav（{}）", self.name, out.display())
-        })?;
+        let ms = wav::duration_ms(out)
+            .with_context(|| tf("synth.bad_wav", &[&self.name, &out.display()]))?;
         Ok(Clip {
             path: out.to_path_buf(),
             ms,
@@ -78,7 +90,7 @@ impl Synthesizer for CommandSynth {
         }
         let args = self.build(&self.spec.play, "", &clip.path, Some(&clip.path));
         let Some((program, rest)) = args.split_first() else {
-            return Err(anyhow!("播放命令是空的"));
+            return Err(anyhow!("{}", t("synth.empty_play")));
         };
 
         let mut child = Command::new(program)
@@ -87,7 +99,7 @@ impl Synthesizer for CommandSynth {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
-            .with_context(|| format!("无法运行播放器 {program}"))?;
+            .with_context(|| tf("synth.cannot_play", &[&program]))?;
 
         // Poll so an interrupt can cut the audio off mid-sentence.
         loop {
@@ -99,7 +111,7 @@ impl Synthesizer for CommandSynth {
             match child.try_wait()? {
                 Some(status) if status.success() => return Ok(()),
                 Some(status) => {
-                    return Err(anyhow!("播放器退出（{status}）"));
+                    return Err(anyhow!("{}", tf("synth.player_exited", &[&status])));
                 }
                 None => std::thread::sleep(Duration::from_millis(20)),
             }
@@ -117,15 +129,92 @@ impl Synthesizer for CommandSynth {
 }
 
 impl CommandSynth {
+    /// The language entry to read this sentence with.
+    ///
+    /// In order: the one the reader pinned in `config.yaml`; the one the voice
+    /// they pinned belongs to, since `zf_xiaoyi` under `en-us` is the exact
+    /// mismatch this table exists to prevent; otherwise the sentence's own.
+    ///
+    /// Detection is per sentence rather than per session because a shelf holds
+    /// books in more than one language, and so does the odd book — a quoted
+    /// English line inside a Chinese page is read as English without anyone
+    /// reaching for a setting.
+    fn language_for(&self, text: &str) -> Option<&LanguageSpec> {
+        let named = match self.language.as_str() {
+            "" | "auto" => None,
+            name => self.spec.languages.get(name),
+        };
+        named
+            .or_else(|| self.voice_family())
+            .or_else(|| self.spec.languages.get(config::language_of(text)))
+    }
+
+    /// The language entry a pinned voice belongs to, if readio ships one.
+    ///
+    /// Matched on the family a voice name starts with as well as on the name
+    /// itself: Kokoro's Mandarin set is `zf_xiaobei`, `zf_xiaoni`, `zf_xiaoyi`
+    /// and the `zf_xiaoxiao` in the table, and a reader swapping between them
+    /// has not changed language.
+    fn voice_family(&self) -> Option<&LanguageSpec> {
+        let voice = self.voice.trim();
+        if voice.is_empty() {
+            return None;
+        }
+        let family = |name: &str| name.split_once('_').map(|(head, _)| head.to_string());
+        self.spec.languages.values().find(|s| {
+            s.voice == voice || (family(&s.voice) == family(voice) && !s.voice.is_empty())
+        })
+    }
+
+    /// The voice this passage gets: the reader's explicit choice first, because
+    /// naming a voice is a decision and readio does not overrule those; then
+    /// the one that matches the language; then the engine's own default.
+    fn voice_for(&self, language: Option<&LanguageSpec>) -> String {
+        if !self.voice.trim().is_empty() {
+            return self.voice.clone();
+        }
+        match language.map(|s| s.voice.as_str()) {
+            Some(voice) if !voice.is_empty() => voice.to_string(),
+            _ => self.spec.voice.clone(),
+        }
+    }
+
     /// Expand a template into argv.
     ///
     /// `{text}` and `{json}` are substituted after splitting, so no amount of
     /// quoting inside the sentence can add an argument.
     fn build(&self, template: &str, text: &str, out: &Path, file: Option<&Path>) -> Vec<String> {
-        let json = request_body(&self.spec.model, &self.voice, text, self.rate);
+        // Anything the reader wrote in `extra` still has the last word: it is
+        // spliced after `{lang}`, and a repeated flag is the later one.
+        let language = self.language_for(text);
+        let voice = self.voice_for(language);
+        let model = match language.map(|s| s.model.as_str()) {
+            Some(model) if !model.is_empty() => model,
+            _ => &self.spec.model,
+        };
+        let lang = language.map(|s| s.lang.as_str()).unwrap_or_default();
+        let json = request_body(model, &voice, text, self.rate);
         split_args(template)
             .into_iter()
-            .map(|arg| {
+            .flat_map(|arg| {
+                // `{extra}` is the reader's own words from the config file, so it
+                // is spliced as arguments rather than substituted into one. A
+                // `--lang cmn` that arrives as a single argv entry is an engine
+                // saying "unrecognised option --lang cmn".
+                if arg.trim() == "{extra}" {
+                    return split_args(&self.spec.extra);
+                }
+                // Same for `{lang}`, and for the same reason — with the added
+                // point that an engine with nothing to say here contributes no
+                // argument at all rather than an empty one.
+                if arg.trim() == "{lang}" {
+                    return split_args(lang);
+                }
+                // Nothing here goes through a shell, so `~` would otherwise
+                // reach the engine as a directory named "~". Expanded on the
+                // template rather than on the result, so a sentence that opens
+                // with a tilde is still just a sentence.
+                let arg = expand_tilde(&arg);
                 let expanded = arg
                     .replace("{out}", &out.to_string_lossy())
                     .replace(
@@ -134,18 +223,20 @@ impl CommandSynth {
                             .map(|f| f.to_string_lossy().into_owned())
                             .unwrap_or_default(),
                     )
-                    .replace("{voice}", &self.voice)
+                    .replace("{voice}", &voice)
                     .replace("{rate}", &format_rate(self.rate))
-                    .replace("{model}", &expand_tilde(&self.spec.model))
+                    .replace("{scale}", &format_rate(inverse(self.rate)))
+                    .replace("{model}", &expand_tilde(model))
                     .replace("{extra}", &self.spec.extra);
                 // Whole-argument substitutions last: their content is data.
-                if expanded.trim() == "{text}" {
+                let arg = if expanded.trim() == "{text}" {
                     text.to_string()
                 } else if expanded.trim() == "{json}" {
                     json.clone()
                 } else {
                     expanded.replace("{text}", text).replace("{json}", &json)
-                }
+                };
+                vec![arg]
             })
             .filter(|arg| !arg.is_empty())
             .collect()
@@ -155,6 +246,19 @@ impl CommandSynth {
 /// Rate as engines expect it: two decimals, no exponent.
 fn format_rate(rate: f32) -> String {
     format!("{rate:.2}")
+}
+
+/// The same speed said the other way round, for engines whose knob is duration.
+///
+/// Piper's `--length-scale` stretches the audio: 0.5 is twice as fast. Handing
+/// it a speed multiplier makes "read faster" read slower, which sounds like a
+/// broken model rather than a swapped placeholder.
+fn inverse(rate: f32) -> f32 {
+    if rate.abs() < f32::EPSILON {
+        1.0
+    } else {
+        1.0 / rate
+    }
 }
 
 /// Body for an OpenAI-compatible `/v1/audio/speech` call.
@@ -215,7 +319,7 @@ pub fn split_args(template: &str) -> Vec<String> {
 /// their text there rather than from an argument.
 fn run(args: &[String], input: Option<&str>, timeout: Duration) -> Result<()> {
     let Some((program, rest)) = args.split_first() else {
-        return Err(anyhow!("命令是空的"));
+        return Err(anyhow!("{}", t("synth.empty_command")));
     };
     let mut child = Command::new(program)
         .args(rest)
@@ -227,7 +331,7 @@ fn run(args: &[String], input: Option<&str>, timeout: Duration) -> Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| format!("无法运行 {program}"))?;
+        .with_context(|| tf("synth.cannot_run", &[&program]))?;
 
     if let Some(text) = input {
         use std::io::Write;
@@ -251,11 +355,11 @@ fn run(args: &[String], input: Option<&str>, timeout: Duration) -> Result<()> {
                 }
                 let detail = stderr.lines().next_back().unwrap_or("").trim().to_string();
                 return Err(anyhow!(
-                    "{program} 退出（{status}）{}",
+                    "{}",
                     if detail.is_empty() {
-                        String::new()
+                        tf("synth.exited", &[&program, &status])
                     } else {
-                        format!("：{detail}")
+                        tf("synth.exited_saying", &[&program, &status, &detail])
                     }
                 ));
             }
@@ -263,7 +367,7 @@ fn run(args: &[String], input: Option<&str>, timeout: Duration) -> Result<()> {
                 if std::time::Instant::now() > deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(anyhow!("{program} 超时"));
+                    return Err(anyhow!("{}", tf("synth.timeout", &[&program])));
                 }
                 std::thread::sleep(Duration::from_millis(15));
             }
@@ -315,11 +419,7 @@ mod tests {
         EngineSpec {
             synth: synth.to_string(),
             play: "afplay {file}".to_string(),
-            voice: String::new(),
-            model: String::new(),
-            extra: String::new(),
-            stdin: false,
-            about: String::new(),
+            ..EngineSpec::default()
         }
     }
 
@@ -426,16 +526,63 @@ mod tests {
         assert!(!synth.is_available(), "should report the binary as missing");
     }
 
+    /// A failing engine has to explain itself in the reader's language. The
+    /// sentence comes back from a subprocess, so this is the one place where an
+    /// untranslated string could slip past the message table.
     #[test]
-    fn a_failing_engine_reports_why() {
+    fn a_failing_engine_reports_why_in_the_readers_language() {
+        let _lock = crate::i18n::exclusive();
+        let before = crate::i18n::current();
         let synth = CommandSynth::new("false", spec("false --out {out}"), String::new(), 1.0);
-        let err = synth
-            .synthesize("文本", Path::new("/tmp/readio-never-written.wav"))
-            .expect_err("`false` cannot synthesize anything");
-        let message = format!("{err:#}");
+        let complain = || {
+            format!(
+                "{:#}",
+                synth
+                    .synthesize("text", Path::new("/tmp/readio-never-written.wav"))
+                    .expect_err("`false` cannot synthesize anything")
+            )
+        };
+
+        crate::i18n::set(crate::i18n::Lang::En);
+        let english = complain();
+        crate::i18n::set(crate::i18n::Lang::Zh);
+        let chinese = complain();
+        crate::i18n::set(before);
+
         assert!(
-            message.contains("false") && message.contains("合成失败"),
-            "error should name the engine and what went wrong: {message}"
+            english.contains("false") && english.contains("could not synthesize"),
+            "an English reader should be told in English: {english}"
+        );
+        assert!(
+            chinese.contains("合成失败"),
+            "a Chinese reader should be told in Chinese: {chinese}"
+        );
+    }
+
+    /// An engine that exits happily without writing a wav is a misconfigured
+    /// command line, so the message has to name the file the reader can edit.
+    /// `config.yaml` is the only file readio keeps; naming any other one sends
+    /// them looking for something that was never there.
+    #[test]
+    fn an_engine_that_writes_no_audio_points_at_the_file_you_can_edit() {
+        let _lock = crate::i18n::exclusive();
+        let before = crate::i18n::current();
+        crate::i18n::set(crate::i18n::Lang::En);
+
+        let out = std::env::temp_dir().join("readio-no-audio-test.wav");
+        let _ = std::fs::remove_file(&out);
+        let synth = CommandSynth::new("quiet", spec("true --out {out}"), String::new(), 1.0);
+        let message = format!(
+            "{:#}",
+            synth
+                .synthesize("text", &out)
+                .expect_err("`true` exits happily and writes nothing")
+        );
+        crate::i18n::set(before);
+
+        assert!(
+            message.contains("config.yaml"),
+            "the message has to name the file to edit: {message}"
         );
     }
 
@@ -445,8 +592,192 @@ mod tests {
         assert!(!which("readio-nonexistent-binary-xyz"));
     }
 
+    /// No shell runs these commands, so `~` in a config file has to be expanded
+    /// here or reach the engine as the name of a directory nobody has.
+    #[test]
+    fn a_tilde_in_a_command_means_home() {
+        let synth = CommandSynth::new(
+            "kokoro",
+            spec("engine --model ~/.readio/voices/m.onnx --out {out}"),
+            String::new(),
+            1.0,
+        );
+        let args = synth.build(
+            &synth.spec.synth.clone(),
+            "文本",
+            Path::new("/tmp/a.wav"),
+            None,
+        );
+        let home = dirs::home_dir().expect("a home directory");
+        assert_eq!(
+            args[2],
+            home.join(".readio/voices/m.onnx").to_string_lossy(),
+            "the path has to be absolute by the time the engine sees it: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|arg| arg.starts_with('~')),
+            "nothing may still be holding a tilde: {args:?}"
+        );
+    }
+
+    /// An engine whose model path is left implicit works only in the directory
+    /// its weights were downloaded into — and readio is started from wherever
+    /// the reader happens to be. `kokoro-tts` defaults `--model` and `--voices`
+    /// to `./`, which is exactly this trap.
+    #[test]
+    fn no_preset_depends_on_the_directory_readio_was_started_from() {
+        for (name, spec) in crate::tts::config::presets() {
+            for fetch in &spec.fetch {
+                let file = fetch.to.rsplit('/').next().unwrap_or_default();
+                // A sidecar is found by the engine itself: piper reads
+                // `voice.onnx.json` next to the `voice.onnx` it was given, so
+                // naming the model is naming both.
+                let sidecar_of = file.rsplit_once('.').map(|(base, _)| base);
+                let named =
+                    |needle: &str| spec.synth.contains(needle) || spec.model.contains(needle);
+                assert!(
+                    named(file) || sidecar_of.is_some_and(named),
+                    "{name} downloads {file} and then never tells the engine where it went"
+                );
+            }
+        }
+    }
+
+    /// Kokoro's `--lang` defaults to `en-us`, and pointed at Chinese it sounds
+    /// out 字 with English letter-to-sound rules: the same sentence took 13.6 s
+    /// that way against 4.1 s said properly. The voice has to move with it —
+    /// `zf_*` is Mandarin, `af_*` American English — so both are checked here.
+    #[test]
+    fn each_language_is_read_with_its_own_voice_and_phonemes() {
+        let preset = crate::tts::config::presets()["kokoro"].clone();
+        let template = preset.synth.clone();
+        let synth = CommandSynth::new("kokoro", preset, String::new(), 1.0);
+
+        let chinese = synth.build(&template, "界面不是中立的。", Path::new("/tmp/a.wav"), None);
+        assert!(
+            window(&chinese, "--lang") == Some("cmn"),
+            "Chinese has to be phonemised as Chinese: {chinese:?}"
+        );
+        assert!(
+            window(&chinese, "--voice").is_some_and(|v| v.starts_with("zf_")),
+            "and read by a Chinese voice: {chinese:?}"
+        );
+
+        let english = synth.build(
+            &template,
+            "The interface is not neutral.",
+            Path::new("/tmp/a.wav"),
+            None,
+        );
+        assert!(
+            window(&english, "--lang") == Some("en-us"),
+            "and English as English: {english:?}"
+        );
+        assert!(
+            window(&english, "--voice").is_some_and(|v| v.starts_with("af_")),
+            "with an English voice: {english:?}"
+        );
+    }
+
+    /// Naming a voice is a decision. readio corrects its own defaults, never a
+    /// reader's — and a voice it recognises brings its language with it, so a
+    /// Chinese voice is never handed English phonemes.
+    #[test]
+    fn a_voice_the_reader_named_outranks_the_language_it_belongs_to() {
+        let preset = crate::tts::config::presets()["kokoro"].clone();
+        let template = preset.synth.clone();
+        let synth = CommandSynth::new("kokoro", preset, "zf_xiaoyi".to_string(), 1.0);
+        let args = synth.build(
+            &template,
+            "The interface is not neutral.",
+            Path::new("/tmp/a.wav"),
+            None,
+        );
+        assert_eq!(
+            window(&args, "--voice"),
+            Some("zf_xiaoyi"),
+            "the voice they asked for is the voice they get: {args:?}"
+        );
+        assert_eq!(
+            window(&args, "--lang"),
+            Some("cmn"),
+            "and it is spoken as the language it belongs to: {args:?}"
+        );
+    }
+
+    /// `{extra}` is spliced after `{lang}`, so a reader who wants a language
+    /// readio has no entry for — Japanese, say — writes it there and wins.
+    #[test]
+    fn a_language_written_by_hand_has_the_last_word() {
+        let mut preset = crate::tts::config::presets()["kokoro"].clone();
+        preset.extra = "--lang ja".to_string();
+        let template = preset.synth.clone();
+        let synth = CommandSynth::new("kokoro", preset, String::new(), 1.0);
+        let args = synth.build(&template, "界面不是中立的。", Path::new("/tmp/a.wav"), None);
+        let last = args
+            .iter()
+            .rposition(|arg| arg == "--lang")
+            .expect("a language flag");
+        assert_eq!(
+            args.get(last + 1).map(String::as_str),
+            Some("ja"),
+            "the reader's own flag has to come last: {args:?}"
+        );
+    }
+
+    /// An engine with nothing to say about language contributes no argument at
+    /// all: a bare `--lang` would swallow the flag after it.
+    #[test]
+    fn an_engine_without_a_language_flag_passes_none() {
+        let synth = CommandSynth::new(
+            "plain",
+            spec("engine --out {out} {lang} --voice {voice}"),
+            "F1".to_string(),
+            1.0,
+        );
+        let args = synth.build(
+            &synth.spec.synth.clone(),
+            "文本",
+            Path::new("/tmp/a.wav"),
+            None,
+        );
+        assert_eq!(
+            args,
+            vec!["engine", "--out", "/tmp/a.wav", "--voice", "F1"],
+            "an empty {{lang}} has to vanish rather than leave a hole: {args:?}"
+        );
+    }
+
+    /// Detection is the default, not the only option: a reader whose shelf is
+    /// entirely in one language can say so and stop readio guessing.
+    #[test]
+    fn a_pinned_language_reads_every_page_the_same_way() {
+        let preset = crate::tts::config::presets()["kokoro"].clone();
+        let template = preset.synth.clone();
+        let synth = CommandSynth::new("kokoro", preset, String::new(), 1.0).in_language("en");
+        let args = synth.build(&template, "界面不是中立的。", Path::new("/tmp/a.wav"), None);
+        assert_eq!(window(&args, "--lang"), Some("en-us"), "{args:?}");
+        assert_eq!(window(&args, "--voice"), Some("af_heart"), "{args:?}");
+    }
+
+    /// A typo in a config file should cost a reader a guess, not a book.
+    #[test]
+    fn a_language_nobody_has_an_entry_for_falls_back_to_the_sentence() {
+        let preset = crate::tts::config::presets()["kokoro"].clone();
+        let template = preset.synth.clone();
+        let synth = CommandSynth::new("kokoro", preset, String::new(), 1.0).in_language("zn");
+        let args = synth.build(&template, "界面不是中立的。", Path::new("/tmp/a.wav"), None);
+        assert_eq!(window(&args, "--lang"), Some("cmn"), "{args:?}");
+    }
+
+    /// The value after a flag, for tests that care what an engine was told.
+    fn window<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        let at = args.iter().position(|arg| arg == flag)?;
+        args.get(at + 1).map(String::as_str)
+    }
+
     /// Windows has no `afplay`, so the default player is a PowerShell one-liner.
-    /// `C:\Users\John Doe\...` is a perfectly ordinary path there, so the script
+    /// `C:\Users\John Doe\...` is a perfectly ordinary path there, so the language
     /// has to reach PowerShell as one argument with the path quoted inside it.
     /// Checked on every platform because the template is what ships, and nobody
     /// runs the Windows tests.
@@ -456,14 +787,18 @@ mod tests {
         let windows =
             "powershell -NoProfile -Command \"(New-Object Media.SoundPlayer '{file}').PlaySync()\"";
         let args = split_args(windows);
-        assert_eq!(args.len(), 4, "the script must stay one argument: {args:?}");
+        assert_eq!(
+            args.len(),
+            4,
+            "the language must stay one argument: {args:?}"
+        );
 
         let clip = r"C:\Users\John Doe\.readio\speech\1.wav";
-        let script = args[3].replace("{file}", clip);
+        let language = args[3].replace("{file}", clip);
         assert_eq!(
-            script,
+            language,
             format!("(New-Object Media.SoundPlayer '{clip}').PlaySync()"),
-            "the path has to end up quoted inside the script"
+            "the path has to end up quoted inside the language"
         );
 
         // And the platform readio was built for gets a player at all.

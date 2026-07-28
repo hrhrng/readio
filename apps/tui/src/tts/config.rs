@@ -13,10 +13,10 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 /// How to drive one speech engine.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EngineSpec {
     /// Command that writes audio. Placeholders: `{text}` `{out}` `{voice}`
-    /// `{rate}` `{model}` `{extra}`.
+    /// `{rate}` `{model}` `{lang}` `{extra}`.
     pub synth: String,
     /// Command that plays a file, `{file}` being the clip. Empty means the
     /// synth command played it itself.
@@ -38,58 +38,258 @@ pub struct EngineSpec {
     /// One-line description shown by `/tts`.
     #[serde(default)]
     pub about: String,
+    /// PyPI distribution that provides this engine's command, if it has one.
+    ///
+    /// readio does not bundle a model and will not vendor an installer either.
+    /// This is the one fact it needs to offer `/tts install`: the package name.
+    /// Everything else — whether to use `uv`, `pipx` or `pip`, and which of them
+    /// this machine actually has — is worked out at the moment of installing,
+    /// because the answer differs per machine and changes over time.
+    #[serde(default)]
+    pub pip: String,
+    /// Python the package insists on, when it is fussy. `kokoro-tts` declares
+    /// `>=3.11,<3.13`, so installing it under a default 3.13 fails with a
+    /// resolver error that says nothing about the version.
+    #[serde(default)]
+    pub python: String,
+    /// Files the engine needs but does not ship: voice models, mostly. Each is
+    /// `url → destination`, fetched after the package is installed.
+    #[serde(default)]
+    pub fetch: Vec<Fetch>,
+    /// Where to read about the engine when readio cannot install it.
+    #[serde(default)]
+    pub docs: String,
+    /// What to change when the passage is in another language, keyed the way
+    /// the rest of readio names languages: `zh`, `en`.
+    ///
+    /// A library is not monolingual, and a multilingual model still has to be
+    /// told which language it is looking at. Kokoro's `--lang` defaults to
+    /// `en-us`: pointed at Chinese it applies English letter-to-sound rules and
+    /// produces a slurred, roughly three-times-too-long reading of text it is
+    /// perfectly capable of saying properly. The voice matters just as much —
+    /// `zf_*` are Chinese, `af_*` American English — and the two have to move
+    /// together, so they live in one entry per language rather than as separate
+    /// settings that can be set to disagree.
+    #[serde(default)]
+    pub languages: BTreeMap<String, LanguageSpec>,
+}
+
+/// The parts of an engine's invocation that depend on what is being read.
+///
+/// Every field is optional: an unset one leaves the engine's own default alone,
+/// which is what an engine that only speaks one language wants.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LanguageSpec {
+    /// Voice for this language, overriding the engine's default. A reader who
+    /// names a voice explicitly outranks this — an explicit choice is a choice.
+    #[serde(default)]
+    pub voice: String,
+    /// Model for this language, for engines like Piper where the language is
+    /// baked into the weights rather than selected by a flag.
+    #[serde(default)]
+    pub model: String,
+    /// `{lang}` for this language — the flag *and* its value, because engines
+    /// spell it differently (`--lang cmn`, `--language zh`, `-l zh_CN`) and
+    /// readio would otherwise have to know each one. Spliced as arguments, so
+    /// leaving it empty removes the flag entirely rather than passing a blank.
+    #[serde(default)]
+    pub lang: String,
+}
+
+/// Which language a passage is written in, as far as choosing a voice goes.
+///
+/// One Han character in eight is enough to call it Chinese: Chinese prose
+/// quoting an English term is still Chinese, and an English page quoting a
+/// single 字 is still English. Everything else answers `en`, which is readio's
+/// default throughout rather than a claim about the alphabet — a Russian book
+/// gets English phonemes because that is the entry that exists, and the reader
+/// who has a Russian voice says so in `config.yaml`.
+pub fn language_of(text: &str) -> &'static str {
+    let mut han = 0usize;
+    let mut total = 0usize;
+    for ch in text.chars().filter(|c| !c.is_whitespace()) {
+        total += 1;
+        if matches!(ch as u32,
+            0x3400..=0x4DBF        // CJK extension A
+            | 0x4E00..=0x9FFF      // CJK unified ideographs
+            | 0xF900..=0xFAFF      // CJK compatibility ideographs
+            | 0x2_0000..=0x2_FFFF  // extensions B onwards
+        ) {
+            han += 1;
+        }
+    }
+    if han > 0 && han * 8 >= total {
+        "zh"
+    } else {
+        "en"
+    }
+}
+
+/// One file to download before an engine can speak.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Fetch {
+    pub url: String,
+    /// Where it lands, `~` allowed.
+    pub to: String,
 }
 
 /// Built-in engine presets.
 ///
 /// Chosen from the local-TTS benchmark at <https://github.com/5uck1ess/tts-bench>
 /// (June 2026 pass): small, permissively licensed, and fast enough to stay ahead
-/// of a reader on CPU or Apple Silicon. See `docs/tts.md` for the numbers.
+/// of a reader on CPU or Apple Silicon. The per-engine numbers are in the
+/// comments below, next to the command line each one needs.
 pub fn presets() -> BTreeMap<String, EngineSpec> {
     let mut out = BTreeMap::new();
 
-    // Kokoro-82M — Apache-2.0, multilingual (including Chinese), 13.8× realtime
-    // on M4 MPS. The default: best quality per megabyte for long-form reading.
+    // Kokoro-82M — Apache-2.0, multilingual (including Chinese). The default:
+    // best quality per megabyte for long-form reading.
+    //
+    // Speed depends entirely on which Kokoro you drive. The 13.8× realtime in
+    // the benchmark is the PyTorch build on an M4's GPU; `kokoro-tts` is
+    // onnxruntime on the CPU, measured here at about 1.4× realtime — enough to
+    // stay ahead of a listener with `prefetch` sentences in hand, and not much
+    // more. Piper is the one to pick on a slow machine.
+    //
+    // The CLI takes its input and output as positional arguments, `-` meaning
+    // stdin, which is also how a sentence gets in without ever touching a shell.
+    //
+    // `--model` and `--voices` are spelled out because their defaults are
+    // `./kokoro-v1.0.onnx` and `./voices-v1.0.bin` — relative to the working
+    // directory, which for readio is wherever the reader happened to launch it.
+    // Left implicit, the engine works in whichever folder the models were
+    // downloaded to and nowhere else.
+    //
+    // `{lang}` is the difference between Kokoro reading Chinese and Kokoro
+    // spelling it out: see `languages` below.
     out.insert(
         "kokoro".to_string(),
         EngineSpec {
-            synth: "kokoro-tts --text {text} --output {out} --voice {voice} --speed {rate}"
+            synth: "kokoro-tts - {out} --voice {voice} --speed {rate} --format wav {lang} \
+                    --model ~/.readio/voices/kokoro-v1.0.onnx \
+                    --voices ~/.readio/voices/voices-v1.0.bin {extra}"
                 .to_string(),
             play: default_player(),
-            voice: "zf_xiaobei".to_string(),
+            voice: "zf_xiaoxiao".to_string(),
             model: String::new(),
             extra: String::new(),
-            stdin: false,
+            stdin: true,
             about: "Kokoro-82M · Apache-2.0 · multilingual, best on long passages".to_string(),
+            pip: "kokoro-tts".to_string(),
+            // The package declares >=3.11,<3.13, and a machine whose default is
+            // 3.13 otherwise fails with a resolver error that never mentions it.
+            python: "3.12".to_string(),
+            // The wheel carries no weights: without these two the engine
+            // installs cleanly and then refuses every sentence.
+            fetch: vec![
+                Fetch {
+                    url: "https://github.com/nazdridoy/kokoro-tts/releases/download\
+                          /v1.0.0/kokoro-v1.0.onnx"
+                        .to_string(),
+                    to: "~/.readio/voices/kokoro-v1.0.onnx".to_string(),
+                },
+                Fetch {
+                    url: "https://github.com/nazdridoy/kokoro-tts/releases/download\
+                          /v1.0.0/voices-v1.0.bin"
+                        .to_string(),
+                    to: "~/.readio/voices/voices-v1.0.bin".to_string(),
+                },
+            ],
+            docs: "https://github.com/nazdridoy/kokoro-tts".to_string(),
+            // The four `zf_*` voices are Kokoro's Mandarin set; `af_heart` is
+            // its best-rated English one. Pairing each with the matching
+            // `--lang` is what this table is for: a Chinese voice under
+            // `en-us` is the worst of both, an English phonemizer driving a
+            // model that knows how the sentence should sound.
+            languages: BTreeMap::from([
+                (
+                    "zh".to_string(),
+                    LanguageSpec {
+                        voice: "zf_xiaoxiao".to_string(),
+                        model: String::new(),
+                        lang: "--lang cmn".to_string(),
+                    },
+                ),
+                (
+                    "en".to_string(),
+                    LanguageSpec {
+                        voice: "af_heart".to_string(),
+                        model: String::new(),
+                        lang: "--lang en-us".to_string(),
+                    },
+                ),
+            ]),
         },
     );
 
-    // Piper — ~15M, 62 ms warm TTFA and 33.5× realtime on M4: the one to pick
-    // when you want speech to start before you notice you asked for it.
+    // Piper — ~15M and built for exactly this: speech that starts before you
+    // notice you asked for it. The benchmark's 62 ms to first audio is a GPU
+    // number, but Piper is the preset least dependent on having one.
+    //
+    // `--length-scale` is duration, not speed, so it takes `{scale}` — the
+    // reciprocal of the multiplier. Feeding it `{rate}` makes 2× read at half
+    // speed, which is the sort of bug that sounds like a broken model.
     out.insert(
         "piper".to_string(),
         EngineSpec {
-            synth: "piper --model {model} --output_file {out} --length_scale {rate}".to_string(),
+            synth: "piper --model {model} --output-file {out} --length-scale {scale} {extra}"
+                .to_string(),
             play: default_player(),
             voice: String::new(),
             model: "~/.readio/voices/zh_CN-huayan-medium.onnx".to_string(),
             extra: String::new(),
             stdin: true,
             about: "Piper · GPL-3.0 · fastest to first sound, models are a few MB".to_string(),
+            pip: "piper-tts".to_string(),
+            python: String::new(),
+            // Piper ships no voice. Fetching the model directly beats
+            // `python3 -m piper.download_voices`, which only exists inside
+            // whichever environment pip happened to install into.
+            fetch: vec![
+                Fetch {
+                    url: "https://huggingface.co/rhasspy/piper-voices/resolve/main\
+                          /zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx"
+                        .to_string(),
+                    to: "~/.readio/voices/zh_CN-huayan-medium.onnx".to_string(),
+                },
+                Fetch {
+                    url: "https://huggingface.co/rhasspy/piper-voices/resolve/main\
+                          /zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx.json"
+                        .to_string(),
+                    to: "~/.readio/voices/zh_CN-huayan-medium.onnx.json".to_string(),
+                },
+            ],
+            docs: "https://github.com/OHF-voice/piper1-gpl".to_string(),
+            // Piper's language is the model file, and readio fetches one of
+            // them. Reading English with `zh_CN-huayan` works about as well as
+            // you would expect; the fix is another `.onnx` and a `model:` under
+            // `latin` here, not a flag readio can pass.
+            languages: BTreeMap::new(),
         },
     );
 
     // Supertonic — 99M, pure ONNX with no torch anywhere, MIT, 31 languages.
+    // `tts` is a subcommand, and the voice is one of M1–M5 / F1–F5 rather than a
+    // name, so it needs a default: an empty `--voice` is an error, not a shrug.
     out.insert(
         "supertonic".to_string(),
         EngineSpec {
-            synth: "supertonic --text {text} --out {out} --voice {voice}".to_string(),
+            synth: "supertonic tts {text} --output {out} --voice {voice} --speed {rate} {extra}"
+                .to_string(),
             play: default_player(),
-            voice: String::new(),
+            voice: "F1".to_string(),
             model: String::new(),
             extra: String::new(),
             stdin: false,
             about: "Supertonic 99M · MIT · pure ONNX, no torch".to_string(),
+            pip: "supertonic".to_string(),
+            python: String::new(),
+            // The model (~400 MB) downloads itself into ~/.cache on first use.
+            fetch: Vec::new(),
+            docs: "https://github.com/supertone-inc/supertonic-py".to_string(),
+            // Its voices are numbered rather than named per language, and the
+            // CLI infers the language from the text.
+            languages: BTreeMap::new(),
         },
     );
 
@@ -108,10 +308,131 @@ pub fn presets() -> BTreeMap<String, EngineSpec> {
             extra: String::new(),
             stdin: false,
             about: "Any OpenAI-compatible /v1/audio/speech endpoint".to_string(),
+            // Nothing to install: this one is a server the reader is already
+            // running, and readio has no business starting it.
+            pip: String::new(),
+            python: String::new(),
+            fetch: Vec::new(),
+            docs: "https://github.com/remsky/Kokoro-FastAPI".to_string(),
+            // The request body carries only model, voice, text and speed, so
+            // the language is the server's business.
+            languages: BTreeMap::new(),
         },
     );
 
     out
+}
+
+/// Command lines readio itself shipped as a preset and has since corrected.
+///
+/// None of these ever worked: they were written from what the engines' READMEs
+/// implied rather than from their actual argument parsers. A saved config that
+/// still carries one is not carrying a decision — it is carrying a mistake of
+/// readio's, saved to disk the first time an old build started up.
+const SUPERSEDED: &[(&str, &str)] = &[
+    // `--text` and `--output` are not kokoro-tts flags; it reads `-` on stdin
+    // and takes the output file positionally.
+    (
+        "kokoro",
+        "kokoro-tts --text {text} --output {out} --voice {voice} --speed {rate}",
+    ),
+    // Right shape, but the weights were left implicit — and their default is
+    // the working directory, so the engine only worked when readio happened to
+    // be started from the folder they were downloaded into.
+    (
+        "kokoro",
+        "kokoro-tts - {out} --voice {voice} --speed {rate} --format wav {extra}",
+    ),
+    // Ran anywhere, and read Chinese with `--lang`'s default of `en-us`: an
+    // English phonemizer sounding out 字 one at a time, three times slower than
+    // the same sentence said properly.
+    (
+        "kokoro",
+        "kokoro-tts - {out} --voice {voice} --speed {rate} --format wav \
+         --model ~/.readio/voices/kokoro-v1.0.onnx \
+         --voices ~/.readio/voices/voices-v1.0.bin {extra}",
+    ),
+    // piper spells these with hyphens, and `--length-scale` is duration rather
+    // than rate, so the number has to be inverted as well as renamed.
+    (
+        "piper",
+        "piper --model {model} --output_file {out} --length_scale {rate}",
+    ),
+    // supertonic's CLI has a `tts` subcommand and takes the text positionally.
+    (
+        "supertonic",
+        "supertonic --text {text} --out {out} --voice {voice}",
+    ),
+];
+
+/// Bring the engines in a saved config up to date with this binary.
+///
+/// A saved config is a record of the reader's choices, not a snapshot of what
+/// readio knew on the day it was written — and the fields divide cleanly into
+/// three kinds:
+///
+/// - **What the package is.** `about`, `docs`, `pip` and `python` describe an
+///   engine readio ships a preset for. Nobody writes these by hand, so they
+///   always follow the binary. Freezing them is what made every engine on an
+///   upgraded machine read "a server, nothing to install": the fields did not
+///   exist when the file was written, so they loaded empty and stayed empty.
+/// - **How to run it.** `synth`, `play`, `stdin`, `fetch` and `languages` are the
+///   reader's to change, and are replaced only when what is saved is one of
+///   readio's own superseded defaults — where "leaving it alone" means keeping
+///   a command that cannot run.
+/// - **Which voice.** `voice`, `model` and `extra` are choices, and are never
+///   touched, not even while correcting a command line around them.
+///
+/// Returns true when anything changed, so the caller can write the file back.
+pub fn reconcile(engines: &mut BTreeMap<String, EngineSpec>) -> bool {
+    let mut changed = false;
+    for (name, preset) in presets() {
+        let Some(saved) = engines.get_mut(&name) else {
+            engines.insert(name, preset);
+            changed = true;
+            continue;
+        };
+        let before = saved.clone();
+
+        saved.about = preset.about;
+        saved.docs = preset.docs;
+        saved.pip = preset.pip;
+        saved.python = preset.python;
+
+        let superseded = SUPERSEDED
+            .iter()
+            .any(|(engine, synth)| *engine == name && same_command(synth, &saved.synth));
+        if superseded {
+            saved.synth = preset.synth;
+            saved.play = preset.play;
+            saved.stdin = preset.stdin;
+            saved.fetch = preset.fetch;
+            saved.languages = preset.languages;
+        } else if same_command(&saved.synth, &preset.synth) {
+            // Their line is readio's line, so the files it needs are readio's
+            // to know about too. A line they wrote themselves gets no `fetch`:
+            // it is what readiness is checked against, and insisting on a voice
+            // file readio chose would report a working setup as missing.
+            saved.fetch = preset.fetch;
+            // An empty table is a config written before readio had the field,
+            // not a reader who decided one language was enough.
+            if saved.languages.is_empty() {
+                saved.languages = preset.languages;
+            }
+        }
+
+        changed |= *saved != before;
+    }
+    changed
+}
+
+/// Whether two command templates say the same thing.
+///
+/// Compared word by word because a long line makes the round trip through YAML
+/// as a folded scalar: the content survives, the exact run of spaces need not,
+/// and a config that reflowed on save is not a config the reader edited.
+fn same_command(a: &str, b: &str) -> bool {
+    a.split_whitespace().eq(b.split_whitespace())
 }
 
 /// Player command for this platform, chosen from what is normally present.
@@ -119,7 +440,7 @@ fn default_player() -> String {
     if cfg!(target_os = "macos") {
         "afplay {file}".to_string()
     } else if cfg!(target_os = "windows") {
-        // The whole script is one quoted argument and the path is quoted inside
+        // The whole language is one quoted argument and the path is quoted inside
         // it, because `C:\Users\John Doe\...` is an ordinary Windows path and an
         // unquoted one would be read as two arguments.
         "powershell -NoProfile -Command \"(New-Object Media.SoundPlayer '{file}').PlaySync()\""
@@ -184,6 +505,40 @@ mod tests {
         );
         if cfg!(target_os = "macos") {
             assert!(player.starts_with("afplay"), "got: {player}");
+        }
+    }
+
+    /// The rule the table keys encode: one Han character in eight. A Chinese
+    /// sentence quoting an English term is still Chinese, and an English one
+    /// quoting a 字 is still English — read the other way round, either sounds
+    /// like a broken model.
+    #[test]
+    fn a_passage_is_named_by_what_it_is_mostly_written_in() {
+        assert_eq!(language_of("界面不是中立的。"), "zh");
+        assert_eq!(language_of("这是 API 的设计问题"), "zh");
+        assert_eq!(language_of("The interface is not neutral."), "en");
+        assert_eq!(
+            language_of("The character 道 appears twice in the opening chapter."),
+            "en"
+        );
+        assert_eq!(language_of(""), "en", "and nothing at all is not an error");
+    }
+
+    /// Every language a preset offers has to name both halves: a Chinese voice
+    /// under English phonemes is the failure this table exists to prevent.
+    #[test]
+    fn every_language_entry_names_a_voice_and_its_phonemes() {
+        for (name, spec) in presets() {
+            for (language, entry) in &spec.languages {
+                assert!(
+                    !entry.voice.is_empty() || !entry.model.is_empty(),
+                    "{name}/{language} switches language without switching voice"
+                );
+                assert!(
+                    entry.lang.is_empty() || spec.synth.contains("{lang}"),
+                    "{name}/{language} has a language flag the command never passes"
+                );
+            }
         }
     }
 }

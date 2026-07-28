@@ -47,7 +47,7 @@ src/
     text.rs       chapter splitting for Markdown and plain text
     sample.rs     the built-in sample, one per interface language
   ui/
-    block.rs      ten block kinds, from user input to library listing
+    block.rs      nine block kinds, from user input to a rendered illustration
     image.rs      half-block rendering: two pixels per cell, aspect corrected
     scrollback.rs entries, per-entry line cache, tail-following viewport, pixel layer
     prompt.rs     single-line editor with a grapheme-level cursor
@@ -101,9 +101,9 @@ A reader is doing one of three things, so readio has one setting with three valu
 
 | Mode | Chip | What moves the text |
 | --- | --- | --- |
-| Manual | `⏵ step` | `⏎`, or `↓` `pgdn` and the wheel once you are at the bottom |
+| Manual | `⏵ manual` | `⏎`, or `↓` `pgdn` and the wheel once you are at the bottom |
 | Auto-scroll | `⏵⏵ auto` | nothing to press: passages follow one another |
-| Read-aloud | `⏵⏵ voice` | the voice, which brings its own scrolling |
+| Read-aloud | `⏵⏵ aloud` | the voice, which brings its own scrolling |
 
 `shift+tab` cycles them, which is the gesture a coding agent uses for exactly this kind of switch, and `/mode [manual|auto|tts]` says it in words. The chip carries no musical note and never will: a `♪` in the corner of the screen announces a media player, which is the one thing this interface must not look like.
 
@@ -111,9 +111,9 @@ A reader is doing one of three things, so readio has one setting with three valu
 
 Three smaller rules came out of using it:
 
-- **A mode is a setting, not a consequence.** `esc` pauses and a second `esc` stops the turn, but neither demotes auto-scroll to manual. Pausing used to do exactly that, which is how a reader could pause, press enter, and watch the same paragraph arrive twice.
+- **A mode is a setting, not a consequence.** `esc` interrupts the turn and `⏎` picks it back up, but neither demotes auto-scroll to manual. Interrupting used to do exactly that, which is how a reader could stop, press enter, and watch the same paragraph arrive twice.
 - **In manual mode the bottom of the page loads more.** `↓`, `pgdn` and the wheel scroll as usual until there is nothing below, and then they fetch the next passage, the way reaching the end of a list loads the next page.
-- **A mode explains itself once.** The first switch prints a full line — what moves, how to change its speed, how to pause. After that a switch is a flash in the status row, because someone cycling with `shift+tab` does not want the paragraph three times.
+- **A mode explains itself once.** The first switch prints a full line — what moves, how to change its speed, how to interrupt it. After that a switch is a flash in the status row, because someone cycling with `shift+tab` does not want the paragraph three times.
 
 ## Pace, as reasoning effort
 
@@ -130,7 +130,7 @@ Reading pace is presented as the model's reasoning effort, and the honest conseq
 
 One multiplier drives both worlds: text appears at `reading.speed × multiplier`, and read-aloud plays at the multiplier itself, so a level means the same thing whether the book is being typed out or spoken. That is also why `^r` is a single key — it always means "change how fast I am reading" — and why `crate::effort` owns the arithmetic while `App::apply_pace` is the only thing that hands a number to the pacer.
 
-The numbers belong to the reader, not to readio. All six live under `effort.multipliers` in the config file; `/rate <0.5-3.0>` retunes the level in force and writes it back, so `/effort xhigh` then `/rate 0.9` is how someone makes their slow gear their own; `/speed <n>` moves the base the multipliers scale. `/effort` with no argument prints the ladder with the active level marked, which is the one place the costume and the honest numbers sit side by side.
+The numbers belong to the reader, not to readio. All six live under `effort.multipliers` in the config file; `/rate <0.5-3.0>` retunes the level in force and writes it back, so `/effort xhigh` then `/rate 0.9` is how someone makes their slow gear their own; `/speed <n>` moves the base the multipliers scale. `/effort` with no argument opens the ladder above the composer, each level showing the multiplier behind it and `(active)` on the one in force — the one place the costume and the honest numbers sit side by side.
 
 Clips are rendered at a speed rather than resampled at playback, so a level change throws away everything prefetched and re-queues from the start of the sentence that was playing: the reader hears the new pace within a sentence instead of at the next passage.
 
@@ -139,9 +139,13 @@ Clips are rendered at a speed rather than resampled at playback, so a level chan
 The menu has two levels, because a value is as hard to remember as a command.
 
 1. `/` and a partial name offers commands: name, argument shape, and a one-line description.
-2. `/name ` for a command with a fixed set of answers — `/effort`, `/mode`, `/lang`, `/tts` — offers those answers instead, each with what it means and `(active)` on the one in force. Nobody should have to know that `xhigh` is spelled without a hyphen, or which of their engines the config calls `piper`.
+2. `/name ` offers that command's answers. For a fixed set — `/effort`, `/mode`, `/lang`, `/tts` — those are the levels, modes, languages and engines, each with what it means and `(active)` on the one in force; nobody should have to know that `xhigh` is spelled without a hyphen, or which of their engines the config calls `piper`. For a command whose answers are the reader's own things — `/open`, `/goto`, `/marks`, `/unmark` — they are their books, chapters and bookmarks. For `/import` they are files and directories, read from the disk.
 
 `↑` `↓` move, `tab` completes the highlighted row, `⏎` runs it — or completes it, when the command cannot run without an argument. The bracket in `args` is what decides: `<n>` means `⏎` completes, `[n]` means the bare form does something worth seeing. Value rows are built per frame rather than declared, because half of what they say — which level is active, what multiplier it stands for, which engines are installed — is a fact about the reader's config.
+
+The same list is what a key opens. `^r`, a bare `/effort`, launching with a library, or `/goto` with no number all raise a **select**: the same rows, anchored above the composer, `↑` `↓` to choose and `⏎` to confirm. A select keeps its own narrowing text rather than borrowing the prompt line, because writing `/effort ` into the composer to hold the state throws away whatever the reader was halfway through typing. Two rules make it safe: a select never touches what the reader was typing, and `/` always begins a command — the library select is open the moment readio starts, so the first thing anyone types would otherwise be eaten by a filter.
+
+That is also why no command prints a numbered listing into the transcript any more. Sixteen books in the log with "type 7" underneath is a listing pretending to be a control: it costs a screenful, it goes stale as soon as anything changes, and it cannot be navigated. The transcript keeps the book and what happened to it; the questions live where they are answered.
 
 The wide description under the list exists because a menu row is the only documentation most readers will ever read. "List the library" does not say what the listing contains; the panel does, and it is where `--copy` versus `--link` versus `--move` gets settled. It wraps to the width available, keeps the list from eating a short terminal, and clips with an ellipsis rather than stopping mid-sentence.
 
@@ -173,16 +177,85 @@ They live in `state.json` beside the reading position, stored as character offse
 
 ## Read-aloud
 
-readio ships no model. It invokes an engine you installed through a command template, which is why the binary is 4 MB and why a better model next month is a config edit rather than a release. Four presets ship, measured in [tts-bench](https://github.com/5uck1ess/tts-bench):
+readio ships no model. It invokes an engine you installed through a command template, which is why the binary is 4 MB and why a better model next month is a config edit rather than a release. Four presets ship, chosen from [tts-bench](https://github.com/5uck1ess/tts-bench):
 
 | Engine | Size · licence | Why it is here |
 | --- | --- | --- |
-| `kokoro` | 82M · Apache-2.0 | default; multilingual, ~13.8× realtime on an M4, best on long passages |
-| `piper` | ~15M · GPL-3.0 | fastest to first sound (62 ms, 33.5× realtime); text on stdin |
+| `kokoro` | 82M · Apache-2.0 | default; multilingual, best on long passages |
+| `piper` | ~15M · GPL-3.0 | fastest to first sound; text on stdin |
 | `supertonic` | 99M · MIT | pure ONNX, no torch, 31 languages |
 | `openai` | — | any OpenAI-compatible `/v1/audio/speech` endpoint |
 
-Templates are argument lists with the placeholders `{text} {out} {voice} {rate} {model} {json} {file}`, so an engine readio has never heard of still works. A sentence is always passed as **one argument** and never through a shell: `$(whoami)` in the text is just eight characters.
+A word on the speed figures you will find in that benchmark: they measure the models, usually through PyTorch on a GPU. readio drives whatever CLI you installed, and those are mostly onnxruntime on the CPU — `kokoro-tts` synthesizes at roughly 1.4× realtime on an M4, not the 13.8× the model is capable of. That is still fast enough to stay ahead of a listener, because sentences are rendered `prefetch` ahead of the one playing, but it is the number to plan around. On a slower machine, Piper is the preset to reach for.
+
+Templates are argument lists with the placeholders `{text} {out} {voice} {rate} {scale} {model} {lang} {json} {file} {extra}`, so an engine readio has never heard of still works. A sentence is always passed as **one argument** and never through a shell: `$(whoami)` in the text is just eight characters.
+
+### Reading in more than one language
+
+A multilingual model still has to be told which language it is looking at, and the default is rarely yours: `kokoro-tts` assumes `en-us`, so Chinese handed to it unannounced is sounded out with English letter-to-sound rules. The same eighteen-character sentence takes 13.6 seconds that way and 4.1 seconds said properly — slurred, and three times too slow.
+
+So each engine carries a small table of what changes when the page changes language:
+
+```yaml
+languages:
+  zh:
+    voice: zf_xiaoxiao
+    lang: --lang cmn
+  en:
+    voice: af_heart
+    lang: --lang en-us
+```
+
+The voice moves with the language because in Kokoro the two are the same decision — `zf_*` is Mandarin, `af_*` American English — and settings that can be made to disagree eventually will. `lang` holds the flag *and* its value, so an engine that spells it `--language zh` needs no support from readio, and an engine with nothing to say there leaves it empty and is passed no flag at all. Piper's table is empty for a different reason: its language is the model file, so the entry to write is a `model:`, not a flag.
+
+Which entry applies is decided per sentence, from the text: one Han character in eight makes a passage Chinese, so a Chinese page quoting an English term stays Chinese and an English page quoting a single 字 stays English. A bilingual chapter switches voice mid-page without anyone reaching for a setting.
+
+`/voice` is where that is visible, and its first row is `auto`:
+
+```
+❯ auto (active)  match each passage as it comes
+  en             pin this language, read by af_heart
+  zh             pin this language, read by zf_xiaoxiao
+```
+
+Picking a language pins `tts.language` rather than a voice — the voice that belongs to it is recorded beside it, and settings that can be made to disagree eventually are. A name typed instead (`/voice zf_xiaoyi`) goes straight through to the engine and outranks both; one readio recognises brings its language along, so asking for a Mandarin voice is asking for Mandarin. `auto` is a row rather than only a config value because a setting that can only be turned on is a trap: before it existed, `/voice af_heart` was a one-way door that only a text editor could reopen.
+
+### Choosing one, and getting one
+
+`/tts` is the voice, and nothing else: read-aloud is one of the three reading modes, so `shift+tab` and `/mode` turn it on and off, and a switch in this menu as well would be a second control for the same fact. What the menu answers is *which* voice — and, because the honest answer to that depends on the machine, whether you have it at all:
+
+```
+❯ kokoro (active)  Kokoro-82M · Apache-2.0 · multilingual, best on long passages · ⏎ installs it
+  openai           a server, nothing to install
+  piper            Piper · GPL-3.0 · fastest to first sound · ⏎ installs it
+  supertonic       Supertonic 99M · MIT · pure ONNX, no torch · ⏎ reads with it
+```
+
+Each row checks the engine's program, and for an engine whose voice is a separate download, that file too — so `⏎` either switches and starts reading, or installs and then does that. Nobody has to find out an engine is missing by choosing it and hearing nothing.
+
+Installing shows itself, one `Bash` call per command, streaming:
+
+```
+● Bash uv tool install --python 3.12 kokoro-tts  1/1  ·  24.8s
+  Resolved 61 packages in 1.31s
+  Installed 61 packages in 3.42s
+   + kokoro-tts==0.9.4
+
+○ kokoro is installed (25s). Read-aloud is on: kokoro · zf_xiaobei
+```
+
+What it decides, and why each decision cannot be a constant in a release:
+
+| Decision | How |
+| --- | --- |
+| Which installer | `uv tool install`, then `pipx install`, then `pip install --user` — whichever this machine has. pip is last because Homebrew and every modern distribution now refuse it outright (PEP 668), and a refusal the reader has to decode is worse than saying up front that nothing suitable is here. |
+| Which Python | From the preset when the package is fussy. `kokoro-tts` declares `>=3.11,<3.13`, so a machine defaulting to 3.13 otherwise fails with a resolver error that never mentions the version. |
+| The voice model | Neither Kokoro nor Piper ships weights in its wheel, so their model files are fetched as further steps of the same install and written into the engine's command line. Kokoro's `--model` and `--voices` default to `./`, which means an engine installed without them works in exactly one directory: whichever one the files were downloaded into. An engine whose command exists but whose voice does not is not installed, and the menu says so. |
+| Where the command went | `uv` and `pipx` write into `~/.local/bin`, which is on the PATH of the shell that set them up and not necessarily on the one readio inherited. If the program is not on PATH afterwards, the place it actually landed is written into the engine's command line — rather than asking anyone to edit a shell profile and start over. |
+
+Nothing runs through a shell here either; every command is an argv, and every command is printed before it runs, so "install it for me" and "tell me what you would run" are the same feature. A subprocess's output is stripped of escape sequences before it reaches the screen — an installer is not entitled to move readio's cursor — and split on carriage returns as well as newlines, which is the only way a progress bar shows progress rather than arriving in one lump after the download finishes.
+
+`openai` is not installable and says so: it is a server you run yourself, and readio has no business starting it.
 
 Two things change when speech is on. Reveal speed follows the audio — each clip reports its own duration and the pacer runs at `chars / clip_seconds`, so text finishes exactly when sound does and the configured pace steps aside. And highlighting becomes two-level: the sentence being spoken takes a light wash, the word or character being sounded a deep one. Chinese advances by character (there is nothing to break on, and the character is the unit the eye moves in), Latin by word, with punctuation lit alongside the character it follows.
 
@@ -243,9 +316,14 @@ tts:
   enabled: false
   engine: kokoro
   voice: ""
+  language: auto          # or zh / en, to stop readio guessing per sentence
   prefetch: 2             # sentences rendered ahead of the one playing
 # input_log: /tmp/keys.log   # every terminal event appended, for debugging input
 ```
+
+The `engines:` block below that is settings for the engines themselves, and it is the one part of the file readio maintains as well as reads. On startup each built-in engine is reconciled with the binary, in three categories: what the package *is* — the description, the docs link, the PyPI name, the Python it needs — always follows the release, because nobody writes those by hand and a file written before those fields existed would otherwise freeze them empty forever. How to *run* it — the command, the player, whether the text goes on stdin, the language table — is yours, and is replaced only when what is saved is a default readio itself shipped and has since corrected. Which *voice* — `voice`, `model`, `extra` — is never touched.
+
+This is not hypothetical tidiness: every local preset shipped before v0.2.0 had a command line that did not match its engine's actual CLI, and the one shipped in v0.2.0-beta.3 ran but never passed a language, so it read Chinese with English phonemes. Without reconciliation an upgrade would leave read-aloud broken, or quietly bad, on exactly the machines that had used it longest.
 
 The host directory:
 
@@ -267,21 +345,21 @@ The host directory:
 | --- | --- |
 | `⏎` | load the next passage; in the library, open the last book |
 | `⏎` while streaming | rush this turn to its end |
-| `esc` · `esc` again | pause, shown as thinking · stop the turn |
+| `esc` | interrupt the turn, keeping your place; `⏎` carries on |
 | `shift+tab` | cycle manual → auto-scroll → read-aloud |
 | `/` | the command menu: `↑ ↓` to choose, `tab` completes, `⏎` runs |
 | `↑ ↓`, wheel, `pgup` `pgdn`, `home` `end` | scroll; at the bottom in manual mode, load more |
 | `^t` · `^o` | fold reasoning · tool calls |
 | `^s` · `^r` | read-aloud on or off · next reasoning effort |
 | `^g` · `^b` | next · previous search hit |
-| `^p` `^n` · `^l` · `^c` `^d` | input history · clear · quit |
+| `^p` `^n` · `^l` · `^c` `^d` | input history · clear the screen · discard the turn, then quit |
 
 | Area | Commands |
 | --- | --- |
 | Library | `/lib` `/open <n>` `/import <path> [--copy\|--link\|--move]` `/forget <n>` `/sample` |
 | Reading | `/mode [manual\|auto\|tts]` `/effort [level]` `/toc` `/goto <n>` `/next` `/prev` `/find <term>` `/auto` `/plan` `/context` `/progress` `/speed <n>` |
 | Bookmarks | `/mark [note]` `/marks [n]` `/unmark <n>` |
-| Read-aloud | `/tts [on\|off\|<engine>\|test\|config]` `/voice <name>` `/rate <0.5-3.0>` `/device` |
+| Read-aloud | `/tts [<engine>\|install <engine>\|test\|config]` `/voice [auto\|zh\|en\|<name>]` `/rate <0.5-3.0>` `/device` |
 | Interface | `/lang en\|zh` `/help` `/quit` |
 
 `/forget` removes only the library's own copy. A file imported with `-l` stays where it is, and one imported with `-m` is not deleted from the library either.
@@ -294,9 +372,10 @@ cargo test          # 276: wrapping, pacing, parsing, import modes, reading, who
                     # chapter shape, emphasis, bookmarks, the three modes, effort levels
 ```
 
-- `tests/render.rs` draws a real `App` through ratatui's `TestBackend` and asserts on the screen, so "is the library listed", "did typing 2 open the second book" and "did esc actually interrupt" all have regression cover.
+- `tests/render.rs` draws a real `App` through ratatui's `TestBackend` and asserts on the screen, so "is the library offered", "did typing 2 open the second book", "does esc interrupt without discarding" and "does `^c` discard" all have regression cover.
+- `tests/select.rs` pins the two rules the select lives by: it keeps its narrowing text out of the composer, a `/` always escapes it into a command, a filter that would empty the list is refused, choosing a row records the result rather than the command, and a bare `/import` opens the filesystem at `~/` and walks into directories.
 - `tests/effort.rs` holds the pace honest: `^r` walks the ladder and the pacer slows with it, a level names what it is worth, `/rate` retunes only the level in force and writes it back, and `/speed` moves the base the multiplier scales.
-- `tests/mode.rs` drives the modes the way a reader does: `shift+tab` into auto-scroll and the text starts moving, two passages arrive with nobody pressing anything, manual mode then sits still, `↓` at the bottom fetches more, and a pause does not silently change the mode.
+- `tests/mode.rs` drives the modes the way a reader does: `shift+tab` into auto-scroll and the text starts moving, two passages arrive with nobody pressing anything, manual mode then sits still, `↓` at the bottom fetches more, and an interruption does not silently change the mode.
 - `tests/find.rs` walks search → jump by number → the term deeply washed, asserts the counts are true counts, that `^g` says so when it wraps, and that `^g` with no search points back at `/find`.
 - `tests/library.rs` covers the filesystem consequences of each import mode, that a second import of the same book adds no second entry, and that `/forget` never deletes a file the reader owns.
 - `tests/audio_device.rs` runs the allowlist end to end — blocked, warned, `/device allow`, restored — while `src/tts/device.rs` simulates sleeping headphones through an injected probe and asserts the decision flips once rather than every frame.
@@ -324,6 +403,14 @@ CI (`.github/workflows/tui-ci.yml`, at the repository root) runs fmt, clippy wit
 ```sh
 cargo build --release     # 4.0 MB, thin LTO, one codegen unit, symbols stripped
 ```
+
+Install it by rename, not by copying over the old one:
+
+```sh
+mv target/release/readio ~/.local/bin/readio.new && mv ~/.local/bin/readio.new ~/.local/bin/readio
+```
+
+On macOS, `cp` over an existing binary leaves the old inode with a signature that no longer matches its contents, and the kernel answers by killing the process — an upgrade that "installed fine" and then dies with signal 9 and no message. A rename gives the new binary its own inode, and it also means a half-written download can never be left behind under a name someone is about to run. `install.sh` does exactly this, which is why it never had the problem.
 
 Nothing in the dependency tree compiles C. `zip` is reduced to `default-features = false, features = ["deflate"]`, which drops `zstd-sys` and bzip2 — EPUB only needs store and deflate — and leaves the tree pure Rust. Static musl builds are then a target away rather than a cross toolchain, and one Linux archive runs on any distribution.
 

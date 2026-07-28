@@ -3,12 +3,14 @@
 //!
 //! readio does not bundle a model. It shells out to whatever engine you point
 //! it at, which keeps the binary small and means a better model next month is a
-//! config edit rather than a new release. See [`config`] for the file and
-//! `docs/tts.md` for which small models are worth pointing it at.
+//! config edit rather than a new release. See [`config`] for the presets and
+//! the README's "Read-aloud" section for which small models are worth pointing
+//! it at.
 //!
 //! The pieces:
 //!
-//! - [`config::TtsConfig`] — `~/.readio/tts.toml`: engine, voice, rate.
+//! - [`config::TtsConfig`] — the `tts:` section of `~/.readio/config.yaml`:
+//!   engine, voice, rate.
 //! - [`Synthesizer`] — turn text into an audio file, then play it. Implemented
 //!   by [`command::CommandSynth`] for real engines and by a fake in tests.
 //! - [`device`] — the output-device whitelist, so switching headphones cannot
@@ -27,6 +29,7 @@
 pub mod command;
 pub mod config;
 pub mod device;
+pub mod install;
 pub mod sentence;
 pub mod wav;
 

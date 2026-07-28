@@ -62,6 +62,18 @@ pub fn current() -> Lang {
     }
 }
 
+/// One lock every test that pins the language must hold.
+///
+/// The language is global, and `cargo test` runs a binary's tests on many
+/// threads, so a test asserting on Chinese output and a test asserting on English
+/// output will otherwise take it in turns to fail on a loaded machine. Anything
+/// that calls [`set`] takes this first.
+#[cfg(test)]
+pub(crate) fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Look up a message in the current language.
 pub fn t(key: &str) -> &'static str {
     let row = TABLE.iter().find(|(k, _, _)| *k == key);
@@ -104,32 +116,71 @@ pub const TABLE: &[(&str, &str, &str)] = &[
     ("chrome.pick_hint", "输入序号选书", "type a number to pick a book"),
     ("chrome.pick_tail", "  ·  /lib 书库  ·  /import <路径>  ·  /help 更多",
         "  ·  /lib library  ·  /import <path>  ·  /help for more"),
+    // An empty library has no number to type. Telling someone to pick one is how
+    // a first launch turns into a keystroke that does nothing.
+    ("chrome.empty_hint", "导入一本：/import <路径>", "import one: /import <path>"),
+    ("chrome.empty_tail", "  ·  /sample 看示例  ·  /help 更多",
+        "  ·  /sample for the sample  ·  /help for more"),
     ("chrome.continue", "⏎ 继续", "⏎ keep reading"),
     ("chrome.idle_tail", "  ·  shift+tab 换模式  ·  /help 更多",
         "  ·  shift+tab cycles modes  ·  /help for more"),
-    ("chrome.busy_tail", "  ·  esc 暂停  ·  ↑↓ 滚动", "  ·  esc to pause  ·  ↑↓ to scroll"),
+    ("chrome.busy_tail", "  ·  esc 中断  ·  ↑↓ 滚动", "  ·  esc interrupts  ·  ↑↓ to scroll"),
     // Pausing wears the agent's own clothes: a stopped stream is a model
     // thinking, which is the one state a coding agent is always allowed to be in.
-    ("chrome.paused", "思考中…", "thinking…"),
-    ("chrome.paused_tail", "  ·  ⏎ 继续  ·  esc 停止这一轮",
-        "  ·  ⏎ to continue  ·  esc again stops the turn"),
+    // esc holds the turn where it is. It is called an interruption because that
+    // is what it is, and because it is the word the reader already knows from
+    // every agent that stops mid-answer.
+    ("chrome.paused", "已中断", "Interrupted"),
+    ("chrome.paused_keys", "⏎ 或空格继续", "⏎ or space to continue"),
     ("menu.hint", "↑↓ 选  ·  tab 补全  ·  ⏎ 执行  ·  esc 关掉",
         "↑↓ to choose  ·  tab completes  ·  ⏎ runs it  ·  esc closes"),
-    ("menu.hint_more", "↑↓ 选  ·  tab 补全  ·  ⏎ 执行  ·  还有 {0} 条",
-        "↑↓ to choose  ·  tab completes  ·  ⏎ runs it  ·  {0} more below"),
+    // A select has nothing to complete: the row is the answer, so tab runs it
+    // too, and typing narrows the list instead of reaching the composer.
+    ("menu.hint_select", "↑↓ 选  ·  ⏎ 确定  ·  直接打字筛选  ·  esc 取消",
+        "↑↓ to choose  ·  ⏎ confirms  ·  type to narrow  ·  esc cancels"),
+    ("menu.hint_rest", "还有 {0} 条", "{0} more below"),
+    ("menu.hint_filter", "筛选：{0}", "filter: {0}"),
     ("menu.example", "例：", "e.g."),
     ("menu.active", "（当前）", "(active)"),
+    // A book ⏎ would resume is not a book that is open, and the chapter you are
+    // reading is not a setting in force: both need their own word.
+    ("menu.last_read", "（上次在读）", "(last read)"),
+    ("menu.you_are_here", "（读到这里）", "(you are here)"),
+    // Rows built from the reader's own library, book and bookmarks.
+    ("menu.book_more", "打开《{0}》，回到上次停下的地方（已读 {1}%，{2} 方式持有）",
+        "Open {0} and pick up where you stopped — {1}% read, held by {2}"),
+    ("menu.book_missing", "文件找不到了：{0}。/forget 可以把这一条清掉",
+        "The file is gone: {0}. /forget clears the entry"),
+    ("menu.path_dir", "目录", "folder"),
+    ("menu.path_file", "{0}", "{0}"),
+    ("menu.path_dir_more", "进入 {0} 继续找。⏎ 或 tab 都能往里走",
+        "Step into {0} and keep looking — ⏎ or tab walks in"),
+    ("menu.path_file_more", "导入 {0}。默认复制一份进书库（--copy）；加 --link 只记路径，--move 把文件搬进来",
+        "Import {0}. It is copied into the library by default (--copy); --link only remembers the path, --move brings the file in"),
+    ("menu.chapter_read", "已读过", "read"),
+    ("menu.chapter_here", "正在这里", "you are here"),
+    ("menu.chapter_ahead", "还没读", "not yet"),
+    ("menu.chapter_more", "跳到《{0}》（第 {1} 章）的开头。跳走之前可以先 /mark 记下现在这一处",
+        "Jump to the start of {0} (chapter {1}). /mark keeps your current place first"),
+    ("menu.mark_more", "回到「{0}」，大约在全书 {1}% 的位置",
+        "Go back to “{0}”, about {1}% into the book"),
     ("menu.also", "也可写作", "also"),
 
     // ── the three reading modes ──
     // A coding agent shows its mode as a chip and cycles it with shift+tab; the
     // chip has to stay narrow, so the explaining is done by the message.
+    //
+    // The chip says the same word as the mode wherever it fits. It used to say
+    // 逐段 / step for manual, which is a description of what the mode does
+    // rather than a name anyone recognises: the first question it got was "这个
+    // 逐段是啥意思". A chip has no room to answer that, so it should not raise
+    // the question.
     ("mode.manual", "手动", "manual"),
     ("mode.auto", "自动滚动", "auto-scroll"),
     ("mode.tts", "朗读", "read-aloud"),
-    ("mode.chip_manual", "逐段", "step"),
+    ("mode.chip_manual", "手动", "manual"),
     ("mode.chip_auto", "自动", "auto"),
-    ("mode.chip_tts", "朗读", "voice"),
+    ("mode.chip_tts", "朗读", "aloud"),
 
     // ── reading pace, worn as reasoning effort ──
     // Higher effort is slower, which is exactly how the real thing behaves, so the
@@ -141,9 +192,6 @@ pub const TABLE: &[(&str, &str, &str)] = &[
     ("effort.xhigh", "慢读，字句留得住", "slow, words stay with you"),
     ("effort.max", "细读，一句一句来", "close reading, sentence by sentence"),
     ("effort.set", "推理强度 {0}  ·  {1}", "Reasoning effort {0} · {1}"),
-    ("effort.now", "推理强度 {0}（{1}，约 {2} 字/秒）", "Reasoning effort {0} — {1}, about {2} chars/s"),
-    ("effort.tune", "改这一档的倍数：/rate <0.5-3.0>；全部六档写在 config.yaml 的 effort.multipliers 里",
-        "Retune this level with /rate <0.5-3.0>; all six live under effort.multipliers in config.yaml"),
     ("effort.tuned", "{0} 这一档现在是 {1}，已写回 config.yaml",
         "Level {0} is now {1}, written back to config.yaml"),
     ("effort.row_more", "{0}：{1}，{2}。文字约 {3}，朗读也按这个倍数播。倍数可以在 config.yaml 里改，或者 /rate。",
@@ -152,15 +200,15 @@ pub const TABLE: &[(&str, &str, &str)] = &[
         "Usage: /effort minimal | low | medium | high | xhigh | max (^r cycles)"),
     ("mode.set_manual", "手动模式：不会自己往下走。⏎ 载入下一段，滚到底按 ↓ 也可以。shift+tab 换模式",
         "Manual: nothing advances on its own. ⏎ loads the next passage, and so does ↓ at the bottom. shift+tab cycles modes"),
-    ("mode.set_auto", "自动滚动：一段接一段，当前 {0}。/effort 或 ^r 调速，esc 暂停，shift+tab 换模式",
-        "Auto-scroll: passage after passage at {0}. /effort or ^r changes the pace, esc pauses, shift+tab cycles modes"),
-    ("mode.set_tts", "朗读模式（自带滚动）：由人声定速，当前 {0}。/effort 或 ^r 调倍速，esc 暂停，shift+tab 换模式",
-        "Read-aloud, which scrolls itself: the voice sets the pace, now {0}. /effort or ^r changes it, esc pauses, shift+tab cycles modes"),
+    ("mode.set_auto", "自动滚动：一段接一段，当前 {0}。/effort 或 ^r 调速，esc 中断，shift+tab 换模式",
+        "Auto-scroll: passage after passage at {0}. /effort or ^r changes the pace, esc interrupts, shift+tab cycles modes"),
+    ("mode.set_tts", "朗读模式（自带滚动）：由人声定速，当前 {0}。/effort 或 ^r 调倍速，esc 中断，shift+tab 换模式",
+        "Read-aloud, which scrolls itself: the voice sets the pace, now {0}. /effort or ^r changes it, esc interrupts, shift+tab cycles modes"),
     ("mode.row_manual", "你说一段算一段", "nothing moves until you say so"),
     ("mode.row_auto", "一段接一段自己往下走", "passages follow one another by themselves"),
     ("mode.row_tts", "念出来，滚动跟着人声", "read out loud, scrolling with the voice"),
-    ("mode.row_auto_more", "自动滚动：读完一段接着下一段，速度按当前推理强度。esc 暂停，再按一次停下；shift+tab 也能切模式。",
-        "Auto-scroll: each passage is followed by the next at the pace the current effort level sets. esc pauses, esc again stops, and shift+tab cycles the modes."),
+    ("mode.row_auto_more", "自动滚动：读完一段接着下一段，速度按当前推理强度。esc 中断，回车接着读；shift+tab 也能切模式。",
+        "Auto-scroll: each passage is followed by the next at the pace the current effort level sets. esc interrupts, ⏎ carries on, and shift+tab cycles the modes."),
     ("mode.row_tts_more", "朗读模式：readio 调用你配置好的引擎念出来，文字跟着音频走，推理强度就是播放倍速。装不上引擎时会说明原因并跳过这个模式。",
         "Read-aloud: readio drives the engine you configured, the text keeps pace with the audio, and the effort level is the playback multiplier. If no engine can start, it says why and skips the mode."),
     ("mode.now", "当前是{0}模式（{1}）。shift+tab 循环切换，或 /mode manual|auto|tts",
@@ -179,8 +227,8 @@ pub const TABLE: &[(&str, &str, &str)] = &[
     ("chrome.help_close", " 按任意键关闭", " any key closes"),
 
     // ── prompt placeholders ──
-    ("prompt.reading", "回车继续读，/ 看命令，esc 暂停",
-        "enter reads on  ·  / for commands  ·  esc pauses"),
+    ("prompt.reading", "回车或空格继续读，/ 看命令，esc 中断",
+        "enter or space reads on  ·  / for commands  ·  esc interrupts"),
     ("prompt.pick", "输入序号选书，或 /import <路径> 导入",
         "type a number to pick a book, or /import <path>"),
     ("prompt.empty", "readio <文件> 导入一本，或 /sample 试试内置示例",
@@ -191,7 +239,10 @@ pub const TABLE: &[(&str, &str, &str)] = &[
     ("block.thought_for", "Thought for {0}s", "Thought for {0}s"),
     ("block.thought", "Thought", "Thought"),
     ("block.turn_done", "已读 {0} tok  ·  {1}s", "read {0} tok  ·  {1}s"),
-    ("block.interrupted", "已中断", "interrupted"),
+    // `^c` throws the turn away; `esc` only interrupts one, and that state is
+    // `chrome.paused` above the prompt. Two outcomes, two words — a transcript
+    // that calls both of them "interrupted" cannot be read back.
+    ("block.interrupted", "这一轮已取消", "turn cancelled"),
     ("block.chapter_done", "本章读完：{0}  ·  {1} tok", "chapter done: {0}  ·  {1} tok"),
     ("block.book_done", "全书读完。要不要重头开始？/goto 1",
         "that's the whole book. Start over with /goto 1?"),
@@ -207,7 +258,6 @@ pub const TABLE: &[(&str, &str, &str)] = &[
     ("block.ctx_speech", "朗读", "speech"),
 
     // ── library ──
-    ("lib.title", "书库  {0} 本", "Library  ·  {0} books"),
     ("lib.empty", "还没有导入任何书。", "Nothing imported yet."),
     ("lib.empty_hint", "导入一本：readio <文件> [-c 复制 | -l 引用 | -m 移动]，默认复制到 {0}。\n想先试试的话，/sample 打开内置示例。",
         "Import one: readio <file> [-c copy | -l link | -m move]. Copies land in {0}.\nOr try /sample for the built-in sample."),
@@ -290,8 +340,8 @@ The short forms -c / -l / -m work too."),
     ("cmd.usage_lang", "用法：/lang zh | en | auto", "Usage: /lang zh | en | auto"),
     ("cmd.speed_set", "基准速度已改，当前 {0} 字/秒（强度 {1}）",
         "Base pace changed: {0} chars/s at effort {1}"),
-    ("cmd.auto_on", "自动续读已开启，esc 可以随时停下",
-        "Auto-continue is on; esc stops it"),
+    ("cmd.auto_on", "自动续读已开启，esc 可以随时中断",
+        "Auto-continue is on; esc interrupts it"),
     ("cmd.auto_off", "自动续读已关闭", "Auto-continue is off"),
     ("cmd.last_chapter", "已经是最后一章了", "That's the last chapter"),
     ("cmd.first_chapter", "已经是第一章了", "That's the first chapter"),
@@ -314,31 +364,72 @@ The short forms -c / -l / -m work too."),
     ("cmd.unmark_done", "已删掉第 {0} 个标记：{1}", "Dropped mark {0}: {1}"),
 
     // ── speech ──
-    ("tts.on", "朗读已开启：{0}", "Read-aloud on: {0}"),
-    ("tts.off", "朗读已关闭", "Read-aloud off"),
-    ("tts.row_on", "打开朗读（等于朗读模式）", "turn read-aloud on"),
-    ("tts.row_off", "关掉朗读，回到自动滚动", "turn it off, back to auto-scroll"),
+    //
+    // No "on" and no "off" line: read-aloud is a reading mode, so `/mode` and the
+    // mode chip say whether it is running. What lives here is the voice — which
+    // engine, getting one, proving it works.
     ("tts.row_test", "念一句，验证引擎接得通", "speak one line to prove the wiring"),
     ("tts.row_config", "告诉我配置文件在哪", "print where the config file lives"),
-    ("tts.row_engine", "引擎，需要 {0}", "engine, needs {0}"),
-    ("tts.row_engine_more", "改用 {0} 引擎，它调用的是 {1}——没装的话 readio 会告诉你缺什么、去哪配。音色用 /voice 换。",
-        "Switches to the {0} engine, which runs {1}. If it is not installed readio says what is missing and where to configure it. /voice picks the voice."),
+    ("tts.row_engine", "{0} · ⏎ 用它念", "{0} · ⏎ reads with it"),
+    ("tts.row_engine_more", "改用 {0} 引擎，它调用的是 {1}，⏎ 直接切过去开始念。音色用 /voice 换；朗读的开关是 shift+tab。",
+        "Switches to the {0} engine, which runs {1}, and starts reading aloud. /voice picks the voice; shift+tab is what turns read-aloud off again."),
+    ("tts.row_engine_missing", "{0} · ⏎ 装上它", "{0} · ⏎ installs it"),
+    ("tts.row_engine_missing_more", "{0} 还没装。⏎ 就用 {1} 装 {2}，连音色模型一起下，装完自动切过去开始念。每条命令跑之前都会先写出来；下多少东西取决于模型，通常几十兆到几百兆。",
+        "{0} is not installed. ⏎ installs {2} with {1}, voice model included, and starts reading with it when it lands. Every command is written out before it runs; how much it downloads depends on the model, usually tens to hundreds of megabytes."),
+    ("tts.row_engine_server", "服务端，装不了", "a server, nothing to install"),
+    ("tts.row_engine_server_more", "{0} 连的是你自己起的 OpenAI 兼容服务，readio 不负责装、也不负责起。看 {1}。",
+        "{0} talks to an OpenAI-compatible server you run yourself; readio neither installs nor starts it. See {1}."),
+    // Same sentence for an engine the reader defined themselves, where there is
+    // no link to give: "See ." is worse than not offering to point anywhere.
+    ("tts.row_engine_server_bare", "{0} 是你自己配的命令，readio 不负责装、也不负责起。",
+        "{0} is a command you configured yourself; readio neither installs nor starts it."),
     ("tts.engine_set", "朗读引擎：{0}", "Speech engine: {0}"),
     ("tts.voice_set", "朗读音色：{0}", "Speech voice: {0}"),
+    ("tts.voice_auto", "音色跟着文字走：中文段用中文音色，英文段用英文音色。",
+        "The voice now follows the page: Chinese passages in a Chinese voice, English in an English one."),
+    ("tts.voice_language_set", "整本都按 {0} 念，音色 {1}",
+        "Reading everything as {0}, in {1}"),
+    ("tts.row_voice_auto", "跟着每段文字的语种换音色",
+        "match each passage as it comes"),
+    ("tts.row_voice_auto_more",
+        "每句话自己判断语种，音色和发音规则一起换——中英混排的一章不用你动手。这是默认。",
+        "Each sentence is read in the language it is written in, voice and phonemes together, \
+         so a chapter that mixes the two needs nothing from you. This is the default."),
+    ("tts.row_voice_lang", "固定用这一种语言念，音色 {0}",
+        "pin this language, read by {0}"),
+    ("tts.row_voice_lang_more",
+        "整本书都当作{0}来念，音色固定为 {1}。适合书本来就只有一种语言，不想让 readio 猜。",
+        "Reads the whole book as {0}, in {1}. For a shelf that is all one language, \
+         where a guess is one more thing that can be wrong."),
+    ("tts.row_voice_pinned", "你点名的音色", "the voice you named"),
+    ("tts.row_voice_pinned_more",
+        "这是你自己指定的音色，readio 不会覆盖它。readio 认识的音色会带上自己的语种。回到 auto 选第一行。",
+        "A voice you named yourself, which readio will not overrule. One it recognises brings \
+         its language along. The first row goes back to automatic."),
+    ("tts.language_zh", "中文", "Chinese"),
+    ("tts.language_en", "英文", "English"),
     ("tts.speed_set", "朗读倍速 {0}", "Read-aloud speed {0}"),
     ("tts.speed_later", "朗读倍速 {0}，下次开启朗读时生效",
         "Read-aloud speed {0}; it takes effect when you turn speech on"),
     ("tts.speed_now", "当前倍速 {0}  ·  可选 {1}  ·  ^r 循环切换",
         "Speed {0}   ladder: {1}   (^r cycles)"),
     ("tts.unknown_engine", "没有这个引擎：{0}。可用：{1}", "No such engine: {0}. Available: {1}"),
-    ("tts.missing_binary", "找不到 {0}。装好之后再开 /tts，或改 {1} 换一个引擎。",
-        "Cannot find {0}. Install it and run /tts again, or pick another engine in {1}."),
+    // Short on purpose: this rides the status row, where it fades on its own
+    // after a few seconds. It used to be a transcript line long enough to name
+    // the config file, which meant every failed `shift+tab` left another copy of
+    // the same sentence stacked in the reader's book. `/tts` lists the engines
+    // that are actually installed, so the way out is one command away.
+    ("tts.missing_binary", "找不到 {0}，朗读没开成。/tts 里 ⏎ 一下就装上",
+        "{0} not found, so read-aloud is off. /tts and ⏎ installs one"),
     ("tts.failed", "朗读失败：{0}", "Read-aloud failed: {0}"),
     ("tts.fallback", "朗读已停，改回按字速阅读。", "Speech stopped; back to timed reading."),
     ("tts.config_at", "朗读配置：{0}", "Speech config: {0}"),
-    ("tts.usage", "用法：/tts [on | off | <引擎> | test | config]",
-        "Usage: /tts [on | off | <engine> | test | config]"),
-    ("tts.usage_voice", "用法：/voice <音色>", "Usage: /voice <name>"),
+    ("tts.usage", "用法：/tts [引擎 | install <引擎> | test | config]。开关朗读用 shift+tab。",
+        "Usage: /tts [engine | install <engine> | test | config]. shift+tab turns read-aloud on and off."),
+    // `/tts on` used to be a switch. It is not one any more, because read-aloud
+    // is a reading mode and a mode already has a key.
+    ("tts.no_switch", "朗读没有单独的开关——它是三种阅读模式之一。shift+tab 换模式，/mode 挑一个；/tts 只管用哪个引擎念。",
+        "Read-aloud has no separate switch: it is one of the three reading modes. shift+tab cycles them and /mode picks one. /tts only chooses which engine reads."),
     ("tts.usage_rate", "用法：/rate <0.5-3.0>，改的是当前强度这一档的倍数",
         "Usage: /rate <0.5-3.0> — it retunes the level you are on"),
     ("tts.testing", "试念一句：{0}", "Test line: {0}"),
@@ -346,6 +437,51 @@ The short forms -c / -l / -m work too."),
         "An interface is never neutral: it decides for you what deserves attention."),
     ("tts.engines", "可用引擎：{0}", "Engines: {0}"),
     ("tts.speaking", "朗读中", "reading aloud"),
+
+    // ── installing an engine ──
+    //
+    // readio bundles no model, so at some point every reader who wants a voice
+    // has to install one. The whole point of these lines is that they name the
+    // next keypress: an install that fails and leaves the reader reading a
+    // stack trace has failed twice.
+    ("install.starting", "正在装 {0}，用的是 {1}。命令都写在下面，装完自动切过去。",
+        "Installing {0} with {1}. Every command is shown below, and readio switches to it when it lands."),
+    ("install.done", "{0} 装好了，用了 {1} 秒。朗读已开启：{2}",
+        "{0} is installed ({1}s). Read-aloud is on: {2}"),
+    // Ten columns of header, no more: the tool line has already spent its width
+    // on the command. What went wrong is explained underneath.
+    ("install.step_failed", "失败", "failed"),
+    ("install.failed", "{0} 没装成。上面红色那条就是断掉的命令——照着它在终端里跑一遍，能看到完整报错。装法看 {1}",
+        "{0} did not install. The command in red above is where it stopped; running it in a terminal shows the full error. Instructions: {1}"),
+    ("install.busy", "{0} 还在装，等它装完。", "{0} is still installing; let it finish."),
+    ("install.already", "{0} 已经装好了，直接切过去。", "{0} is already installed, so switching to it."),
+    ("install.not_yet", "{0} 还没装。/tts 里 ⏎ 一下就装上", "{0} is not installed yet. /tts and ⏎ puts it there"),
+    ("install.no_recipe", "{0} 不是 readio 能装的东西——它是个你自己起的服务。怎么起看 {1}",
+        "{0} is not something readio can install: it is a server you run yourself. See {1}"),
+    ("install.no_recipe_bare", "{0} 不是 readio 能装的东西——那条命令是你自己写的，得你自己备齐",
+        "{0} is not something readio can install: that command line is yours, so its program is too"),
+    ("install.no_installer", "这台机器上没找到 uv、pipx 或 pip，装不了。装一个再来：https://docs.astral.sh/uv/",
+        "No uv, pipx or pip on this machine, so there is nothing to install with. Get one first: https://docs.astral.sh/uv/"),
+
+    // ── what a speech engine says when it fails ──
+    //
+    // These come back from a subprocess, so they are the one class of message
+    // readio cannot phrase in advance. They still have to arrive in the
+    // reader's language, and they have to name the file that can be edited —
+    // config.yaml, the only file readio has.
+    ("synth.failed", "{0} 合成失败", "{0} could not synthesize that"),
+    ("synth.no_audio", "{0} 没写出音频文件（对一下 config.yaml 里它的 synth 命令）",
+        "{0} wrote no audio file (check its synth command in config.yaml)"),
+    ("synth.bad_wav", "{0} 写出的不是能识别的 wav（{1}）",
+        "{0} wrote something that is not a readable wav ({1})"),
+    ("synth.empty_command", "命令是空的", "the command is empty"),
+    ("synth.empty_play", "播放命令是空的", "the play command is empty"),
+    ("synth.cannot_run", "运行不了 {0}", "could not run {0}"),
+    ("synth.cannot_play", "运行不了播放器 {0}", "could not run the player {0}"),
+    ("synth.player_exited", "播放器退出了（{0}）", "the player exited ({0})"),
+    ("synth.exited", "{0} 退出了（{1}）", "{0} exited ({1})"),
+    ("synth.exited_saying", "{0} 退出了（{1}）：{2}", "{0} exited ({1}): {2}"),
+    ("synth.timeout", "{0} 超时了", "{0} timed out"),
 
     // ── audio output whitelist ──
     ("dev.muted_title", "朗读已静音：当前输出设备不在白名单",
@@ -448,8 +584,8 @@ The short forms -c / -l / -m work too."),
         "List the table of contents: {0} chapters, about {1} chars."),
     ("flow.welcome_resume", "接着上次读《{0}》，进度 {1}%，停在第 {2} 章。",
         "Resuming {0} at {1}%, chapter {2}."),
-    ("flow.welcome_fresh", "已载入《{0}》，{1} 章、约 {2}。回车开始读，/help 看命令。",
-        "Loaded {0}: {1} chapters, about {2}. Enter starts reading; /help lists commands."),
+    ("flow.welcome_fresh", "已载入《{0}》，{1} 章、约 {2}。回车或空格开始读，/toc 选章节。",
+        "Loaded {0}: {1} chapters, about {2}. Enter or space starts reading; /toc picks a chapter."),
 
     // ── reading narration ──
     ("flow.think_resumed", "先确认上次停在哪：第 {0} 章「{1}」第 {2} 段。核对一下段落偏移再往下读。",
@@ -568,9 +704,9 @@ mod tests {
     fn lookup_follows_the_current_language() {
         let _guard = exclusive();
         set(Lang::Zh);
-        assert_eq!(t("block.interrupted"), "已中断");
+        assert_eq!(t("block.interrupted"), "这一轮已取消");
         set(Lang::En);
-        assert_eq!(t("block.interrupted"), "interrupted");
+        assert_eq!(t("block.interrupted"), "turn cancelled");
     }
 
     #[test]

@@ -116,7 +116,7 @@ Copies land in `~/.readio/books`. Use `readio --home <dir>` to keep a separate l
 | `/mark [note]` `/marks [n]` `/unmark <n>` | keep a place, list places, drop one |
 | `/auto` `/speed <n>` | keep reading unattended · reveal speed |
 | `/context` `/progress` `/plan` | where you are |
-| `/tts` `/voice <name>` `/rate <0.5-3>` `/device` | read-aloud and audio output |
+| `/tts [engine]` `/voice [auto|zh|en|<name>]` `/rate <0.5-3>` `/device` | which voice reads to you, installing one, audio output |
 | `/lang en\|zh` `/help` `/quit` | interface language · help · exit |
 
 ## What the interface pretends to be
@@ -159,6 +159,28 @@ readio ships no speech model. It drives whichever engine you have installed thro
 | `piper` | ~15M · GPL-3.0 | fastest to first sound; text on stdin |
 | `supertonic` | 99M · MIT | pure ONNX, no torch, 31 languages |
 | `openai` | — | any OpenAI-compatible `/v1/audio/speech` endpoint |
+
+`/tts` asks which voice, and answers the part you cannot know from a list: whether you already have it. Picking an engine you have switches to it and starts reading; picking one you do not installs it — with whichever of `uv`, `pipx` and `pip` you turn out to have, the Python version the package insists on, and the voice model it does not ship. Every command is written out before it runs, and shown running:
+
+```
+● Bash uv tool install --python 3.12 kokoro-tts  1/1  ·  24.8s
+  Installed 61 packages in 3.42s
+   + kokoro-tts==0.9.4
+
+○ kokoro is installed (25s). Read-aloud is on: kokoro · zf_xiaoxiao
+```
+
+If the command lands somewhere that is not on your PATH — `uv` and `pipx` both like `~/.local/bin` — readio records where it went instead of asking you to edit a shell profile. `openai` is the exception: it is a server you run yourself, and readio says so rather than pretending it can install it.
+
+A multilingual model still has to be told which language it is looking at, and its default is rarely yours: `kokoro-tts` assumes `en-us`, so Chinese handed to it unannounced is sounded out with English letter-to-sound rules — the same eighteen-character sentence takes 13.6 seconds that way and 4.1 seconds said properly. readio decides per sentence instead, from the text, and moves the voice with the language, because in Kokoro they are one decision rather than two. A bilingual chapter switches mid-page with nothing to set:
+
+```
+❯ auto (active)  match each passage as it comes
+  en             pin this language, read by af_heart
+  zh             pin this language, read by zf_xiaoxiao
+```
+
+`auto` is a row in `/voice` rather than only a value in the config file, because a setting that can only be turned on is a trap: before it existed, `/voice af_heart` was a one-way door out of automatic that only a text editor could reopen.
 
 While a passage is spoken, its sentence is washed lightly and the word or character being sounded is washed deeply, and the reveal speed follows each clip's real duration rather than a guess.
 

@@ -128,6 +128,40 @@ pub fn render_header(area: Rect, buf: &mut Buffer, c: &Chrome<'_>) {
     split_row(area, buf, left, right);
 }
 
+/// Rows the activity strip needs: one while the turn is interrupted, none otherwise.
+///
+/// An interruption belongs at the end of the transcript — directly under the last
+/// words, above the input box — because that is where everything the agent is
+/// doing, or has stopped doing, appears. It used to sit in the footer beside the
+/// key hints, which read as a label on the prompt rather than as a state the turn
+/// was in.
+pub fn activity_height(c: &Chrome<'_>) -> u16 {
+    u16::from(c.paused)
+}
+
+/// Draw that strip: what happened, and the key that undoes it.
+///
+/// No spinner. A spinner means work is going on, and the whole point of this
+/// state is that none is: the turn is stopped and waiting for the reader. The
+/// way back is printed along the status line with every other key hint.
+pub fn render_activity(area: Rect, buf: &mut Buffer, c: &Chrome<'_>) {
+    if area.height == 0 || !c.paused {
+        return;
+    }
+    let th = theme();
+    let line = Line::from(vec![
+        Span::styled(
+            format!(" {} ", theme::QUOTE_BAR),
+            Style::default().fg(th.accent_warning),
+        ),
+        Span::styled(
+            t("chrome.paused").to_string(),
+            Style::default().fg(th.accent_thinking),
+        ),
+    ]);
+    Paragraph::new(vec![line]).render(area, buf);
+}
+
 /// Read-aloud indicator: the engine when it is sounding, a struck-through note
 /// and the reason when the output device is not allowed.
 fn speech_span(c: &Chrome<'_>) -> Vec<Span<'static>> {
@@ -151,30 +185,23 @@ pub fn render_status(area: Rect, buf: &mut Buffer, c: &Chrome<'_>) {
     let th = theme();
     let faint = Style::default().fg(th.text_faint);
 
-    let left = if let Some(notice) = c.notice {
+    // An interruption outranks a notice. A notice fades on its own; an
+    // interruption is a state the reader has to be told how to leave, and telling
+    // them two seconds late is how "esc did nothing" gets reported as a bug.
+    let left = if c.paused {
+        // What happened is drawn above the prompt by `render_activity`; down here
+        // only the way out of it belongs.
+        vec![
+            Span::raw("  "),
+            Span::styled(t("chrome.paused_keys").to_string(), faint),
+        ]
+    } else if let Some(notice) = c.notice {
         vec![
             Span::styled(
                 format!("  {} ", theme::BULLET_DONE),
                 Style::default().fg(th.accent_system),
             ),
             Span::styled(notice.to_string(), Style::default().fg(th.text_secondary)),
-        ]
-    } else if c.paused {
-        // A paused reader looks exactly like a model thinking, which is the
-        // costume this whole interface wears.
-        vec![
-            Span::raw("  "),
-            Span::styled(
-                format!("{} ", theme::QUOTE_BAR),
-                Style::default().fg(th.accent_thinking),
-            ),
-            Span::styled(
-                t("chrome.paused").to_string(),
-                Style::default()
-                    .fg(th.accent_thinking)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(t("chrome.paused_tail").to_string(), faint),
         ]
     } else if c.busy {
         let mut spans = vec![
@@ -209,13 +236,17 @@ pub fn render_status(area: Rect, buf: &mut Buffer, c: &Chrome<'_>) {
             Span::styled(t("chrome.scrolled_tail").to_string(), faint),
         ]
     } else if !c.has_book {
+        // With nothing imported there is no number to type, and advice you
+        // cannot follow is worse than none.
+        let (hint, tail) = if c.library_count == 0 {
+            ("chrome.empty_hint", "chrome.empty_tail")
+        } else {
+            ("chrome.pick_hint", "chrome.pick_tail")
+        };
         vec![
             Span::raw("  "),
-            Span::styled(
-                t("chrome.pick_hint").to_string(),
-                Style::default().fg(th.text_secondary),
-            ),
-            Span::styled(t("chrome.pick_tail").to_string(), faint),
+            Span::styled(t(hint).to_string(), Style::default().fg(th.text_secondary)),
+            Span::styled(t(tail).to_string(), faint),
         ]
     } else {
         let mut spans = vec![
@@ -275,7 +306,9 @@ pub fn render_status(area: Rect, buf: &mut Buffer, c: &Chrome<'_>) {
 const HELP: &[(&str, &str, &str)] = &[
     ("⏎", "载入下一段；命令以 / 开头", "load the next passage; commands start with /"),
     ("⏎ (输出中 / mid-turn)", "加速当前这一轮，直接读到底", "rush the current turn to its end"),
-    ("esc", "暂停（显示为思考中）；再按一次停止这一轮", "pause (shown as thinking); again stops the turn"),
+    ("esc", "中断这一轮，位置留在原处；回车接着读", "interrupt the turn, keeping your place; ⏎ carries on"),
+    ("空格 space", "停下 / 接着读，跟播放器一个意思（输入框是空的时候）",
+        "stop or carry on, the way it works in a player (when the line is empty)"),
     ("shift+tab", "循环三种模式：手动 / 自动滚动 / 朗读",
         "cycle the modes: manual / auto-scroll / read-aloud"),
     ("↑ ↓ / 滚轮 wheel", "滚动；手动模式下滚到底会载入下一段",
@@ -287,7 +320,8 @@ const HELP: &[(&str, &str, &str)] = &[
     ("^s", "开关朗读", "toggle read-aloud"),
     ("^r", "推理强度下一档，也就是读快一点/慢一点", "next reasoning effort: read faster or slower"),
     ("^l", "清屏", "clear the screen"),
-    ("^c ^d", "退出（输出中时 ^c 先打断）", "quit (^c interrupts first while running)"),
+    ("^c ^d", "退出；正在输出时 ^c 先把这一轮丢掉（esc 只是中断，还能接着读）",
+        "quit; while running, ^c discards the turn (esc only interrupts — that one resumes)"),
     ("", "", ""),
     ("/lib", "列出书库", "list the library"),
     ("/open <n>", "打开第几本；直接输序号也行", "open entry n; a bare number works too"),
@@ -313,7 +347,8 @@ const HELP: &[(&str, &str, &str)] = &[
     ("", "", ""),
     ("/effort [level]", "推理强度：minimal…max，越高读得越慢",
         "reasoning effort: minimal…max, higher reads slower"),
-    ("/tts [on|off|engine]", "朗读开关与引擎", "read-aloud and engine"),
+    ("/tts [engine]", "用哪个引擎念；没装的当场装",
+        "which voice reads to you; installs one that is missing"),
     ("/voice <name>", "换音色", "change voice"),
     ("/rate <0.5-3>", "改当前强度这一档的倍数", "retune the current effort level"),
     ("/device", "音频输出白名单：只在指定设备上出声",
@@ -321,6 +356,7 @@ const HELP: &[(&str, &str, &str)] = &[
     ("/speed <n>", "吐字速度（朗读时跟随音频）",
         "reveal speed (follows the audio while reading aloud)"),
     ("/lang zh|en", "界面语言", "interface language"),
+    ("/clear", "清屏，进度不受影响", "clear the screen; your place is kept"),
     ("/help  /quit", "这个面板 / 退出", "this panel / quit"),
 ];
 

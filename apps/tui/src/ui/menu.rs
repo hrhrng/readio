@@ -23,10 +23,13 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
+use crate::book::Book;
 use crate::config::Config;
 use crate::effort;
 use crate::i18n::{Lang, t};
+use crate::library::Library;
 use crate::mode::Mode;
+use crate::store::Mark;
 use crate::theme::{self, theme};
 use crate::wrap::{display_width, truncate, wrap};
 
@@ -99,6 +102,7 @@ impl Command {
                 format!("/{} ", self.name)
             },
             run: self.runnable(),
+            active: false,
         }
     }
 }
@@ -123,14 +127,27 @@ pub struct Row {
     pub insert: String,
     /// Whether `⏎` runs it now, or only completes it.
     pub run: bool,
+    /// The answer in force: what the select should land on when it opens.
+    pub active: bool,
 }
 
-/// What the menu needs to know about the reader to mark the active answer.
+/// What the menu needs to know about the reader: enough to mark the active
+/// answer, and enough to offer their own books, chapters and bookmarks as
+/// answers rather than as numbers to be typed from a listing.
 pub struct Ctx<'a> {
     pub cfg: &'a Config,
     pub mode: Mode,
     /// Base characters per second, before the effort multiplier.
     pub base_cps: f32,
+    pub library: &'a Library,
+    /// How far into each library entry the reader is, in the library's order.
+    pub progress: &'a [f32],
+    /// The entry `⏎` would resume, 1-based.
+    pub resume: Option<usize>,
+    pub book: Option<&'a Book>,
+    /// Chapter the reader is in, for marking the current row.
+    pub chapter: usize,
+    pub marks: &'a [Mark],
 }
 
 /// The rows a prompt line should offer, in menu order. Empty means no menu.
@@ -146,6 +163,16 @@ pub fn offer(line: &str, ctx: &Ctx<'_>) -> Vec<Row> {
             Some(command) => values(command, typed.trim(), ctx),
             None => Vec::new(),
         },
+    }
+}
+
+/// The answers to one command, as a select opened by that command rather than by
+/// typing it. `typed` filters them, so a reader can narrow a hundred chapters by
+/// typing a number or the start of a title.
+pub fn values_of(name: &str, typed: &str, ctx: &Ctx<'_>) -> Vec<Row> {
+    match find(name) {
+        Some(command) => values(command, typed, ctx),
+        None => Vec::new(),
     }
 }
 
@@ -182,13 +209,108 @@ pub fn matching(query: &str) -> Vec<&'static Command> {
     starts
 }
 
+/// Files and directories a half-typed path could mean.
+///
+/// A path is the one argument nobody can be offered from a fixed list, and it is
+/// also the one people get wrong most often — so the select reads the filesystem
+/// instead: directories to walk into, and only the formats readio can actually
+/// open.
+fn path_rows(typed: &str) -> Vec<Row> {
+    // Split what has been typed into "the directory to list" and "the prefix to
+    // match", keeping the reader's own spelling (`~/Doc…`) for what goes back
+    // into the prompt.
+    let typed = if typed.is_empty() { "~/" } else { typed };
+    let (shown_dir, prefix) = match typed.rfind('/') {
+        Some(cut) => (&typed[..=cut], &typed[cut + 1..]),
+        None => ("./", typed),
+    };
+    let dir = crate::app::expand_tilde(shown_dir);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+
+    let mut rows: Vec<(bool, String, Row)> = Vec::new();
+    for entry in entries.flatten().take(2_000) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // Dotfiles stay out of the way until someone types the dot.
+        if name.starts_with('.') && !prefix.starts_with('.') {
+            continue;
+        }
+        if !name.to_lowercase().starts_with(&prefix.to_lowercase()) {
+            continue;
+        }
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if !is_dir && !Book::supports(&entry.path()) {
+            continue;
+        }
+        let spelled = format!("{shown_dir}{name}{}", if is_dir { "/" } else { "" });
+        let about = if is_dir {
+            t("menu.path_dir").to_string()
+        } else {
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            crate::i18n::tf("menu.path_file", &[&bytes(size)])
+        };
+        let more = if is_dir {
+            crate::i18n::tf("menu.path_dir_more", &[&spelled])
+        } else {
+            crate::i18n::tf("menu.path_file_more", &[&spelled])
+        };
+        rows.push((
+            is_dir,
+            name.to_lowercase(),
+            Row {
+                label: format!("{name}{}", if is_dir { "/" } else { "" }),
+                about,
+                more,
+                example: format!("/import {spelled}"),
+                also: Vec::new(),
+                insert: format!("/import {spelled}"),
+                // A directory is a step, not an answer: ⏎ walks into it.
+                run: !is_dir,
+                active: false,
+            },
+        ));
+    }
+    // Directories first, then files, each alphabetically: the order a reader
+    // expects from every file dialog they have ever used.
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    rows.into_iter().map(|(_, _, row)| row).take(60).collect()
+}
+
+/// `1.4 MB`, for a file the reader is about to import.
+fn bytes(size: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = size as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{size} {}", UNITS[0])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 /// The answers a command accepts, filtered by what has been typed so far.
 fn values(command: &'static Command, typed: &str, ctx: &Ctx<'_>) -> Vec<Row> {
+    // A path is matched against the filesystem, not against a list, so it comes
+    // back already filtered.
+    if command.name == "import" {
+        return path_rows(typed);
+    }
     let rows = match command.name {
         "effort" => effort_rows(ctx),
         "mode" => mode_rows(ctx),
         "lang" => lang_rows(ctx),
         "tts" => tts_rows(ctx),
+        "voice" => voice_rows(ctx),
+        // The reader's own things, offered rather than counted out: a book, a
+        // chapter, a place they kept.
+        "open" | "forget" => book_rows(command.name, ctx),
+        "goto" => chapter_rows(ctx),
+        "marks" | "unmark" => mark_rows(command.name, ctx),
         // A path, a chapter number or a search term: nothing to suggest, and a
         // menu in the way of typing one is worse than no menu.
         _ => Vec::new(),
@@ -196,20 +318,36 @@ fn values(command: &'static Command, typed: &str, ctx: &Ctx<'_>) -> Vec<Row> {
     if typed.is_empty() {
         return rows;
     }
+    // A title is worth finding from the middle: nobody remembers whether the book
+    // starts with "The". A fixed answer is not — matching the middle of those
+    // would offer `max` to someone who typed `x` meaning `xhigh`.
+    let loose = matches!(
+        command.name,
+        "open" | "forget" | "goto" | "marks" | "unmark"
+    );
     let needle = typed.to_ascii_lowercase();
     rows.into_iter()
         .filter(|row| {
             let value = row.insert.rsplit(' ').next().unwrap_or_default();
-            value.starts_with(&needle) || row.label.to_ascii_lowercase().starts_with(&needle)
+            let label = row.label.to_ascii_lowercase();
+            value.starts_with(&needle)
+                || label.starts_with(&needle)
+                || (loose && label.contains(&needle))
         })
         .collect()
 }
 
-/// One answer row, with the `(active)` marker a reader needs to see the state
-/// they are changing.
+/// One answer row, with the marker a reader needs to see the state they are
+/// changing: `(active)` for the setting in force, and something more specific
+/// where "active" would be a lie — a book that `⏎` would resume is not a book
+/// that is open.
 fn value(name: &str, code: &str, about: String, more: String, active: bool) -> Row {
+    marked(name, code, about, more, active, t("menu.active"))
+}
+
+fn marked(name: &str, code: &str, about: String, more: String, active: bool, marker: &str) -> Row {
     let label = if active {
-        format!("{name} {}", t("menu.active"))
+        format!("{name} {marker}")
     } else {
         name.to_string()
     };
@@ -221,7 +359,107 @@ fn value(name: &str, code: &str, about: String, more: String, active: bool) -> R
         also: Vec::new(),
         insert: format!("/{code}"),
         run: true,
+        active,
     }
+}
+
+/// Every imported book, with where the reader left it.
+fn book_rows(command: &str, ctx: &Ctx<'_>) -> Vec<Row> {
+    ctx.library
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let index = i + 1;
+            let progress = ctx.progress.get(i).copied().unwrap_or(0.0);
+            let size = crate::metrics::amount(
+                entry.chars,
+                crate::metrics::words_from_char_count(entry.chars),
+            );
+            let about = match &entry.author {
+                Some(author) => format!("{author}  ·  {size}  ·  {:.0}%", progress * 100.0),
+                None => format!("{size}  ·  {:.0}%", progress * 100.0),
+            };
+            let more = if entry.available() {
+                crate::i18n::tf(
+                    "menu.book_more",
+                    &[
+                        &entry.title,
+                        &format!("{:.0}", progress * 100.0),
+                        &entry.mode.label(),
+                    ],
+                )
+            } else {
+                crate::i18n::tf("menu.book_missing", &[&crate::paths::display(&entry.path)])
+            };
+            marked(
+                &format!("{index}. {}", entry.title),
+                &format!("{command} {index}"),
+                about,
+                more,
+                ctx.resume == Some(index),
+                t("menu.last_read"),
+            )
+        })
+        .collect()
+}
+
+/// Every chapter, as the book's own table of contents defines them.
+fn chapter_rows(ctx: &Ctx<'_>) -> Vec<Row> {
+    let Some(book) = ctx.book else {
+        return Vec::new();
+    };
+    book.chapters
+        .iter()
+        .enumerate()
+        .map(|(i, chapter)| {
+            let number = i + 1;
+            let chars = chapter.char_count();
+            // Read chapters are ticked. The one the reader is in gets nothing:
+            // the select draws its own cursor and marks the row `(active)`, and
+            // three indicators for one fact is two too many.
+            let mark = if i < ctx.chapter { theme::CHECK } else { " " };
+            let about = format!(
+                "{}  ·  {}",
+                crate::metrics::amount(chars, crate::metrics::words_from_char_count(chars)),
+                if i < ctx.chapter {
+                    t("menu.chapter_read")
+                } else if i == ctx.chapter {
+                    t("menu.chapter_here")
+                } else {
+                    t("menu.chapter_ahead")
+                }
+            );
+            marked(
+                &format!("{mark} {number}. {}", chapter.title),
+                &format!("goto {number}"),
+                about,
+                crate::i18n::tf("menu.chapter_more", &[&chapter.title, &number]),
+                i == ctx.chapter,
+                t("menu.you_are_here"),
+            )
+        })
+        .collect()
+}
+
+/// Every place the reader kept.
+fn mark_rows(command: &str, ctx: &Ctx<'_>) -> Vec<Row> {
+    let total = ctx.book.map(|b| b.char_count().max(1)).unwrap_or(1);
+    ctx.marks
+        .iter()
+        .enumerate()
+        .map(|(i, mark)| {
+            let number = i + 1;
+            let percent = (mark.chars as f32 / total as f32 * 100.0).clamp(0.0, 100.0);
+            value(
+                &format!("{number}. {}", mark.label),
+                &format!("{command} {number}"),
+                format!("{percent:.0}%"),
+                crate::i18n::tf("menu.mark_more", &[&mark.label, &format!("{percent:.0}")]),
+                false,
+            )
+        })
+        .collect()
 }
 
 fn effort_rows(ctx: &Ctx<'_>) -> Vec<Row> {
@@ -295,57 +533,162 @@ fn lang_rows(ctx: &Ctx<'_>) -> Vec<Row> {
         .collect()
 }
 
-/// `/tts` answers: the switches, then every engine the config knows about, so a
-/// reader never has to remember whether theirs is called `piper` or `piper-tts`.
+/// `/tts` answers: which voice reads to you, and how to get one.
+///
+/// There is no on and no off here. Read-aloud is one of the three reading modes,
+/// so turning it on is `/mode tts` or `shift+tab`, and a second switch beside the
+/// mode chip would be two controls for one fact — the state where they disagreed
+/// is exactly the state nobody could explain.
 fn tts_rows(ctx: &Ctx<'_>) -> Vec<Row> {
-    let speaking = ctx.cfg.tts.enabled;
-    let mut rows = vec![
-        value(
-            "on",
-            "tts on",
-            t("tts.row_on").to_string(),
-            t("tts.row_on_more").to_string(),
-            speaking,
-        ),
-        value(
-            "off",
-            "tts off",
-            t("tts.row_off").to_string(),
-            t("tts.row_off_more").to_string(),
-            !speaking,
-        ),
-        value(
-            "test",
-            "tts test",
-            t("tts.row_test").to_string(),
-            t("tts.row_test_more").to_string(),
-            false,
-        ),
-        value(
-            "config",
-            "tts config",
-            t("tts.row_config").to_string(),
-            t("tts.row_config_more").to_string(),
-            false,
-        ),
-    ];
-    for name in ctx.cfg.engine_names() {
-        let active = name == ctx.cfg.tts.engine;
-        let spec = ctx.cfg.spec(&name);
-        // The program that would actually run: the thing a reader needs to have
-        // installed, which is the only fact about an engine worth a menu row.
-        let about = spec
-            .and_then(|s| s.synth.split_whitespace().next().map(str::to_string))
-            .unwrap_or_else(|| name.clone());
+    let via = installer_name();
+    let mut rows: Vec<Row> = ctx
+        .cfg
+        .engine_names()
+        .into_iter()
+        .filter_map(|name| {
+            let spec = ctx.cfg.spec(&name)?;
+            let active = name == ctx.cfg.tts.engine;
+            // Three states, not two, and the row promises only what its state
+            // can deliver. An engine that is here switches and starts reading;
+            // one that is missing but has a package installs itself, and says so
+            // before ⏎ is pressed rather than after; a server is neither —
+            // readio has nothing to install and no business starting it.
+            //
+            // The server case comes first, because `curl` being present says
+            // nothing about whether the server behind it is up, and calling that
+            // "installed" would be taking credit for a fact nobody checked.
+            if spec.pip.is_empty() {
+                let more = if spec.docs.is_empty() {
+                    crate::i18n::tf("tts.row_engine_server_bare", &[&name])
+                } else {
+                    crate::i18n::tf("tts.row_engine_server_more", &[&name, &spec.docs])
+                };
+                return Some(value(
+                    &name,
+                    &format!("tts {name}"),
+                    t("tts.row_engine_server").to_string(),
+                    more,
+                    active,
+                ));
+            }
+            if crate::tts::install::is_ready(spec) {
+                let program = crate::tts::install::program_of(spec);
+                return Some(value(
+                    &name,
+                    &format!("tts {name}"),
+                    crate::i18n::tf("tts.row_engine", &[&spec.about]),
+                    crate::i18n::tf("tts.row_engine_more", &[&name, &program]),
+                    active,
+                ));
+            }
+            Some(value(
+                &name,
+                &format!("tts install {name}"),
+                crate::i18n::tf("tts.row_engine_missing", &[&spec.about]),
+                crate::i18n::tf("tts.row_engine_missing_more", &[&name, &via, &spec.pip]),
+                active,
+            ))
+        })
+        .collect();
+
+    // Then the two things one does to a voice that is already chosen.
+    rows.push(value(
+        "test",
+        "tts test",
+        t("tts.row_test").to_string(),
+        t("tts.row_test_more").to_string(),
+        false,
+    ));
+    rows.push(value(
+        "config",
+        "tts config",
+        t("tts.row_config").to_string(),
+        t("tts.row_config_more").to_string(),
+        false,
+    ));
+    rows
+}
+
+/// `/voice` answers: which voice, and whether readio picks it for you.
+///
+/// The first row is `auto`, because it is both the default and the only answer
+/// a reader cannot type from memory — a voice name is written on the engine's
+/// page somewhere, but "stop choosing for me" is nowhere. A setting that can
+/// only be turned on is a trap, and until this row existed, `/voice af_heart`
+/// was a one-way door out of automatic that only a text editor could reopen.
+fn voice_rows(ctx: &Ctx<'_>) -> Vec<Row> {
+    let pinned_voice = ctx.cfg.tts.voice.trim();
+    let pinned_lang = match ctx.cfg.tts.language.trim() {
+        "" | "auto" => None,
+        name => Some(name),
+    };
+    let mut rows = vec![value(
+        "auto",
+        "voice auto",
+        t("tts.row_voice_auto").to_string(),
+        t("tts.row_voice_auto_more").to_string(),
+        pinned_voice.is_empty() && pinned_lang.is_none(),
+    )];
+
+    // One row per language the engine has an entry for. Choosing one pins the
+    // language rather than the voice: the voice that belongs to it is already
+    // recorded next to it, and pinning both is how they come to disagree.
+    let Some(spec) = ctx.cfg.active_engine() else {
+        return rows;
+    };
+    for (code, entry) in &spec.languages {
+        let voice = if entry.voice.is_empty() {
+            spec.voice.clone()
+        } else {
+            entry.voice.clone()
+        };
         rows.push(value(
-            &name,
-            &format!("tts {name}"),
-            crate::i18n::tf("tts.row_engine", &[&about]),
-            crate::i18n::tf("tts.row_engine_more", &[&name, &about]),
-            active,
+            code,
+            &format!("voice {code}"),
+            crate::i18n::tf("tts.row_voice_lang", &[&voice]),
+            crate::i18n::tf("tts.row_voice_lang_more", &[&language_name(code), &voice]),
+            pinned_lang == Some(code.as_str()),
+        ));
+    }
+
+    // A voice they typed themselves is still theirs, and it should be visible
+    // as the thing currently in force rather than implied by no row matching.
+    if !pinned_voice.is_empty() {
+        rows.push(value(
+            pinned_voice,
+            &format!("voice {pinned_voice}"),
+            t("tts.row_voice_pinned").to_string(),
+            t("tts.row_voice_pinned_more").to_string(),
+            true,
         ));
     }
     rows
+}
+
+/// A language code as a reader would say it, for the codes readio ships.
+pub fn language_name(code: &str) -> String {
+    match code {
+        "zh" => t("tts.language_zh"),
+        "en" => t("tts.language_en"),
+        other => return other.to_string(),
+    }
+    .to_string()
+}
+
+/// Which installer this machine turns out to have, named in the row that offers
+/// to use it: "installs it" is a promise, and a reader is entitled to know what
+/// is about to run before they press ⏎ rather than after.
+fn installer_name() -> &'static str {
+    for candidate in ["uv", "pipx", "pip3", "pip"] {
+        if crate::tts::install::which(candidate).is_some() {
+            return if candidate == "pip3" {
+                "pip"
+            } else {
+                candidate
+            };
+        }
+    }
+    "uv"
 }
 
 /// Whether the prompt is asking for the menu at all.
@@ -392,7 +735,12 @@ fn text_width(width: u16) -> usize {
 
 /// Draw the menu, with `selected` highlighted, the list scrolled to keep it in
 /// view, and the highlighted row explained underneath.
-pub fn render(area: Rect, buf: &mut Buffer, rows: &[Row], selected: usize) {
+///
+/// `filter` is what a select has been narrowed by. A typed menu has none — the
+/// prompt below already shows the text — but a select keeps its narrowing text
+/// out of the composer, so the only place a reader can see what they typed is
+/// here.
+pub fn render(area: Rect, buf: &mut Buffer, rows: &[Row], selected: usize, filter: Option<&str>) {
     if rows.is_empty() || area.height == 0 {
         return;
     }
@@ -454,17 +802,32 @@ pub fn render(area: Rect, buf: &mut Buffer, rows: &[Row], selected: usize) {
 
     lines.extend(detail(&rows[selected], area.width));
 
-    // One faint line of instructions, because the keys are not guessable.
+    // One faint line of instructions, because the keys are not guessable. A
+    // select is told apart from a typed menu: `tab` there has nothing to
+    // complete, and what the reader has typed has nowhere else to appear.
     let more = rows.len().saturating_sub(window.len());
-    let hint = if more > 0 {
-        crate::i18n::tf("menu.hint_more", &[&more])
-    } else {
-        crate::i18n::t("menu.hint").to_string()
+    let keys = match filter {
+        Some(_) => t("menu.hint_select"),
+        None => t("menu.hint"),
     };
-    lines.push(Line::from(Span::styled(
+    let hint = if more > 0 {
+        format!("{keys}  ·  {}", crate::i18n::tf("menu.hint_rest", &[&more]))
+    } else {
+        keys.to_string()
+    };
+    let mut spans = vec![Span::styled(
         format!("   {hint}"),
         Style::default().fg(th.text_faint),
-    )));
+    )];
+    // What has been typed to narrow the rows, echoed where the rows are: a
+    // filter the reader cannot see is a filter they cannot undo.
+    if let Some(filter) = filter.filter(|f| !f.is_empty()) {
+        spans.push(Span::styled(
+            format!("  ·  {}", crate::i18n::tf("menu.hint_filter", &[&filter])),
+            Style::default().fg(th.accent_agent),
+        ));
+    }
+    lines.push(Line::from(spans));
 
     Paragraph::new(lines).render(area, buf);
 }
@@ -629,8 +992,8 @@ pub static COMMANDS: &[Command] = &[
         name: "auto", args: "",
         zh: "自动滚动开关，等于在手动与自动之间切",
         en: "Switch auto-scroll on or off",
-        zh_more: "在手动和自动滚动之间来回切，等价于 /mode auto 和 /mode manual。速度用 /speed <字/秒> 或 ^r，esc 暂停。",
-        en_more: "Flips between manual and auto-scroll, the same as /mode auto and /mode manual. Speed comes from /speed <chars per second> or ^r, and esc pauses.",
+        zh_more: "在手动和自动滚动之间来回切，等价于 /mode auto 和 /mode manual。速度用 /speed <字/秒> 或 ^r，esc 中断、回车继续。",
+        en_more: "Flips between manual and auto-scroll, the same as /mode auto and /mode manual. Speed comes from /speed <chars per second> or ^r; esc interrupts and ⏎ carries on.",
         example: "",
     },
     Command {
@@ -674,20 +1037,20 @@ pub static COMMANDS: &[Command] = &[
         example: "/speed 45",
     },
     Command {
-        name: "tts", args: "[on|off|<engine>|test|config]",
-        zh: "朗读：开关、换引擎、试一句、找配置",
-        en: "Read-aloud: switch it, pick an engine, test it",
-        zh_more: "readio 自己不带模型，只调用你配好的命令。on / off 开关，写引擎名（kokoro、piper、supertonic、openai）套用预设，test 念一句验证接线，config 打印 ~/.readio/config.yaml 的位置。",
-        en_more: "readio ships no model and only runs the command you configured. on and off switch it, an engine name (kokoro, piper, supertonic, openai) applies a preset, test speaks a line, config prints where config.yaml lives.",
+        name: "tts", args: "[engine|install|test|config]",
+        zh: "朗读用哪个引擎，没装的当场装",
+        en: "Which voice reads to you, and installing one",
+        zh_more: "readio 自己不带模型，只调用你配好的命令。这里列出所有引擎，标出哪些已经装好：⏎ 选一个就切过去开始念，没装的那个 ⏎ 就直接装（用这台机器上有的 uv / pipx / pip，音色模型也一起下），装完自动切过去。test 念一句验证接线，config 打印 ~/.readio/config.yaml 的位置。开关朗读是 shift+tab 或 /mode——朗读本身是一种阅读模式，不该有第二个开关。",
+        en_more: "readio ships no model and only runs the command you configured. This lists every engine and marks the ones you already have: ⏎ on one switches to it and starts reading aloud, ⏎ on a missing one installs it — with whichever of uv, pipx and pip this machine has, voice model included — and switches when it lands. test speaks a line, config prints where config.yaml lives. Turning read-aloud on and off is shift+tab or /mode: it is a reading mode, and a second switch for it would be one too many.",
         example: "/tts kokoro",
     },
     Command {
-        name: "voice", args: "<name>",
-        zh: "换音色，名字由你装的引擎决定",
-        en: "Choose which voice speaks",
-        zh_more: "把音色名传给你配置的引擎；有哪些名字取决于你装的模型，不是 readio 说了算。切换后从当前这句重新念。",
-        en_more: "Passes a voice name through to the engine you configured; which names exist depends on the model you installed, not on readio. Speech resumes from the current sentence.",
-        example: "/voice af_heart",
+        name: "voice", args: "[auto|zh|en|<name>]",
+        zh: "谁来念，以及要不要 readio 替你挑",
+        en: "Who reads, and whether readio picks",
+        zh_more: "auto 按每段文字本身的语种换音色，这是默认；写 zh 或 en 就固定一种语言念到底；也可以直接给引擎认识的音色名——有哪些名字取决于你装的模型，不是 readio 说了算。换完从当前这句重新念。",
+        en_more: "auto follows the language of each passage and is the default; zh or en pins one language for the whole book; a name goes straight through to the engine, and which names exist depends on the model you installed, not on readio. Speech resumes from the current sentence.",
+        example: "/voice auto",
     },
     Command {
         name: "rate", args: "[0.5-3.0]",
@@ -712,6 +1075,14 @@ pub static COMMANDS: &[Command] = &[
         zh_more: "在中文和英文之间切换界面，并把选择写进 config.yaml。书永远是作者写它时的那种语言。",
         en_more: "Switches the interface between English and Chinese and remembers the choice in config.yaml. A book always stays in the language it was written in.",
         example: "/lang zh",
+    },
+    Command {
+        name: "clear", args: "",
+        zh: "清屏，只清屏幕不动进度",
+        en: "Clear the screen, keeping your place",
+        zh_more: "把上面读过的内容从屏幕上抹掉，好让下一段干净地开始。阅读位置、标记、这次的读数都不受影响——清掉的只是屏幕，不是进度。^l 也一样。",
+        en_more: "Wipes what is on screen so the next passage starts on a clean one. Your position, your marks and this session's readout are untouched — only the screen is cleared, not the progress. ^l does the same.",
+        example: "",
     },
     Command {
         name: "help", args: "",
@@ -741,6 +1112,7 @@ impl Command {
             "tts" => &["speak", "read"],
             "device" => &["devices", "audio", "output"],
             "marks" => &["bookmarks"],
+            "clear" => &["cls"],
             "quit" => &["exit", "q"],
             "lang" => &["language"],
             _ => &[],
@@ -754,18 +1126,51 @@ mod tests {
     use crate::effort::Effort;
     use ratatui::layout::Rect;
 
-    fn ctx(cfg: &Config) -> Ctx<'_> {
+    /// A reader with an empty library: enough for every test about commands and
+    /// fixed answers. The tests that care about books build their own.
+    fn ctx<'a>(cfg: &'a Config, library: &'a Library, marks: &'a [Mark]) -> Ctx<'a> {
         Ctx {
             cfg,
             mode: Mode::Manual,
             base_cps: 46.0,
+            library,
+            progress: &[],
+            resume: None,
+            book: None,
+            chapter: 0,
+            marks,
         }
     }
 
+    /// `ctx!(&cfg)` for the many tests that need nothing but the config.
+    macro_rules! ctx {
+        ($cfg:expr) => {
+            ctx($cfg, empty_library(), &[])
+        };
+    }
+
+    /// One shared empty library, so `ctx!` can hand out a borrow that outlives
+    /// the statement it was written in.
+    fn empty_library() -> &'static Library {
+        static EMPTY: std::sync::OnceLock<Library> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(Library::default)
+    }
+
     fn draw(width: u16, height_: u16, rows: &[Row], selected: usize) -> String {
+        screen(width, height_, rows, selected, None)
+    }
+
+    /// The same, for a select: the rows carry a filter of their own.
+    fn screen(
+        width: u16,
+        height_: u16,
+        rows: &[Row],
+        selected: usize,
+        filter: Option<&str>,
+    ) -> String {
         let area = Rect::new(0, 0, width, height_);
         let mut buf = Buffer::empty(area);
-        render(area, &mut buf, rows, selected);
+        render(area, &mut buf, rows, selected, filter);
         (0..height_)
             .map(|y| {
                 (0..width)
@@ -781,7 +1186,7 @@ mod tests {
     #[test]
     fn a_bare_slash_offers_everything() {
         let cfg = Config::default();
-        assert_eq!(offer("/", &ctx(&cfg)).len(), COMMANDS.len());
+        assert_eq!(offer("/", &ctx!(&cfg)).len(), COMMANDS.len());
     }
 
     #[test]
@@ -802,13 +1207,44 @@ mod tests {
     }
 
     #[test]
-    fn a_command_that_takes_a_path_closes_the_menu() {
+    fn a_path_is_offered_from_the_filesystem_rather_than_from_a_list() {
+        let _guard = crate::i18n::exclusive();
+        crate::i18n::set(Lang::En);
         let cfg = Config::default();
-        let ctx = ctx(&cfg);
+        let library = Library::default();
+        let ctx = ctx(&cfg, &library, &[]);
         assert!(wanted("/im", &ctx));
-        assert!(!wanted("/import ", &ctx), "nothing to suggest for a path");
-        assert!(!wanted("/import ~/book.epub", &ctx));
         assert!(!wanted("what is this", &ctx));
+
+        // A real directory holding one book and one file readio cannot open.
+        let dir = std::env::temp_dir().join(format!("readio-menu-path-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("essays")).expect("a directory to walk into");
+        std::fs::write(dir.join("calvino.epub"), b"x").expect("a book");
+        std::fs::write(dir.join("notes.rtf"), b"x").expect("a file readio cannot open");
+        std::fs::write(dir.join(".hidden.txt"), b"x").expect("a dotfile");
+
+        let typed = format!("{}/", dir.display());
+        let rows = offer(&format!("/import {typed}"), &ctx);
+        let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
+
+        // Directories first, then the formats readio can actually open.
+        assert_eq!(labels, vec!["essays/", "calvino.epub"], "{labels:?}");
+        // ⏎ on a directory walks into it; on a book it imports.
+        assert!(!rows[0].run, "a directory is a step, not an answer");
+        assert!(rows[1].run);
+        assert_eq!(rows[1].insert, format!("/import {typed}calvino.epub"));
+        assert!(rows[1].about.contains('B'), "a size: {:?}", rows[1].about);
+
+        // Typing a prefix narrows it, and typing the dot reveals the dotfile.
+        let rows = offer(&format!("/import {typed}cal"), &ctx);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "calvino.epub");
+        let rows = offer(&format!("/import {typed}."), &ctx);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, ".hidden.txt");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -847,9 +1283,10 @@ mod tests {
 
     #[test]
     fn the_detail_panel_explains_the_highlighted_row() {
+        let _guard = crate::i18n::exclusive();
         crate::i18n::set(Lang::En);
         let cfg = Config::default();
-        let rows = offer("/import", &ctx(&cfg));
+        let rows = offer("/import", &ctx!(&cfg));
         let screen = draw(96, height(&rows, 0, 96), &rows, 0);
         assert!(screen.contains("~/.readio/books"), "{screen}");
         assert!(
@@ -860,9 +1297,10 @@ mod tests {
 
     #[test]
     fn a_narrow_terminal_loses_rows_before_it_loses_the_explanation() {
+        let _guard = crate::i18n::exclusive();
         crate::i18n::set(Lang::En);
         let cfg = Config::default();
-        let rows = offer("/", &ctx(&cfg));
+        let rows = offer("/", &ctx!(&cfg));
         // Half the height the menu would like: the paragraph and the hint stay.
         let screen = draw(60, 6, &rows, 0);
         assert!(screen.contains("Lists every book"), "{screen}");
@@ -874,19 +1312,21 @@ mod tests {
 
     #[test]
     fn aliases_are_offered_next_to_the_example() {
+        let _guard = crate::i18n::exclusive();
         crate::i18n::set(Lang::En);
         let cfg = Config::default();
-        let rows = offer("/lib", &ctx(&cfg));
+        let rows = offer("/lib", &ctx!(&cfg));
         let screen = draw(96, height(&rows, 0, 96), &rows, 0);
         assert!(screen.contains("/library"), "{screen}");
     }
 
     #[test]
     fn a_second_level_offers_every_effort_level_with_the_active_one_marked() {
+        let _guard = crate::i18n::exclusive();
         crate::i18n::set(Lang::En);
         let mut cfg = Config::default();
         cfg.effort.level = Effort::Medium;
-        let rows = offer("/effort ", &ctx(&cfg));
+        let rows = offer("/effort ", &ctx!(&cfg));
 
         assert_eq!(rows.len(), effort::LEVELS.len());
         assert_eq!(rows[0].label, "Minimal");
@@ -901,17 +1341,18 @@ mod tests {
     #[test]
     fn typing_part_of_a_level_narrows_it() {
         let cfg = Config::default();
-        let rows = offer("/effort x", &ctx(&cfg));
+        let rows = offer("/effort x", &ctx!(&cfg));
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].insert, "/effort xhigh");
     }
 
     #[test]
     fn the_multipliers_a_reader_configured_are_what_the_menu_shows() {
+        let _guard = crate::i18n::exclusive();
         crate::i18n::set(Lang::En);
         let mut cfg = Config::default();
         cfg.effort.multipliers.set(Effort::Max, 0.6);
-        let rows = offer("/effort ", &ctx(&cfg));
+        let rows = offer("/effort ", &ctx!(&cfg));
         let max = rows.last().expect("a row for max");
         assert!(max.about.contains("0.6×"), "{:?}", max.about);
         let screen = draw(96, height(&rows, 5, 96), &rows, 5);
@@ -920,9 +1361,10 @@ mod tests {
 
     #[test]
     fn the_other_second_levels_answer_too() {
+        let _guard = crate::i18n::exclusive();
         crate::i18n::set(Lang::En);
         let cfg = Config::default();
-        let ctx = ctx(&cfg);
+        let ctx = ctx!(&cfg);
 
         let modes = offer("/mode ", &ctx);
         assert_eq!(modes.len(), 3);
@@ -932,10 +1374,197 @@ mod tests {
         assert_eq!(langs.len(), 2);
         assert!(langs.iter().any(|row| row.insert == "/lang zh"));
 
-        // Switches first, then every engine the config knows about.
+        // Every engine the config knows about, then the two things one does to a
+        // voice. Whether an engine offers to be switched to or to be installed
+        // depends on the machine the test is running on, which is the whole point
+        // of the row. What is not here is on and off: that is `/mode`.
         let tts = offer("/tts ", &ctx);
         assert!(tts.len() > 4);
-        assert_eq!(tts[0].insert, "/tts on");
-        assert!(tts.iter().any(|row| row.insert == "/tts kokoro"));
+        assert!(
+            !tts.iter().any(|row| row.insert == "/tts on"),
+            "read-aloud is a mode, not a switch in this menu"
+        );
+        assert!(
+            tts.iter()
+                .any(|row| row.insert == "/tts kokoro" || row.insert == "/tts install kokoro"),
+            "{:?}",
+            tts.iter().map(|row| &row.insert).collect::<Vec<_>>()
+        );
+    }
+
+    /// An engine whose command is `sh` is installed on every machine this could
+    /// run on; one named after nothing at all is installed on none. That is
+    /// enough to test both states without asking what the machine has.
+    fn cfg_with_engines() -> Config {
+        let mut cfg = Config::default();
+        cfg.tts.engines.clear();
+        cfg.tts.engines.insert(
+            "here".to_string(),
+            crate::tts::config::EngineSpec {
+                synth: "sh -c true {out}".to_string(),
+                pip: "here-tts".to_string(),
+                about: "a voice that is already here".to_string(),
+                docs: "https://example.invalid/here".to_string(),
+                ..Default::default()
+            },
+        );
+        cfg.tts.engines.insert(
+            "gone".to_string(),
+            crate::tts::config::EngineSpec {
+                synth: "readio-definitely-not-installed {out}".to_string(),
+                pip: "gone-tts".to_string(),
+                about: "a voice that is not here yet".to_string(),
+                docs: "https://example.invalid/gone".to_string(),
+                ..Default::default()
+            },
+        );
+        cfg.tts.engines.insert(
+            "server".to_string(),
+            crate::tts::config::EngineSpec {
+                synth: "curl -sS http://127.0.0.1:8880 -o {out}".to_string(),
+                pip: String::new(),
+                docs: "https://example.invalid/server".to_string(),
+                ..Default::default()
+            },
+        );
+        cfg.tts.engine = "here".to_string();
+        cfg
+    }
+
+    /// The one menu where a row has to know something about the machine: an
+    /// engine you have and an engine you do not are different offers.
+    /// A setting that can only be turned on is a trap. `/voice af_heart` used to
+    /// be a one-way door out of automatic: nothing in the interface said `auto`,
+    /// so the way back was a text editor.
+    #[test]
+    fn the_voice_menu_offers_its_way_back_to_automatic() {
+        let _guard = crate::i18n::exclusive();
+        crate::i18n::set(Lang::En);
+        let cfg = Config::default();
+        let rows = values_of("voice", "", &ctx!(&cfg));
+
+        let first = rows.first().expect("a row");
+        assert_eq!(first.insert, "/voice auto", "auto comes first: {rows:?}");
+        assert!(
+            first.label.contains("active"),
+            "and is what a fresh config is doing: {:?}",
+            first.label
+        );
+        for code in ["zh", "en"] {
+            assert!(
+                rows.iter()
+                    .any(|row| row.insert == format!("/voice {code}")),
+                "a language the engine has an entry for is offered: {rows:?}"
+            );
+        }
+    }
+
+    /// The marker has to follow the setting, or the menu is a list of things a
+    /// reader has to remember the state of.
+    #[test]
+    fn the_voice_menu_marks_the_language_that_is_pinned() {
+        let _guard = crate::i18n::exclusive();
+        crate::i18n::set(Lang::En);
+        let mut cfg = Config::default();
+        cfg.tts.language = "zh".to_string();
+        let rows = values_of("voice", "", &ctx!(&cfg));
+
+        let zh = rows.iter().find(|r| r.insert == "/voice zh").unwrap();
+        assert!(zh.label.contains("active"), "{:?}", zh.label);
+        let auto = rows.first().unwrap();
+        assert!(!auto.label.contains("active"), "{:?}", auto.label);
+        assert!(
+            zh.about.contains("zf_xiaoxiao"),
+            "the row names the voice it would use: {:?}",
+            zh.about
+        );
+    }
+
+    /// A voice readio has no entry for is still the truth about this session,
+    /// and a menu that showed only `auto` and two languages would be lying.
+    #[test]
+    fn a_voice_the_reader_typed_appears_as_the_one_in_force() {
+        let _guard = crate::i18n::exclusive();
+        crate::i18n::set(Lang::En);
+        let mut cfg = Config::default();
+        cfg.tts.voice = "zf_xiaoyi".to_string();
+        let rows = values_of("voice", "", &ctx!(&cfg));
+
+        let mine = rows
+            .iter()
+            .find(|r| r.insert == "/voice zf_xiaoyi")
+            .unwrap();
+        assert!(mine.label.contains("active"), "{:?}", mine.label);
+        assert!(
+            !rows.first().unwrap().label.contains("active"),
+            "and automatic is not also claiming to be on"
+        );
+    }
+
+    #[test]
+    fn tts_lists_every_engine_and_says_which_are_already_here() {
+        let _guard = crate::i18n::exclusive();
+        crate::i18n::set(Lang::En);
+        let cfg = cfg_with_engines();
+        let rows = values_of("tts", "", &ctx!(&cfg));
+
+        assert_eq!(
+            rows.len(),
+            5,
+            "one row per engine, installed or not, then test and config: {:?}",
+            rows.iter().map(|row| &row.label).collect::<Vec<_>>()
+        );
+        assert!(
+            !rows.iter().any(|row| row.insert == "/tts on"),
+            "read-aloud is a mode; this menu is about the voice"
+        );
+
+        let here = rows.iter().find(|r| r.label.starts_with("here")).unwrap();
+        assert!(here.about.contains("reads with it"), "{:?}", here.about);
+        assert_eq!(here.insert, "/tts here", "an engine that is here switches");
+
+        let gone = rows.iter().find(|r| r.label.starts_with("gone")).unwrap();
+        assert_eq!(gone.insert, "/tts install gone", "a missing one installs");
+        assert!(
+            gone.about.contains("not here yet") && gone.about.contains("installs it"),
+            "the row says what the engine is and what ⏎ will do: {:?}",
+            gone.about
+        );
+        assert!(
+            gone.more.contains("gone-tts"),
+            "and the detail names the package: {:?}",
+            gone.more
+        );
+        assert!(
+            rows.iter().all(|row| row.run),
+            "every row runs as it stands"
+        );
+    }
+
+    #[test]
+    fn a_server_is_never_offered_for_installing() {
+        let _guard = crate::i18n::exclusive();
+        crate::i18n::set(Lang::En);
+        let cfg = cfg_with_engines();
+        let rows = values_of("tts", "server", &ctx!(&cfg));
+        assert_eq!(rows.len(), 1, "the filter should leave the server row");
+        assert_eq!(rows[0].insert, "/tts server");
+        assert!(
+            rows[0].about.contains("nothing to install"),
+            "{:?}",
+            rows[0].about
+        );
+    }
+
+    /// Typing part of an engine's name narrows the menu the same way, whichever
+    /// of the two things its row would do.
+    #[test]
+    fn a_half_typed_engine_finds_the_row_that_installs_it() {
+        let _guard = crate::i18n::exclusive();
+        crate::i18n::set(Lang::En);
+        let cfg = cfg_with_engines();
+        let rows = offer("/tts go", &ctx!(&cfg));
+        assert_eq!(rows.len(), 1, "{:?}", rows);
+        assert_eq!(rows[0].insert, "/tts install gone");
     }
 }

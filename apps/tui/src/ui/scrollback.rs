@@ -181,6 +181,29 @@ impl Scrollback {
             .unwrap_or(0)
     }
 
+    /// Add a line of live output to a running tool call.
+    pub fn push_output(&mut self, id: u64, line: String) -> bool {
+        let Some(entry) = self.entry_mut(id) else {
+            return false;
+        };
+        let ok = entry.block.push_output(line);
+        if ok {
+            entry.touch();
+            self.follow_tail();
+        }
+        ok
+    }
+
+    /// Mark a running tool call as failed, with the reason on its header.
+    pub fn fail_tool(&mut self, id: u64, message: String) {
+        if let Some(entry) = self.entry_mut(id) {
+            entry.running = false;
+            if entry.block.fail_tool(message) {
+                entry.touch();
+            }
+        }
+    }
+
     pub fn finish(&mut self, id: u64, elapsed_ms: Option<u64>) {
         if let Some(entry) = self.entry_mut(id) {
             entry.running = false;

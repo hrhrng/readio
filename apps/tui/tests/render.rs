@@ -186,7 +186,7 @@ fn find_runs_a_real_search() {
 }
 
 #[test]
-fn escape_pauses_and_enter_picks_it_back_up() {
+fn escape_interrupts_and_enter_picks_it_back_up() {
     let (mut app, mut terminal) = fixture();
     screen(&mut app, &mut terminal, 20);
     app.turn.set_cps(20.0);
@@ -197,11 +197,18 @@ fn escape_pauses_and_enter_picks_it_back_up() {
 
     press(&mut app, crossterm::event::KeyCode::Esc);
     let view = screen(&mut app, &mut terminal, 4);
-    assert!(app.turn.paused(), "esc should pause, not stop");
-    assert!(app.turn.busy(), "a paused turn is still the current turn");
+    assert!(app.turn.paused(), "esc should interrupt, not discard");
     assert!(
-        view.contains("思考") || view.contains("thinking"),
-        "a pause should read as thinking:\n{view}"
+        app.turn.busy(),
+        "an interrupted turn is still the current turn"
+    );
+    assert!(
+        view.contains("已中断"),
+        "the interruption should say so:\n{view}"
+    );
+    assert!(
+        view.contains("⏎ 或空格继续"),
+        "and print the way back:\n{view}"
     );
 
     press_enter(&mut app);
@@ -210,8 +217,14 @@ fn escape_pauses_and_enter_picks_it_back_up() {
     assert!(app.turn.busy(), "and carry on reading");
 }
 
+/// Esc has one meaning, however many times it is pressed.
+///
+/// It used to escalate: one press paused, a second abandoned the turn. That
+/// made the same key do two different things a second apart, and the reader had
+/// to remember which one they were about to get. Now esc only ever interrupts,
+/// and `^c` — the key that has always meant this — is what throws the turn away.
 #[test]
-fn escape_twice_stops_the_turn() {
+fn escape_twice_is_still_only_an_interruption() {
     let (mut app, mut terminal) = fixture();
     screen(&mut app, &mut terminal, 20);
     app.turn.set_cps(20.0);
@@ -225,8 +238,85 @@ fn escape_twice_stops_the_turn() {
     press(&mut app, crossterm::event::KeyCode::Esc);
     let view = screen(&mut app, &mut terminal, 4);
 
+    assert!(
+        app.turn.busy(),
+        "the second press must not discard the turn"
+    );
+    assert!(app.turn.paused(), "it is still interrupted");
+    assert!(view.contains("已中断"), "and still says so:\n{view}");
+
+    press_enter(&mut app);
+    screen(&mut app, &mut terminal, 4);
+    assert!(!app.turn.paused(), "enter still picks it back up");
+}
+
+/// Space is the player key: stop, carry on, and start again from nothing.
+#[test]
+fn space_stops_and_starts_the_reading() {
+    let (mut app, mut terminal) = fixture();
+    screen(&mut app, &mut terminal, 20);
+    app.turn.set_cps(20.0);
+
+    // Nothing running: space begins the passage, exactly as enter would.
+    press(&mut app, crossterm::event::KeyCode::Char(' '));
+    screen(&mut app, &mut terminal, 6);
+    assert!(app.turn.busy(), "space should start reading");
+    assert!(
+        app.prompt.is_empty(),
+        "and must not leave a space in the composer"
+    );
+
+    // Running: space interrupts, the same state esc produces.
+    press(&mut app, crossterm::event::KeyCode::Char(' '));
+    let view = screen(&mut app, &mut terminal, 4);
+    assert!(app.turn.paused(), "space should interrupt:\n{view}");
+    assert!(view.contains("已中断"), "and say so:\n{view}");
+
+    // Interrupted: space picks it back up.
+    press(&mut app, crossterm::event::KeyCode::Char(' '));
+    screen(&mut app, &mut terminal, 4);
+    assert!(!app.turn.paused(), "space should carry on");
+    assert!(app.turn.busy(), "and the turn is running again");
+}
+
+/// A space is only the player key on an empty line.
+#[test]
+fn space_is_a_space_when_there_is_something_to_type() {
+    let (mut app, mut terminal) = fixture();
+    run_until_idle(&mut app, &mut terminal);
+
+    for c in "/goto 3".chars() {
+        press(&mut app, crossterm::event::KeyCode::Char(c));
+    }
+    assert_eq!(
+        app.prompt.line(),
+        "/goto 3",
+        "the space belongs to the argument, not to the player"
+    );
+    assert!(!app.turn.paused(), "and nothing was interrupted");
+}
+
+#[test]
+fn ctrl_c_is_what_discards_the_turn() {
+    let (mut app, mut terminal) = fixture();
+    screen(&mut app, &mut terminal, 20);
+    app.turn.set_cps(20.0);
+
+    press_enter(&mut app);
+    screen(&mut app, &mut terminal, 8);
+    assert!(app.turn.busy(), "turn should be running");
+
+    app.on_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('c'),
+        crossterm::event::KeyModifiers::CONTROL,
+    ));
+    let view = screen(&mut app, &mut terminal, 4);
+
     assert!(!app.turn.busy(), "turn should be stopped");
-    assert!(view.contains("已中断"), "expected interrupt event:\n{view}");
+    assert!(
+        view.contains("这一轮已取消"),
+        "^c discards the turn, and says so in different words than esc:\n{view}"
+    );
 }
 
 #[test]
@@ -409,7 +499,16 @@ fn bare_launch_lists_imported_books() {
         );
     }
     assert!(view.contains(" 1. "), "entries should be numbered:\n{view}");
-    assert!(view.contains("copy"), "hold mode should be shown:\n{view}");
+    assert!(
+        view.contains("5000字") || view.contains("5,000"),
+        "each entry should show how long it is:\n{view}"
+    );
+    // The fixture's files do not exist, and a select says so about the row it is
+    // sitting on: where the book went matters more than how it is held.
+    assert!(
+        view.contains("文件找不到了") || view.contains("copy") || view.contains("复制"),
+        "the highlighted book should explain itself:\n{view}"
+    );
     assert!(app.book.is_none(), "no book is open yet");
 }
 
@@ -419,7 +518,7 @@ fn an_empty_library_explains_how_to_import() {
     let view = screen(&mut app, &mut terminal, 4);
 
     assert!(
-        view.contains("书库  0 本") || view.contains("还没有导入"),
+        view.contains("书库 0 本") || view.contains("还没有导入"),
         "{view}"
     );
     assert!(

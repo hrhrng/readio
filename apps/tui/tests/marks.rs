@@ -69,10 +69,12 @@ fn a_mark_with_no_note_is_named_after_what_is_there() {
     let (mut app, mut terminal) = fixture();
     settle(&mut app, &mut terminal);
     command(&mut app, &mut terminal, "/mark");
+    // `/marks` opens the select above the composer rather than printing a
+    // listing: the marks are something to choose from, not something to read.
     let view = command(&mut app, &mut terminal, "/marks");
     assert!(
-        view.contains("1 marks") || view.contains("1  ch1"),
-        "the listing should show the one mark: {view}"
+        view.contains("ch1") || view.contains("1."),
+        "the select should offer the one mark: {view}"
     );
     assert!(view.contains('%'), "a mark says how far in it is: {view}");
 }
@@ -93,10 +95,13 @@ fn marking_the_same_place_twice_renames_one_mark() {
     command(&mut app, &mut terminal, "/mark first");
     command(&mut app, &mut terminal, "/mark second");
     let view = command(&mut app, &mut terminal, "/marks");
-    assert!(view.contains("second"), "the newer name wins: {view}");
     assert!(
-        view.contains("1 marks"),
-        "and it is one mark, not two — the command echoes above are not the listing: {view}"
+        view.contains("1. second"),
+        "the newer name wins, and it is the first row: {view}"
+    );
+    assert!(
+        !view.contains("1. first"),
+        "and it is one mark, not two: {view}"
     );
 }
 

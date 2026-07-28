@@ -25,8 +25,8 @@ use crate::store::{Progress, Store, now_secs};
 use crate::theme::theme;
 use crate::tts::device::{self, Gate, Verdict};
 use crate::tts::sentence::Unit;
-use crate::tts::{Speaker, SpeechEvent, command::CommandSynth, sentence};
-use crate::ui::block::{Block, Event, Highlight, LibraryRow};
+use crate::tts::{Speaker, SpeechEvent, command::CommandSynth, install, sentence};
+use crate::ui::block::{Block, Event, Highlight, Tool, Verb};
 use crate::ui::chrome::{self, Chrome};
 use crate::ui::menu;
 use crate::ui::prompt::Prompt;
@@ -36,7 +36,12 @@ use flow::Pos;
 use turn::{Effect, Turn};
 
 /// How long a status-line notice stays up.
-const NOTICE_TTL: Duration = Duration::from_secs(4);
+///
+/// Long enough to read a sentence of Chinese, short enough that it is gone
+/// before it becomes furniture. Notices replace one another rather than
+/// stacking, which is the whole reason things like "the voice engine is not
+/// installed" belong here instead of in the transcript.
+const NOTICE_TTL: Duration = Duration::from_secs(6);
 /// Second Ctrl+C within this window quits.
 const QUIT_WINDOW: Duration = Duration::from_secs(2);
 /// Reading speed used when the reader presses Enter to skip ahead.
@@ -59,9 +64,10 @@ pub struct App {
     resumed: bool,
     /// Keep queueing turns until interrupted.
     auto: bool,
-    /// Modes whose full explanation has already been printed this session, so
-    /// that cycling with shift+tab does not reprint the same paragraph.
-    explained: [bool; 3],
+    /// How far into each library entry the reader is, for the book select.
+    library_progress: Vec<f32>,
+    /// Bookmarks of the open book, for the marks select.
+    marks: Vec<crate::store::Mark>,
     /// Reader's configured speed, restored after a rush.
     base_cps: f32,
     rushing: bool,
@@ -75,6 +81,8 @@ pub struct App {
     cfg: Config,
     /// Live synthesizer, spawned on demand.
     speaker: Option<Speaker>,
+    /// A speech engine being installed, and the tool call it is streaming into.
+    installing: Option<Install>,
     /// Reveal speed derived from the last clip, restored when speech stops.
     speech_cps: Option<f32>,
     /// Scrollback entry currently highlighted as spoken.
@@ -95,9 +103,47 @@ pub struct App {
     /// Row highlighted in the slash-command menu. The list itself is derived
     /// from what is typed, so only the cursor has to be remembered.
     menu_at: usize,
+    /// A select opened by a key or a command rather than by typing a slash.
+    ///
+    /// It carries its own filter because the alternative — writing `/effort `
+    /// into the composer and reading the rows back out of it — throws away
+    /// whatever the reader was halfway through typing, and puts a command they
+    /// never typed on the line under their cursor.
+    select: Option<Select>,
     /// Term to highlight in the next passage that contains it, set when a jump
     /// lands on a hit.
     marking: Option<String>,
+}
+
+/// A select the reader did not type: `^r` reaching for the effort ladder, `/toc`
+/// asking which chapter, the library asking which book.
+///
+/// The rows come from the same place the typed menu's do, so there is one list of
+/// answers and one way to move through it; what differs is only where the
+/// narrowing text is kept.
+struct Select {
+    /// The command whose answers are on offer, without the slash.
+    command: String,
+    /// What has been typed to narrow the rows. Not the prompt line.
+    filter: String,
+}
+
+/// A speech engine being installed.
+///
+/// It lives on the app rather than inside the turn machine because an install
+/// is not a reading turn: it takes tens of seconds of network, it must not stop
+/// the book, and interrupting it half way would leave a broken environment
+/// behind. The reader keeps reading; the commands report themselves as tool
+/// calls, one per command, the way any other work does.
+struct Install {
+    run: install::Running,
+    /// Engine to switch to when it finishes.
+    engine: String,
+    /// Transcript block the current command is streaming into.
+    block: u64,
+    /// Index of that command in the plan.
+    step: usize,
+    started: Instant,
 }
 
 /// A search and where the reader is inside its results.
@@ -197,7 +243,8 @@ impl App {
             notice: None,
             resumed: false,
             auto: false,
-            explained: [false; 3],
+            library_progress: Vec::new(),
+            marks: Vec::new(),
             base_cps: cps,
             rushing: false,
             resume: None,
@@ -206,6 +253,7 @@ impl App {
             started: Instant::now(),
             cfg,
             speaker: None,
+            installing: None,
             speech_cps: None,
             lit: None,
             voiced: None,
@@ -215,6 +263,7 @@ impl App {
             find: None,
             marking: None,
             menu_at: 0,
+            select: None,
         };
 
         if app.cfg.tts.output.is_active() {
@@ -251,51 +300,32 @@ impl App {
         self.pos = pos;
         self.library.touch(&book.id);
         self.book = Some(book);
+        // A new book brings its own bookmarks, and the book select behind it has
+        // a fresh position to report.
+        self.refresh_marks();
+        self.refresh_library_progress();
         self.auto = false;
         self.resume = None;
         self.prompt.placeholder = t("prompt.reading").to_string();
 
         let book = self.book.as_ref().expect("just set");
         let steps = flow::welcome(book, pos, self.resumed);
-        let plan = flow::plan(book, pos);
         self.turn.enqueue(steps);
-        self.turn.enqueue(plan);
+        // No chapter listing here. Opening a book used to push the reading plan
+        // into the transcript, which put a nine-row list of chapters between the
+        // reader and the first sentence — and a list they cannot move through
+        // with the arrow keys at that. Chapters are a choice, so they live in the
+        // select above the composer: `/toc` raises it, and `/plan` still prints
+        // the plan for anyone who asks for it by name.
         self.begin_session();
     }
 
-    /// Push the imported-books listing into the scrollback.
+    /// Offer the imported books in the select above the composer.
     fn show_library(&mut self) {
-        let rows: Vec<LibraryRow> = self
-            .library
-            .entries
-            .iter()
-            .enumerate()
-            .map(|(i, entry)| {
-                let progress = self
-                    .store
-                    .get(&entry.id)
-                    .map(|p| {
-                        if entry.chars == 0 {
-                            0.0
-                        } else {
-                            (p.chars_read as f32 / entry.chars as f32).clamp(0.0, 1.0)
-                        }
-                    })
-                    .unwrap_or(0.0);
-                LibraryRow {
-                    index: i + 1,
-                    title: entry.title.clone(),
-                    author: entry.author.clone(),
-                    chars: entry.chars,
-                    progress,
-                    mode: entry.mode.label(),
-                    current: self.book.as_ref().is_some_and(|open| open.id == entry.id),
-                    missing: !entry.available(),
-                }
-            })
-            .collect();
+        self.refresh_library_progress();
+        let empty = self.library.is_empty();
 
-        let hint = if rows.is_empty() {
+        let hint = if empty {
             tf("lib.empty_hint", &[&paths::display(&paths::books_dir())])
         } else {
             let mut hint = t("lib.pick_hint").to_string();
@@ -325,7 +355,15 @@ impl App {
         } else {
             t("prompt.pick").to_string()
         };
-        self.sb.push(Block::Library { rows, hint });
+        if empty {
+            self.system(&hint);
+            return;
+        }
+        // Choosing a book is a choice, so it happens in the select above the
+        // prompt rather than as a numbered listing in the transcript. The rows
+        // carry everything the listing carried: title, author, length, progress.
+        self.system(&hint);
+        self.open_select("open");
     }
 
     // ── frame ────────────────────────────────────────────────────────────────
@@ -340,7 +378,13 @@ impl App {
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame).as_secs_f32() * 1000.0;
         self.last_frame = now;
-        self.tick = self.tick.wrapping_add(1);
+        // Every spinner on the screen runs off this counter, so holding it still
+        // while the turn is interrupted holds them still too. A tool call that
+        // keeps spinning under a strip that says "已中断" is telling the reader
+        // two different things at once.
+        if !self.turn.paused() {
+            self.tick = self.tick.wrapping_add(1);
+        }
 
         if let Some((_, at)) = &self.notice
             && at.elapsed() > NOTICE_TTL
@@ -355,6 +399,7 @@ impl App {
         }
         self.poll_audio_device();
         self.pump_speech();
+        self.pump_install();
         self.advance_cursor();
         for effect in effects {
             match effect {
@@ -653,34 +698,6 @@ impl App {
         self.notice(&tf("effort.set", &[&level.label(), &times]));
     }
 
-    /// `/effort` with no argument: the whole ladder, with the active level marked
-    /// and each level's multiplier spelled out, since the multipliers are the
-    /// reader's to change.
-    fn effort_report(&mut self) {
-        let level = self.cfg.effort.level;
-        let rows: Vec<String> = effort::LEVELS
-            .iter()
-            .map(|candidate| {
-                let mark = if *candidate == level { "❯" } else { " " };
-                format!(
-                    "{mark} {:<8} {:>6}   {}",
-                    candidate.label(),
-                    effort::times(self.cfg.effort.multipliers.get(*candidate)),
-                    candidate.about()
-                )
-            })
-            .collect();
-        let cps = format!("{:.0}", self.reveal_cps());
-        self.system(&tf(
-            "effort.now",
-            &[&level.label(), &effort::times(self.multiplier()), &cps],
-        ));
-        for row in rows {
-            self.system(&row);
-        }
-        self.system(t("effort.tune"));
-    }
-
     /// What the status line says while audio is playing: the engine, plus the
     /// multiplier whenever it is not 1× — the number a listener wants to glance
     /// at without opening a menu.
@@ -705,19 +722,25 @@ impl App {
         }
         let Some(spec) = self.cfg.active_engine().cloned() else {
             let names = self.cfg.engine_names().join(", ");
-            self.system(&tf("tts.unknown_engine", &[&self.cfg.tts.engine, &names]));
+            // A notice, not a transcript line. Failing to start the voice is a
+            // fact about this machine, not about the book, and it fades on its
+            // own — four identical copies of it stacked in the reading history
+            // is what happens when an interface writes down every attempt.
+            self.notice(&tf("tts.unknown_engine", &[&self.cfg.tts.engine, &names]));
             return false;
         };
         let synth = CommandSynth::new(
             &self.cfg.tts.engine,
             spec,
-            self.cfg.active_voice(),
+            // The explicit choice only: left empty, the engine picks the voice
+            // that matches whatever language the passage turns out to be in.
+            self.cfg.tts.voice.clone(),
             self.multiplier(),
-        );
+        )
+        .in_language(&self.cfg.tts.language);
         if !synth.is_available() {
             let program = synth.program().unwrap_or_default();
-            let config = paths::display(&paths::config_file());
-            self.system(&tf("tts.missing_binary", &[&program, &config]));
+            self.notice(&tf("tts.missing_binary", &[&program]));
             return false;
         }
         self.speaker = Some(Speaker::spawn(
@@ -801,6 +824,12 @@ impl App {
                     self.cfg.tts.enabled = false;
                     self.speaker = None;
                     self.speech_done();
+                    // Leave through the mode machinery rather than by dropping a
+                    // flag: read-aloud is a reading mode, so an engine that dies
+                    // has to hand the session to another mode. Otherwise the
+                    // status line keeps flashing "read-aloud" beside a chip that
+                    // already says something else.
+                    self.set_mode(ReadMode::Auto);
                 }
             }
         }
@@ -927,22 +956,6 @@ impl App {
             .style(Style::default().bg(th.bg_base).fg(th.text_primary))
             .render(area, frame.buffer_mut());
 
-        let prompt_h = self.prompt.height(area.width);
-        let rows = self.menu_rows();
-        let menu_selected = self.menu_at.min(rows.len().saturating_sub(1));
-        // The menu may not eat the whole screen: the header, the prompt, the
-        // status line and three lines of book always come first.
-        let menu_h = menu::height(&rows, menu_selected, area.width)
-            .min(area.height.saturating_sub(prompt_h + 5));
-        let [header, body, menu_area, prompt, status] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Min(3),
-            Constraint::Length(menu_h),
-            Constraint::Length(prompt_h),
-            Constraint::Length(1),
-        ])
-        .areas(area);
-
         // The reading position only advances when a turn commits, so normalise
         // for display: a finished chapter should read as the next one.
         let shown = match self.book.as_ref() {
@@ -989,11 +1002,33 @@ impl App {
             audio_muted: self.cfg.tts.enabled && !self.audio_permitted(),
         };
 
+        let prompt_h = self.prompt.height(area.width);
+        let rows = self.menu_rows();
+        let menu_selected = self.menu_at.min(rows.len().saturating_sub(1));
+        // The menu may not eat the whole screen: the header, the prompt, the
+        // status line and three lines of book always come first.
+        let menu_h = menu::height(&rows, menu_selected, area.width)
+            .min(area.height.saturating_sub(prompt_h + 5));
+        // One line between the book and the prompt for what the agent is doing
+        // right now, which is where a thinking block belongs.
+        let activity_h = chrome::activity_height(&chrome);
+        let [header, body, activity, menu_area, prompt, status] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(activity_h),
+            Constraint::Length(menu_h),
+            Constraint::Length(prompt_h),
+            Constraint::Length(1),
+        ])
+        .areas(area);
+
         let buf = frame.buffer_mut();
         chrome::render_header(header, buf, &chrome);
         self.sb.render(inset(body), buf, self.tick);
+        chrome::render_activity(activity, buf, &chrome);
         if !rows.is_empty() {
-            menu::render(menu_area, buf, &rows, menu_selected);
+            let filter = self.select.as_ref().map(|s| s.filter.as_str());
+            menu::render(menu_area, buf, &rows, menu_selected, filter);
         }
         self.prompt.render(prompt, buf, self.turn.busy());
         chrome::render_status(status, buf, &chrome);
@@ -1052,10 +1087,21 @@ impl App {
             (KeyCode::Char('w'), true) => self.prompt.kill_word(),
             (KeyCode::Char('a'), true) => self.prompt.home(),
             (KeyCode::Char('e'), true) => self.prompt.end(),
+            // A select owns the letters while it is open: they narrow the rows
+            // instead of landing in a composer the reader cannot see behind it.
+            (KeyCode::Char(c), false) if self.select.is_some() => self.menu_type(c),
+            // Space is play/pause, the way it is in every player — but only on an
+            // empty line. The moment there is anything to type, a space is a
+            // space; a reader writing `/goto 3` must not have the turn stop
+            // under them halfway through the argument.
+            (KeyCode::Char(' '), false) if self.prompt.is_empty() && !self.menu_open() => {
+                self.toggle_pause()
+            }
             (KeyCode::Char(c), false) => self.prompt.insert_char(c),
 
             (KeyCode::Enter, _) => self.on_enter(),
             (KeyCode::Esc, _) => self.on_escape(),
+            (KeyCode::Backspace, _) if self.select.is_some() => self.menu_erase(),
             (KeyCode::Backspace, _) => self.prompt.backspace(),
             (KeyCode::Delete, _) => self.prompt.delete(),
             (KeyCode::Left, _) => self.prompt.left(),
@@ -1124,13 +1170,92 @@ impl App {
     // ── the slash-command menu ───────────────────────────────────────────────
 
     /// What the menu needs to know about the reader: which level, which mode,
-    /// which engines, and the base pace the multipliers scale.
+    /// which engines, the base pace the multipliers scale — and the reader's own
+    /// books, chapters and bookmarks, because those are answers too.
     fn menu_ctx(&self) -> menu::Ctx<'_> {
         menu::Ctx {
             cfg: &self.cfg,
             mode: self.mode(),
             base_cps: self.base_cps,
+            library: &self.library,
+            progress: &self.library_progress,
+            resume: self.resume,
+            book: self.book.as_ref(),
+            chapter: self.pos.chapter,
+            marks: &self.marks,
         }
+    }
+
+    /// Open the select for a command's answers, with the row in force chosen.
+    ///
+    /// This is what a bare `/effort`, `/lib` or `/toc` does now. Printing six
+    /// lines of levels into the transcript and asking the reader to type one back
+    /// was a listing pretending to be a control; the select above the prompt is
+    /// the control.
+    ///
+    /// The composer is left exactly as it was found. A select is a question
+    /// readio asks, and a question should not eat the reader's answer to the
+    /// last one.
+    fn open_select(&mut self, command: &str) {
+        let select = Select {
+            command: command.to_string(),
+            filter: String::new(),
+        };
+        let rows = menu::values_of(&select.command, &select.filter, &self.menu_ctx());
+        if rows.is_empty() {
+            // Nothing to choose from: say so rather than opening an empty box.
+            self.notice(match command {
+                "goto" => t("cmd.no_book"),
+                "marks" | "unmark" => t("mark.none"),
+                _ => t("lib.empty"),
+            });
+            return;
+        }
+        // Land on what is in force, so ⏎ alone changes nothing.
+        self.menu_at = rows.iter().position(|row| row.active).unwrap_or(0);
+        self.select = Some(select);
+        self.sb.to_bottom();
+    }
+
+    /// Close the select, leaving the composer as it was.
+    fn close_select(&mut self) {
+        self.select = None;
+        self.menu_at = 0;
+    }
+
+    /// Reading progress per library entry, in the library's own order. Rebuilt
+    /// when the library or a position changes, because the select shows it.
+    fn refresh_library_progress(&mut self) {
+        self.library_progress = self
+            .library
+            .entries
+            .iter()
+            .map(|entry| {
+                self.store
+                    .get(&entry.id)
+                    .map(|p| {
+                        if entry.chars == 0 {
+                            0.0
+                        } else {
+                            (p.chars_read as f32 / entry.chars as f32).clamp(0.0, 1.0)
+                        }
+                    })
+                    .unwrap_or(0.0)
+            })
+            .collect();
+    }
+
+    /// Bookmarks of the open book, kept beside the app so the select can offer
+    /// them without reaching into the store mid-frame.
+    fn refresh_marks(&mut self) {
+        self.marks = match self.book.as_ref() {
+            Some(book) => self
+                .store
+                .get(&book.id)
+                .map(|p| p.marks.clone())
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
     }
 
     /// Whether the menu is on screen, which decides who owns the arrow keys.
@@ -1138,10 +1263,14 @@ impl App {
         !self.menu_rows().is_empty()
     }
 
-    /// The rows on offer: commands while a name is being typed, and the answers
-    /// to that command once it has one.
+    /// The rows on offer: the answers to an open select, or — when the reader is
+    /// typing — commands while a name is being typed and that command's answers
+    /// once it has one.
     fn menu_rows(&self) -> Vec<menu::Row> {
-        menu::offer(self.prompt.line(), &self.menu_ctx())
+        match &self.select {
+            Some(select) => menu::values_of(&select.command, &select.filter, &self.menu_ctx()),
+            None => menu::offer(self.prompt.line(), &self.menu_ctx()),
+        }
     }
 
     fn menu_step(&mut self, delta: isize) {
@@ -1155,14 +1284,62 @@ impl App {
         self.menu_at = at.rem_euclid(count as isize) as usize;
     }
 
+    /// A printable key while a select is open narrows the select rather than
+    /// reaching the composer: the reader is answering a question, and the answer
+    /// is which row, not which sentence.
+    ///
+    /// A slash is the exception, and has to be: the library select is open the
+    /// moment readio starts, and a reader typing `/import` there means to import
+    /// something, not to look for a book with a slash in its title. A slash
+    /// always begins a command, in every state.
+    fn menu_type(&mut self, c: char) {
+        if c == '/' {
+            self.close_select();
+            self.prompt.insert_char(c);
+            return;
+        }
+        let Some(select) = self.select.as_mut() else {
+            return;
+        };
+        select.filter.push(c);
+        self.menu_at = 0;
+        if self.menu_rows().is_empty() {
+            // A filter matching nothing is a dead end the reader cannot see out
+            // of, so it never takes effect.
+            if let Some(select) = self.select.as_mut() {
+                select.filter.pop();
+            }
+        }
+    }
+
+    /// Backspace in a select rubs out the narrowing text, then closes it: the
+    /// same key that walks back through what you typed walks back out.
+    fn menu_erase(&mut self) {
+        let Some(select) = self.select.as_mut() else {
+            return;
+        };
+        if select.filter.pop().is_none() {
+            self.close_select();
+            return;
+        }
+        self.menu_at = 0;
+    }
+
     /// `tab`: write the highlighted row into the prompt. A command that still
     /// needs an argument is left with a trailing space, which is also what opens
     /// the second level of the menu.
+    ///
+    /// In a select there is nothing to complete — the row *is* the answer — so
+    /// `tab` runs it, which is what a reader pressing it there means.
     fn menu_complete(&mut self) {
         let rows = self.menu_rows();
         let Some(row) = rows.get(self.menu_at.min(rows.len().saturating_sub(1))) else {
             return;
         };
+        if self.select.is_some() {
+            self.menu_submit();
+            return;
+        }
         let line = row.insert.clone();
         self.prompt.set(&line);
         self.menu_at = 0;
@@ -1176,40 +1353,96 @@ impl App {
             return false;
         };
         // A row still waiting for an argument is completed, not run: `⏎` on
-        // `/goto <n>` cannot mean anything yet.
+        // `/goto <n>` cannot mean anything yet. In a select the equivalent is a
+        // directory — a step on the way to a file — so it narrows to that step
+        // instead of closing.
         if !row.run {
+            if let Some(select) = self.select.as_mut() {
+                let insert = row.insert.clone();
+                select.filter = insert
+                    .split_once(' ')
+                    .map(|(_, rest)| rest.to_string())
+                    .unwrap_or_default();
+                self.menu_at = 0;
+                return true;
+            }
             self.menu_complete();
             return true;
         }
         let name = row.insert.trim_start_matches('/').to_string();
+        let typed = self.select.is_none();
         self.prompt.clear();
-        self.menu_at = 0;
-        self.sb.push(Block::User(format!("/{name}")));
+        self.close_select();
+        // A command the reader typed is echoed, because they typed it and the
+        // transcript is a record of what was said. A row they picked out of a
+        // select is not: the result of the choice is the record.
+        if typed {
+            self.sb.push(Block::User(format!("/{name}")));
+        }
         self.sb.to_bottom();
         self.command(&name);
         true
     }
 
-    /// `esc`: pause what is playing, then stop it if pressed again.
+    /// `esc`: stop what is running. `⏎` picks it back up.
     ///
-    /// Pausing used to be interrupting, and interrupting threw the turn away
-    /// without advancing the position — so the next enter re-read the passage
-    /// from the top and the screen filled with the same paragraphs twice. Pause
-    /// keeps the place; a second press is the way out.
+    /// There is no second press to escalate to. Pause used to be one press and
+    /// abandoning the turn another, which meant the same key did two different
+    /// things a second apart and the reader had to know which one they were
+    /// about to get. One key, one meaning: esc interrupts and holds the place,
+    /// enter carries on, and `^c` — the key that has always meant this — is what
+    /// throws the turn away.
     fn on_escape(&mut self) {
-        if self.menu_open() {
+        if self.select.is_some() {
+            // A select is a question; esc declines to answer it, and leaves the
+            // composer holding whatever it held before the question was asked.
+            self.close_select();
+        } else if self.menu_open() {
             // Closing the menu is what esc means here; the typed text stays, so
             // one more press clears it.
             self.prompt.clear();
             self.menu_at = 0;
-        } else if self.turn.paused() {
-            self.interrupt();
-        } else if self.turn.busy() {
+        } else if self.turn.busy() && !self.turn.paused() {
             self.pause();
         } else if !self.prompt.is_empty() {
             self.prompt.clear();
         } else if self.sb.scrolled_away() {
             self.sb.to_bottom();
+        }
+    }
+
+    /// Carry on reading: the next passage, or the book that would supply it.
+    ///
+    /// Shared by `⏎` and space, so the two keys cannot drift apart on what
+    /// "keep going" means when nothing is currently running.
+    fn read_on(&mut self) {
+        self.sb.to_bottom();
+        if self.book.is_some() {
+            self.read_more();
+        } else if let Some(index) = self.resume {
+            self.open_entry(index);
+        } else if self.library.is_empty() {
+            self.system(t("cmd.library_empty"));
+        } else {
+            self.show_library();
+        }
+    }
+
+    /// Space: stop if it is running, carry on if it is not.
+    ///
+    /// One key for both halves, because that is what space means everywhere else
+    /// a stream of anything plays. `esc` and `⏎` keep their own meanings — esc
+    /// only ever interrupts, enter also starts a fresh passage — but a reader who
+    /// reaches for space gets the toggle they expect.
+    fn toggle_pause(&mut self) {
+        if self.turn.paused() {
+            self.resume_turn();
+        } else if self.turn.busy() {
+            self.pause();
+        } else {
+            // Nothing is running: space starts the next passage, the way it
+            // starts a paused track rather than doing nothing.
+            self.read_on();
         }
     }
 
@@ -1279,37 +1512,21 @@ impl App {
         self.cfg.reading.auto = self.auto;
         let _ = self.cfg.save();
 
-        // The first visit to a mode explains it, including how to change its
-        // speed: a chip that says `⏵⏵` is not documentation. After that a switch
-        // is one line in the status row, because someone cycling with shift+tab
-        // does not want the paragraph three times.
-        if self.explained[want.index()] {
-            // The chip already shows the glyph, so the flash names the mode and
-            // the number that mode obeys.
-            let flash = match want {
-                ReadMode::Manual => want.name().to_string(),
-                ReadMode::Auto => format!(
-                    "{}  ·  {}",
-                    want.name(),
-                    crate::metrics::rate_label(self.reveal_cps())
-                ),
-                ReadMode::Speak => {
-                    format!("{}  ·  {}", want.name(), effort::times(self.multiplier()))
-                }
-            };
-            self.notice(&flash);
-        } else {
-            self.explained[want.index()] = true;
-            let message = match want {
-                ReadMode::Manual => t("mode.set_manual").to_string(),
-                ReadMode::Auto => tf(
-                    "mode.set_auto",
-                    &[&crate::metrics::rate_label(self.reveal_cps())],
-                ),
-                ReadMode::Speak => tf("mode.set_tts", &[&effort::times(self.multiplier())]),
-            };
-            self.system(&message);
-        }
+        // A flash, not a paragraph: `/mode` opens a select whose detail panel
+        // explains each mode in full, so the switch itself only has to say which
+        // mode it is and at what pace.
+        let flash = match want {
+            ReadMode::Manual => want.name().to_string(),
+            ReadMode::Auto => format!(
+                "{}  ·  {}",
+                want.name(),
+                crate::metrics::rate_label(self.reveal_cps())
+            ),
+            ReadMode::Speak => {
+                format!("{}  ·  {}", want.name(), effort::times(self.multiplier()))
+            }
+        };
+        self.notice(&flash);
 
         // A mode that moves by itself should start moving.
         if want.scrolls() && self.book.is_some() && !self.turn.busy() && !self.at_end() {
@@ -1382,17 +1599,7 @@ impl App {
                 self.turn.rush();
                 return;
             }
-            self.sb.to_bottom();
-            if self.book.is_some() {
-                self.read_more();
-            } else if let Some(index) = self.resume {
-                self.open_entry(index);
-            } else if self.library.is_empty() {
-                self.system(t("cmd.library_empty"));
-            } else {
-                self.system(t("cmd.pick_first"));
-                self.show_library();
-            }
+            self.read_on();
             return;
         }
         let typed = self.prompt.line().trim().to_string();
@@ -1470,9 +1677,21 @@ impl App {
 
             // ── library ──
             "lib" | "library" | "ls" => self.show_library(),
+            "clear" | "cls" => {
+                self.sb.clear();
+                self.notice(t("cmd.cleared"));
+            }
             "import" | "i" => {
                 if arg.is_empty() {
-                    self.system(t("cmd.usage_import"));
+                    // "Which file?" is answered by the path menu, and a path is
+                    // the one argument worth leaving in the composer: it is text
+                    // the reader may want to edit, and it takes a `--copy` or
+                    // `--link` after it. Seeding the line opens the menu on the
+                    // home directory rather than on whatever directory readio
+                    // happened to be started from.
+                    self.prompt.set("/import ~/");
+                    self.menu_at = 0;
+                    self.sb.to_bottom();
                 } else {
                     self.import(arg);
                 }
@@ -1495,10 +1714,11 @@ impl App {
             }
 
             // ── reading ──
+            // The table of contents is a choice, not a printout: the select
+            // above the prompt lists every chapter with where the reader is.
             "toc" => {
-                if let Some(book) = self.book.as_ref() {
-                    let steps = flow::toc(book, self.pos.chapter);
-                    self.turn.enqueue(steps);
+                if self.book.is_some() {
+                    self.open_select("goto");
                 } else {
                     self.no_book();
                 }
@@ -1583,12 +1803,7 @@ impl App {
             // No `m` alias: that belongs to `/mark`, which readers reach for far
             // more often than they switch modes.
             "mode" => match arg {
-                "" => {
-                    let mode = self.mode();
-                    let chip = crate::mode::chip(mode);
-                    let name = mode.name();
-                    self.system(&tf("mode.now", &[&name, &chip]));
-                }
+                "" => self.open_select("mode"),
                 other => match ReadMode::parse(other) {
                     Some(want) => {
                         self.set_mode(want);
@@ -1636,6 +1851,10 @@ impl App {
             "unmark" => self.unmark_command(arg),
             // ── read aloud ──
             "tts" | "speak" | "read" => self.tts_command(arg),
+            // Installing lives under `/tts`, because the question it answers is
+            // "which voice", and a top-level `/install` in a book reader is a
+            // command whose subject nobody can guess.
+            "install" | "setup" => self.tts_command(&format!("install {arg}")),
             "voice" => self.voice_command(arg),
             "rate" => self.rate_command(arg),
             "lang" | "language" => self.lang_command(arg),
@@ -1645,25 +1864,28 @@ impl App {
         }
     }
 
-    /// `/tts [on | off | <engine> | test | config]`
+    /// `/tts [<engine> | install [engine] | test | config]`
+    ///
+    /// No `on` and no `off`. Read-aloud is one of the three reading modes, so
+    /// `shift+tab` and `/mode` own it; a switch here as well would be a second
+    /// control for the same fact, and the only interesting thing about two
+    /// controls for one fact is what happens when they disagree.
     fn tts_command(&mut self, arg: &str) {
+        if let Some(rest) = arg.strip_prefix("install") {
+            let name = rest.trim();
+            // "Install what?" is a question with a list for an answer, and the
+            // list already marks what is here and what is not.
+            if name.is_empty() {
+                self.open_select("tts");
+                return;
+            }
+            self.install_engine(name);
+            return;
+        }
         match arg {
-            "" => self.toggle_speech(),
-            "on" => {
-                if !self.cfg.tts.enabled {
-                    self.toggle_speech();
-                } else {
-                    let engine = self.speech_label();
-                    self.notice(&tf("tts.on", &[&engine]));
-                }
-            }
-            "off" => {
-                if self.cfg.tts.enabled {
-                    self.toggle_speech();
-                } else {
-                    self.notice(t("tts.off"));
-                }
-            }
+            // The question "which voice" has a list for an answer, and a list of
+            // answers is a select.
+            "" => self.open_select("tts"),
             "config" => {
                 let path = paths::display(&paths::config_file());
                 self.system(&tf("tts.config_at", &[&path]));
@@ -1683,19 +1905,13 @@ impl App {
             "list" | "engines" => {
                 self.system(&tf("tts.engines", &[&self.cfg.engine_names().join(", ")]));
             }
-            name if self.cfg.spec(name).is_some() => {
-                self.silence();
-                self.speaker = None;
-                self.cfg.tts.engine = name.to_string();
-                self.cfg.tts.enabled = true;
-                let _ = self.cfg.save();
-                if self.start_speaker() {
-                    let engine = self.speech_label();
-                    self.system(&tf("tts.engine_set", &[&engine]));
-                } else {
-                    self.cfg.tts.enabled = false;
-                }
+            // The words the old switch used to answer to. They are not engines,
+            // and telling someone "no such engine: on" teaches them nothing —
+            // name the key that does what they were reaching for.
+            "on" | "off" | "enable" | "disable" | "toggle" => {
+                self.system(t("tts.no_switch"));
             }
+            name if self.cfg.spec(name).is_some() => self.use_engine(name),
             other if other.starts_with('-') || other.starts_with('/') => {
                 self.system(t("tts.usage"));
             }
@@ -1706,24 +1922,251 @@ impl App {
         }
     }
 
+    // ── choosing and installing a voice ──────────────────────────────────────
+
+    /// Read with this engine from now on.
+    ///
+    /// Choosing a voice means wanting to hear it, so this enters read-aloud
+    /// through `set_mode` rather than flipping the speech switch behind its
+    /// back: one way into the mode, one place that checks the engine starts and
+    /// that the sound is allowed out.
+    fn use_engine(&mut self, name: &str) {
+        // An engine nobody has installed cannot be switched to, and the reader is
+        // one keypress from fixing that — so say which key.
+        let Some(spec) = self.cfg.spec(name) else {
+            return;
+        };
+        if !install::is_ready(spec) && !spec.pip.is_empty() {
+            self.notice(&tf("install.not_yet", &[&name, &name]));
+            return;
+        }
+        self.silence();
+        self.speaker = None;
+        self.cfg.tts.engine = name.to_string();
+        let _ = self.cfg.save();
+        if self.set_mode(ReadMode::Speak) {
+            let engine = self.speech_label();
+            self.system(&tf("tts.engine_set", &[&engine]));
+        }
+    }
+
+    /// Install the program behind one engine, then switch to it.
+    ///
+    /// readio ships no model and is not about to become a package manager. What
+    /// this does is the thing a reader would otherwise do by hand: find whichever
+    /// of `uv`, `pipx` and `pip` this machine has, install the distribution, and
+    /// fetch the voice file the engine does not ship. Every command is shown
+    /// before it runs and reports itself as it goes, so "install it for me" and
+    /// "tell me what you would run" are the same feature.
+    fn install_engine(&mut self, engine: &str) {
+        if let Some(running) = &self.installing {
+            self.notice(&tf("install.busy", &[&running.engine]));
+            return;
+        }
+        let Some(spec) = self.cfg.spec(engine).cloned() else {
+            let names = self.cfg.engine_names().join(", ");
+            self.notice(&tf("tts.unknown_engine", &[&engine, &names]));
+            return;
+        };
+        // What readio can do about this engine at all comes first. A server is
+        // not a package however healthy `curl` looks on this machine, and
+        // answering "already installed" for one would be taking credit for a
+        // fact nobody checked.
+        let plan = match install::plan(engine, &spec) {
+            Ok(plan) => plan,
+            Err(install::Blocked::NoRecipe { docs }) => {
+                // An engine somebody wrote themselves has nowhere to point.
+                if docs.is_empty() {
+                    self.system(&tf("install.no_recipe_bare", &[&engine]));
+                } else {
+                    self.system(&tf("install.no_recipe", &[&engine, &docs]));
+                }
+                return;
+            }
+            Err(install::Blocked::NoInstaller) => {
+                self.system(t("install.no_installer"));
+                return;
+            }
+        };
+        // Already here: switching to it is what the reader meant.
+        if install::is_ready(&spec) {
+            self.notice(&tf("install.already", &[&engine]));
+            self.tts_command(engine);
+            return;
+        }
+
+        self.sb.to_bottom();
+        self.system(&tf("install.starting", &[&engine, &plan.via]));
+        let block = self.begin_install_step(&plan, 0);
+        self.installing = Some(Install {
+            run: install::Running::start(plan),
+            engine: engine.to_string(),
+            block,
+            step: 0,
+            started: Instant::now(),
+        });
+    }
+
+    /// Open the tool call for one command of an install.
+    fn begin_install_step(&mut self, plan: &install::Plan, step: usize) -> u64 {
+        let Some(command) = plan.steps.get(step) else {
+            return 0;
+        };
+        let mut tool = Tool::new(Verb::Bash, command.line());
+        if plan.steps.len() > 1 {
+            tool = tool.detail(format!("{}/{}", step + 1, plan.steps.len()));
+        }
+        self.sb.push_running(Block::Tool(tool))
+    }
+
+    /// Drain the installer: output into the open tool call, and each finished
+    /// command into the next one.
+    fn pump_install(&mut self) {
+        // Taken out of the app for the duration, so the worker and the
+        // scrollback are not both borrowed from `self` at once.
+        let Some(mut install) = self.installing.take() else {
+            return;
+        };
+        for event in install.run.poll() {
+            match event {
+                install::Progress::Line(line) => {
+                    self.sb.push_output(install.block, line);
+                }
+                install::Progress::Step { step, ok } => {
+                    let ms = install.started.elapsed().as_millis() as u64;
+                    if ok {
+                        self.sb.finish(install.block, Some(ms));
+                        if step + 1 < install.run.plan.steps.len() {
+                            install.block = self.begin_install_step(&install.run.plan, step + 1);
+                            install.step = step + 1;
+                            install.started = Instant::now();
+                        }
+                    } else {
+                        self.sb
+                            .fail_tool(install.block, t("install.step_failed").to_string());
+                    }
+                }
+                install::Progress::Done { ok, ms } => {
+                    if ok {
+                        self.adopt_engine(&install.engine, ms);
+                    } else {
+                        let docs = self
+                            .cfg
+                            .spec(&install.engine)
+                            .map(|spec| spec.docs.clone())
+                            .unwrap_or_default();
+                        self.system(&tf("install.failed", &[&install.engine, &docs]));
+                    }
+                }
+            }
+        }
+        if !install.run.finished {
+            self.installing = Some(install);
+        }
+    }
+
+    /// An engine that just landed becomes the engine in use: nobody installs a
+    /// voice in order to go on reading in silence.
+    fn adopt_engine(&mut self, engine: &str, ms: u64) {
+        self.pin_program(engine);
+        self.silence();
+        self.speaker = None;
+        self.cfg.tts.engine = engine.to_string();
+        let _ = self.cfg.save();
+        let seconds = format!("{:.0}", ms as f64 / 1000.0);
+        // Through the mode, like every other way into read-aloud: an install
+        // that ended in speech nobody can hear because the output is muted is
+        // still worth saying out loud.
+        if self.set_mode(ReadMode::Speak) {
+            let label = self.speech_label();
+            self.system(&tf("install.done", &[&engine, &seconds, &label]));
+        }
+    }
+
+    /// Record where the program actually landed.
+    ///
+    /// `uv` and `pipx` install into `~/.local/bin`, which is on the PATH of the
+    /// shell that set them up but not necessarily on the one readio inherited —
+    /// and an install that ends in "command not found" is not an install. If the
+    /// program is somewhere findable, the engine's command line is rewritten to
+    /// point straight at it, which beats asking a reader to edit their shell
+    /// profile and start over.
+    fn pin_program(&mut self, engine: &str) {
+        let Some(spec) = self.cfg.spec(engine) else {
+            return;
+        };
+        let program = install::program_of(spec);
+        if program.is_empty() || program.contains('/') || install::which(&program).is_some() {
+            return;
+        }
+        let Some(found) = install::locate(&program) else {
+            return;
+        };
+        let path = found.to_string_lossy().into_owned();
+        // A home directory with a space in it is an ordinary thing on macOS, and
+        // the command line is split with shell-like quoting, so quote it.
+        let path = if path.contains(' ') {
+            format!("\"{path}\"")
+        } else {
+            path
+        };
+        if let Some(spec) = self.cfg.tts.engines.get_mut(engine) {
+            spec.synth = spec.synth.replacen(&program, &path, 1);
+        }
+    }
+
     /// `/voice <name>` — engines name their voices differently, so this is free
     /// text handed straight to the engine.
     fn voice_command(&mut self, arg: &str) {
+        // "Which voice" is a question with a list for an answer, and the list is
+        // the only place `auto` is written down.
         if arg.is_empty() {
-            self.system(t("tts.usage_voice"));
+            self.open_select("voice");
             return;
         }
-        self.cfg.tts.voice = arg.to_string();
+        let known = self
+            .cfg
+            .active_engine()
+            .is_some_and(|spec| spec.languages.contains_key(arg));
+        let said = match arg {
+            // Back to letting the passage decide. Both settings are cleared,
+            // because a pinned voice would go on overruling the language.
+            "auto" => {
+                self.cfg.tts.voice.clear();
+                self.cfg.tts.language = "auto".to_string();
+                t("tts.voice_auto").to_string()
+            }
+            // A language readio has an entry for pins the language, not the
+            // voice: the voice that belongs to it is recorded beside it.
+            code if known => {
+                self.cfg.tts.voice.clear();
+                self.cfg.tts.language = code.to_string();
+                let voice = self
+                    .cfg
+                    .active_engine()
+                    .and_then(|spec| spec.languages.get(code))
+                    .map(|entry| entry.voice.clone())
+                    .unwrap_or_default();
+                tf(
+                    "tts.voice_language_set",
+                    &[&menu::language_name(code), &voice],
+                )
+            }
+            name => {
+                self.cfg.tts.voice = name.to_string();
+                tf("tts.voice_set", &[&name])
+            }
+        };
         let _ = self.cfg.save();
         self.silence();
         self.speaker = None;
-        self.system(&tf("tts.voice_set", &[&arg]));
+        self.system(&said);
     }
 
     /// `/effort [minimal|low|medium|high|xhigh|max]`
     fn effort_command(&mut self, arg: &str) {
         if arg.is_empty() {
-            self.effort_report();
+            self.open_select("effort");
             return;
         }
         match Effort::parse(arg) {
@@ -1740,7 +2183,9 @@ impl App {
     /// makes their slow gear their own.
     fn rate_command(&mut self, arg: &str) {
         if arg.is_empty() {
-            self.effort_report();
+            // The select already shows every level with the multiplier behind it,
+            // so printing the same ladder above it says everything twice.
+            self.open_select("effort");
             return;
         }
         match arg.trim_end_matches(['x', 'X', '×']).parse::<f32>() {
@@ -1887,13 +2332,13 @@ impl App {
             return;
         }
         if arg.trim().is_empty() {
-            let steps = flow::marks(book, &marks);
-            self.turn.enqueue(steps);
+            self.refresh_marks();
+            self.open_select("marks");
             return;
         }
         match arg.trim().parse::<usize>() {
             Ok(n) if n >= 1 && n <= marks.len() => self.goto_mark(&marks[n - 1].clone(), n),
-            _ => self.system(&tf("cmd.mark_no_such", &[&marks.len()])),
+            _ => self.notice(&tf("cmd.mark_no_such", &[&marks.len()])),
         }
     }
 
@@ -2101,8 +2546,16 @@ impl App {
         }
     }
 
+    /// "No book is open" — and then the means to open one.
+    ///
+    /// The message tells the reader to type a number, so the numbered list has to
+    /// be in front of them. Saying "type a number" over an empty screen is how a
+    /// dead end is made.
     fn no_book(&mut self) {
         self.system(t("cmd.no_book"));
+        if !self.library.is_empty() {
+            self.open_select("open");
+        }
     }
 
     fn system(&mut self, text: &str) {
@@ -2113,6 +2566,8 @@ impl App {
         self.notice = Some((text.to_string(), Instant::now()));
     }
 
+    /// Write the position, then bring the two selects' caches with it: the book
+    /// list shows progress and the marks list belongs to the open book.
     pub fn save_progress(&mut self) {
         let Some(book) = self.book.as_ref() else {
             return;

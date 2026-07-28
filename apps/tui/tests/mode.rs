@@ -92,7 +92,7 @@ fn a_fresh_reader_is_in_manual_mode() {
 
     assert_eq!(app.mode(), Mode::Manual);
     assert!(
-        view.contains("逐段"),
+        view.contains("手动"),
         "the chip should name the mode:\n{view}"
     );
 }

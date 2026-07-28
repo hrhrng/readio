@@ -113,7 +113,7 @@ pub const WARNING: &str = "⚠";
 /// terminal feels like putting it.
 ///
 /// There is deliberately no glyph for "read-aloud is on": a musical note in the
-/// chrome would announce a media player, and the chip says `⏵⏵ voice` instead.
+/// chrome would announce a media player, and the chip says `⏵⏵ aloud` instead.
 pub const NOTE_MUTED: &str = "⊘";
 pub const ELLIPSIS: &str = "…";
 

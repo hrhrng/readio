@@ -42,6 +42,9 @@ pub enum Verb {
     ListDir,
     Locate,
     Write,
+    /// A command run on the machine. The only verb behind which something real
+    /// happens: installing a speech engine.
+    Bash,
 }
 
 impl Verb {
@@ -52,6 +55,7 @@ impl Verb {
             Verb::ListDir => "ListDir",
             Verb::Locate => "Locate",
             Verb::Write => "Write",
+            Verb::Bash => "Bash",
         }
     }
 }
@@ -161,6 +165,10 @@ impl Highlight {
 /// Shown inside the frame when an illustration cannot be drawn.
 pub const PLACEHOLDER_LABEL: &str = "⛶";
 
+/// Lines of live output a tool call keeps. Six, because that is what a folded
+/// tool block shows: keeping more would hide the newest ones behind a "+2 more"
+/// nobody can expand while it is still moving.
+const TOOL_TAIL: usize = 6;
 /// Lines a picture block spends before its first row of pixels: one blank
 /// separator and one caption.
 pub const IMAGE_HEADER_LINES: u16 = 2;
@@ -206,20 +214,6 @@ pub struct ContextInfo {
 }
 
 #[derive(Debug, Clone)]
-pub struct LibraryRow {
-    pub index: usize,
-    pub title: String,
-    pub author: Option<String>,
-    pub chars: usize,
-    pub progress: f32,
-    pub mode: &'static str,
-    /// Currently open book.
-    pub current: bool,
-    /// The file behind the entry is gone.
-    pub missing: bool,
-}
-
-#[derive(Debug, Clone)]
 pub enum Block {
     User(String),
     Thinking {
@@ -261,11 +255,6 @@ pub enum Block {
         dims: Option<(u32, u32)>,
         /// Tallest the picture may be drawn, from `config.yaml`.
         max_rows: u16,
-    },
-    /// The imported-books listing.
-    Library {
-        rows: Vec<LibraryRow>,
-        hint: String,
     },
 }
 
@@ -390,6 +379,33 @@ impl Block {
         }
     }
 
+    /// Add a line of live output to a tool call, keeping only the tail.
+    ///
+    /// An install prints hundreds of lines and the only ones worth screen space
+    /// are the last few, which say where it has got to. Keeping the tail also
+    /// keeps the block a fixed size, so a download does not push the book off
+    /// the screen.
+    pub fn push_output(&mut self, line: String) -> bool {
+        let Block::Tool(tool) = self else {
+            return false;
+        };
+        tool.body.push(line);
+        if tool.body.len() > TOOL_TAIL {
+            let drop = tool.body.len() - TOOL_TAIL;
+            tool.body.drain(..drop);
+        }
+        true
+    }
+
+    /// Turn a running tool call red, with the reason on the header.
+    pub fn fail_tool(&mut self, message: String) -> bool {
+        let Block::Tool(tool) = self else {
+            return false;
+        };
+        tool.status = ToolStatus::Failed { message };
+        true
+    }
+
     pub fn render(&self, ctx: &Ctx) -> Vec<Line<'static>> {
         match self {
             Block::User(text) => render_user(text, ctx),
@@ -414,7 +430,6 @@ impl Block {
                 dims,
                 max_rows,
             } => render_image(path, alt, *dims, *max_rows, ctx),
-            Block::Library { rows, hint } => render_library(rows, hint, ctx),
         }
     }
 }
@@ -1062,93 +1077,6 @@ fn render_image(
             for _ in 0..3 {
                 out.push(Line::from(""));
             }
-        }
-    }
-    out
-}
-
-fn render_library(rows: &[LibraryRow], hint: &str, ctx: &Ctx) -> Vec<Line<'static>> {
-    let th = theme();
-    let mut out = vec![
-        Line::from(""),
-        Line::from(vec![
-            gutter("◈", th.accent_model),
-            Span::styled(
-                tf("lib.title", &[&rows.len()]),
-                Style::default().fg(th.accent_model).bold(),
-            ),
-        ]),
-    ];
-
-    if rows.is_empty() {
-        out.push(Line::from(vec![
-            indent(),
-            Span::styled(
-                t("lib.empty").to_string(),
-                Style::default().fg(th.text_muted),
-            ),
-        ]));
-    }
-
-    for row in rows {
-        let (glyph, glyph_color) = if row.missing {
-            (theme::CROSS, th.accent_error)
-        } else if row.current {
-            (theme::ARROW, th.accent_plan)
-        } else if row.progress >= 0.999 {
-            (theme::CHECK, th.text_muted)
-        } else {
-            (theme::BULLET_OPEN, th.text_faint)
-        };
-
-        let meta = format!(
-            "  {:>8}  {:>4}  {}",
-            format!(
-                "{} tok",
-                metrics::format_tokens(metrics::tokens_from_chars(row.chars))
-            ),
-            format!("{:.0}%", row.progress * 100.0),
-            row.mode
-        );
-        let mut label = format!("{:>2}. {}", row.index, row.title);
-        if let Some(author) = &row.author {
-            label.push_str(&format!("  {author}"));
-        }
-        let room = ctx
-            .body_width()
-            .saturating_sub(display_width(&meta) + 4)
-            .max(10);
-        // Pad to a fixed column so the size / progress / mode columns line up
-        // across rows whose titles differ in width.
-        let mut label = truncate(&label, room);
-        let pad = room.saturating_sub(display_width(&label));
-        label.push_str(&" ".repeat(pad));
-
-        let title_style = if row.missing {
-            Style::default().fg(th.text_faint)
-        } else if row.current {
-            Style::default()
-                .fg(th.text_primary)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(th.text_secondary)
-        };
-
-        out.push(Line::from(vec![
-            indent(),
-            Span::styled(format!("{glyph} "), Style::default().fg(glyph_color)),
-            Span::styled(label, title_style),
-            Span::styled(meta, Style::default().fg(th.text_faint)),
-        ]));
-    }
-
-    if !hint.is_empty() {
-        out.push(Line::from(""));
-        for line in wrap(hint, ctx.body_width()) {
-            out.push(Line::from(vec![
-                indent(),
-                Span::styled(line, Style::default().fg(th.text_muted)),
-            ]));
         }
     }
     out

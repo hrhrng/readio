@@ -167,6 +167,12 @@ mod tests {
 
     #[test]
     fn the_chip_stays_short_enough_to_share_a_row() {
+        // The language is global, so this takes the same lock every other test
+        // that switches it takes — and puts it back afterwards. Without that, a
+        // test asserting on English output fails whenever this one happens to be
+        // running beside it.
+        let _guard = crate::i18n::exclusive();
+        let before = crate::i18n::current();
         for lang in [crate::i18n::Lang::En, crate::i18n::Lang::Zh] {
             crate::i18n::set(lang);
             for mode in [Mode::Manual, Mode::Auto, Mode::Speak] {
@@ -176,7 +182,18 @@ mod tests {
                     "{chip:?} is too wide for the status row"
                 );
                 assert!(!chip.contains('♪'), "no musical notes in an agent's chrome");
+                // The chip is a piece of the mode's own name, never a second word
+                // for the same thing: a status row reading "voice" beside a
+                // sentence about "read-aloud" makes a reader go looking for two
+                // features. This catches a rename that lands in only one place.
+                let name = mode.name().to_lowercase();
+                let short = chip.split_whitespace().next_back().unwrap_or("");
+                assert!(
+                    !short.is_empty() && name.contains(short),
+                    "chip {short:?} is not part of the mode name {name:?}"
+                );
             }
         }
+        crate::i18n::set(before);
     }
 }

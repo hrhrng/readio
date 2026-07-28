@@ -284,11 +284,7 @@ mod amount_tests {
     use super::*;
     use crate::i18n::{self, Lang};
 
-    /// The tests share one global language, so they take turns.
-    fn exclusive() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
+    use crate::i18n::exclusive;
 
     #[test]
     fn latin_words_come_from_word_boundaries() {

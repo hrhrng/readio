@@ -76,6 +76,14 @@ pub struct Tts {
     pub engine: String,
     /// Overrides the engine's own default voice when non-empty.
     pub voice: String,
+    /// Which language to read in: `auto`, or a key of the engine's `languages`
+    /// table — `zh`, `en`.
+    ///
+    /// `auto` looks at the sentence, which is what a shelf holding books in two
+    /// languages needs. Naming one pins it, for a reader whose book is in a
+    /// language the guess gets wrong, or who simply wants every page read in
+    /// the same voice.
+    pub language: String,
     /// How many sentences to synthesize ahead of playback.
     pub prefetch: usize,
     /// Which audio outputs may be spoken through.
@@ -107,6 +115,7 @@ impl Default for Tts {
             enabled: false,
             engine: "kokoro".to_string(),
             voice: String::new(),
+            language: "auto".to_string(),
             prefetch: 2,
             output: Output::default(),
             engines: presets(),
@@ -131,10 +140,13 @@ impl Config {
         };
         match serde_yaml_ng::from_str::<Self>(&raw) {
             Ok(mut config) => {
-                // Presets fill gaps, so a config written by an older readio
-                // still knows about engines added since.
-                for (name, spec) in presets() {
-                    config.tts.engines.entry(name).or_insert(spec);
+                // A saved config is the reader's settings, not a snapshot of
+                // what readio knew when it was written: engines added since
+                // appear, and the parts of an engine that describe its package
+                // rather than the reader's taste follow the binary. Written back
+                // straight away, so the file says what is actually in force.
+                if crate::tts::config::reconcile(&mut config.tts.engines) {
+                    let _ = config.save();
                 }
                 config.clamp();
                 (config, None)
@@ -234,6 +246,7 @@ impl Config {
              \x20 enabled: {tts}\n\
              \x20 engine: {engine}\n\
              \x20 voice: \"{voice}\"\n\
+             \x20 language: {tts_lang}\n\
              \x20 prefetch: {prefetch}\n\
              {OUTPUT_NOTE}\
              \x20 output:\n\
@@ -259,6 +272,7 @@ impl Config {
             tts = self.tts.enabled,
             engine = self.tts.engine,
             voice = self.tts.voice,
+            tts_lang = self.tts.language,
             prefetch = self.tts.prefetch,
             allow = if self.tts.output.allow.is_empty() {
                 " []".to_string()
@@ -335,7 +349,12 @@ const IMAGES_NOTE: &str =
 const TTS_NOTE: &str = "  # readio ships no model: it drives whatever engine you installed, so
   # switching models is an edit here rather than a new release.
   # readio 自己不带模型，只调用你装好的引擎，所以换模型就是改这里。
-  # an empty voice means the engine default / voice 留空就用引擎默认音色
+  # an empty voice lets readio pick one per language, from the table below
+  # voice 留空，readio 就按每段文字的语种挑音色
+  # language: auto reads each sentence in the language it is written in, and
+  # picks the matching voice from the engine's `languages` table below. Pin it
+  # to zh or en if you would rather every page sounded the same.
+  # language: auto 按每句话本身的语种朗读，音色也跟着换；想固定就写 zh 或 en。
   # rate is the playback speed, 0.5 to 3.0; ^r cycles 0.75× 1× 1.25× 1.5× 2×
   # rate 是朗读倍速（0.5~3.0）；^r 在 0.75× 1× 1.25× 1.5× 2× 之间循环
   # prefetch: sentences rendered ahead of the one playing, so there is no gap
@@ -359,7 +378,12 @@ const OUTPUT_NOTE: &str =
 const ENGINES_NOTE: &str = "  # placeholders / 占位符:
   #   {text} the sentence · {out} the wav to write · {voice} · {rate}
   #   {model} model path · {json} OpenAI-compatible body · {file} clip to play
+  #   {lang} the language entry below, spliced whole: flag and value
   # stdin: true feeds the sentence on stdin instead of as an argument (piper)
+  #
+  # languages: what changes when the page changes language. `lang` holds the
+  # flag *and* its value, so an engine that spells it another way still works,
+  # and an empty one passes nothing at all / 换语种时跟着换的音色与参数。
   #
   # your own engine / 自己的引擎:
   #   mine:
@@ -440,17 +464,135 @@ mod tests {
     fn a_hand_added_engine_survives_the_preset_merge() {
         let raw = "tts:\n  engine: mine\n  engines:\n    mine:\n      synth: my-tts {text} {out}\n      play: afplay {file}\n";
         let mut config: Config = serde_yaml_ng::from_str(raw).expect("parse");
-        for (name, spec) in presets() {
-            config.tts.engines.entry(name).or_insert(spec);
-        }
+        crate::tts::config::reconcile(&mut config.tts.engines);
         assert!(
             config.active_engine().is_some(),
             "the reader's own engine must not be replaced by a preset"
+        );
+        assert_eq!(
+            config.tts.engines["mine"].synth, "my-tts {text} {out}",
+            "and it must survive intact"
         );
         assert!(
             config.engine_names().len() > 1,
             "presets fill in around it: {:?}",
             config.engine_names()
+        );
+    }
+
+    /// The bug this exists to prevent: a config written by an older readio
+    /// froze every engine at the definition that build shipped. The fields that
+    /// say how to install an engine had not been invented yet, so an upgraded
+    /// machine showed every engine as "a server, nothing to install" — and the
+    /// command lines, none of which matched the engines' real CLIs, stayed
+    /// broken forever.
+    #[test]
+    fn a_config_from_an_older_readio_catches_up_with_the_binary() {
+        let raw = "\
+tts:
+  engine: kokoro
+  engines:
+    kokoro:
+      synth: kokoro-tts --text {text} --output {out} --voice {voice} --speed {rate}
+      play: afplay {file}
+      voice: my_own_voice
+      about: 老版本写下的说明
+    mine:
+      synth: my-tts {text} {out}
+      play: afplay {file}
+";
+        let mut config: Config = serde_yaml_ng::from_str(raw).expect("parse");
+        assert!(config.tts.engines["kokoro"].pip.is_empty(), "as saved");
+
+        assert!(
+            crate::tts::config::reconcile(&mut config.tts.engines),
+            "something changed, so the file should be written back"
+        );
+
+        let kokoro = &config.tts.engines["kokoro"];
+        assert_eq!(
+            kokoro.synth,
+            crate::tts::config::presets()["kokoro"].synth,
+            "a command readio shipped and later corrected is replaced"
+        );
+        assert!(!kokoro.pip.is_empty(), "and it knows how to install itself");
+        assert_eq!(
+            kokoro.voice, "my_own_voice",
+            "but a voice they chose is still a choice"
+        );
+        assert_eq!(
+            config.tts.engines["mine"].synth, "my-tts {text} {out}",
+            "while an engine the reader wrote is left alone"
+        );
+    }
+
+    /// The other half of the rule: a reader who changed a preset's command line
+    /// keeps it. Only the parts that describe the package catch up.
+    #[test]
+    fn a_reader_who_edited_a_preset_keeps_their_edit() {
+        let raw = "\
+tts:
+  engines:
+    piper:
+      synth: piper --model /opt/voices/mine.onnx --output-file {out}
+      play: aplay {file}
+      model: /opt/voices/mine.onnx
+      stdin: true
+";
+        let mut config: Config = serde_yaml_ng::from_str(raw).expect("parse");
+        crate::tts::config::reconcile(&mut config.tts.engines);
+
+        let piper = &config.tts.engines["piper"];
+        assert_eq!(
+            piper.synth, "piper --model /opt/voices/mine.onnx --output-file {out}",
+            "their line is their line"
+        );
+        assert_eq!(piper.play, "aplay {file}", "and so is their player");
+        assert_eq!(piper.model, "/opt/voices/mine.onnx", "and their model");
+        assert_eq!(piper.pip, "piper-tts", "but readio still knows the package");
+        assert!(
+            piper.fetch.is_empty(),
+            "and does not insist on a voice file it chose for them"
+        );
+    }
+
+    /// The command line that shipped in beta.3 ran, which is why it is easy to
+    /// miss that it ran wrong: `--lang` was never passed, so Kokoro read every
+    /// Chinese page with English phonemes. Anyone who used that build has the
+    /// line saved, and an upgrade has to repair it.
+    #[test]
+    fn a_config_that_predates_the_language_table_learns_to_read_chinese() {
+        let raw = "\
+tts:
+  engine: kokoro
+  engines:
+    kokoro:
+      synth: kokoro-tts - {out} --voice {voice} --speed {rate} --format wav --model ~/.readio/voices/kokoro-v1.0.onnx --voices ~/.readio/voices/voices-v1.0.bin {extra}
+      play: afplay {file}
+      voice: zf_xiaobei
+      stdin: true
+";
+        let mut config: Config = serde_yaml_ng::from_str(raw).expect("parse");
+        assert!(
+            config.tts.engines["kokoro"].languages.is_empty(),
+            "as saved"
+        );
+
+        assert!(crate::tts::config::reconcile(&mut config.tts.engines));
+
+        let kokoro = &config.tts.engines["kokoro"];
+        assert!(
+            kokoro.synth.contains("{lang}"),
+            "the corrected line has somewhere to put the language: {}",
+            kokoro.synth
+        );
+        assert_eq!(
+            kokoro.languages["zh"].lang, "--lang cmn",
+            "and knows what to put there for Chinese"
+        );
+        assert_eq!(
+            kokoro.voice, "zf_xiaobei",
+            "the voice they were reading with is still theirs"
         );
     }
 

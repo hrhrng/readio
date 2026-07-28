@@ -16,18 +16,19 @@ Every other rule in this document is downstream of that one. Where reader comfor
 | Loading the next passage | a `Read` tool call with a real file and line range | `● Read epub://…/index_split_002.html  L1-17` |
 | Full-text search | a `Grep` call with a real match count | `● Grep pattern: memory · 45 matches` |
 | Saving a bookmark or position | a `Write` call | `● Write ~/.readio/state.json` |
+| Installing a speech engine | a `Bash` call — and this one is real | `● Bash uv tool install kokoro-tts  ·  24.8s` |
 | Characters | tokens | `1.2k tok` |
 | Progress through the book | context window used | `ctx 41.8%` |
 | Chapters | a plan, with ticks | `/plan` |
 | Time since launch | session clock | `12:03` |
-| Paused | `thinking…` | status row |
+| An interrupted turn | a turn the user stopped | `❙ 已中断` above the prompt |
 | Reading pace | **reasoning effort** | `readio-1 (high)` |
 | Unattended reading | the mode `shift+tab` cycles | `⏵⏵ auto` |
 | Latin words inside Chinese prose | identifiers, tinted | body text |
 
 Two things are deliberately *not* disguised: the book's own words, and any number a reader might act on. A fake line range would make the costume a lie the moment someone opened the file.
 
-There is no musical note anywhere. A `♪` in the corner announces a media player, which is the one thing the interface must never look like; read-aloud is `⏵⏵ voice` and the engine name appears where a model name would.
+There is no musical note anywhere. A `♪` in the corner announces a media player, which is the one thing the interface must never look like; read-aloud is `⏵⏵ aloud` and the engine name appears where a model name would.
 
 ## Screen anatomy
 
@@ -41,9 +42,9 @@ There is no musical note anywhere. A `♪` in the corner announces a media playe
  ❯ /effort <level>   推理强度，其实就是读得多快多慢                               ← menu (only when /)
    …                                                                            
 ╭──────────────────────────────────────────────────────────────────────╮        
-│❯ 回车继续读，/ 看命令，esc 暂停                                       │        ← prompt
+│❯ 回车继续读，/ 看命令，esc 中断                                       │        ← prompt
 ╰──────────────────────────────────────────────────────────────────────╯        
-  ⏎ 继续  ·  shift+tab 换模式  ·  /help 更多     ⏵ 逐段  ⸬ readio-1 (high)  74 tok  ·  0:10
+  ⏎ 继续  ·  shift+tab 换模式  ·  /help 更多     ⏵ 手动  ⸬ readio-1 (high)  74 tok  ·  0:10
   ↑ what to do next                              ↑ mode   ↑ model + effort   ↑ session
 ```
 
@@ -55,18 +56,19 @@ Three, because a reader is doing one of three things.
 
 | Mode | Chip | What advances the text |
 | --- | --- | --- |
-| Manual | `⏵ step` | `⏎`, or `↓` `pgdn` wheel once at the bottom |
+| Manual | `⏵ manual` | `⏎`, or `↓` `pgdn` wheel once at the bottom |
 | Auto-scroll | `⏵⏵ auto` | nothing — passages follow one another |
-| Read-aloud | `⏵⏵ voice` | the voice, which brings its own scrolling |
+| Read-aloud | `⏵⏵ aloud` | the voice, which brings its own scrolling |
 
 `shift+tab` cycles them, which is the gesture a coding agent uses for exactly this kind of switch. `/mode` says the same thing in words, and the second level of its menu offers the three with the current one marked.
 
 Rules that follow from calling it a mode:
 
-- **A mode is a setting, not a consequence.** `esc` pauses, `esc` again stops the turn; neither demotes auto-scroll to manual.
+- **A mode is a setting, not a consequence.** `esc` interrupts the turn and `⏎` picks it back up; neither demotes auto-scroll to manual.
 - **Read-aloud implies auto-scroll.** Turning the voice off lands in auto-scroll, not manual — silence is all the reader asked for.
 - **A mode that cannot work is skipped, not entered.** No speech engine means `shift+tab` steps past read-aloud, having said why once.
 - **A mode explains itself the first time and flashes afterwards.** Cycling should not reprint a paragraph.
+- **The voice follows the page, not the session.** Which language a sentence is in is read off the sentence, and the engine is given the matching voice and phonemes; a bilingual chapter switches mid-page with nothing to set. A reader who wants one voice throughout pins `tts.language`.
 
 ## Pace, as reasoning effort
 
@@ -83,38 +85,94 @@ Six levels, the six a coding agent offers, and the honest consequence of asking 
 
 One multiplier drives both worlds: text appears at `reading.speed × multiplier`, and read-aloud plays at the multiplier itself. So a level means the same thing whether the book is being typed out or spoken, and `^r` is one key that always means "change how fast I am reading".
 
-The numbers belong to the reader. All six live under `effort.multipliers` in `~/.readio/config.yaml`, `/rate <0.5-3.0>` retunes the level in force without opening the file, and `/speed <n>` moves the base the multipliers scale. `/effort` with no argument prints the whole ladder with the active level marked, which is the one place the honest numbers and the costume sit side by side.
+The numbers belong to the reader. All six live under `effort.multipliers` in `~/.readio/config.yaml`, `/rate <0.5-3.0>` retunes the level in force without opening the file, and `/speed <n>` moves the base the multipliers scale. `/effort` with no argument opens the ladder as a select, with each level's multiplier beside it and the one in force marked — the one place the honest numbers and the costume sit side by side.
+
+## Where things are shown
+
+Two surfaces, and a rule about which gets what.
+
+**The transcript carries the book, and what happened to it.** Passages, chapter completions, the reading plan, search results, the writes to `state.json`, and an interrupted turn. It is a record of reading, and it is the part a reader scrolls back through.
+
+**Everything else lives on the composer and the surfaces above it.** Which book, which chapter, which bookmark, which effort level, which mode, which engine, which file to import — all of these are *questions*, and a question belongs next to the place you answer it, not in the log of what you have read.
+
+This is why there are no numbered listings any more. Printing sixteen books into the transcript and asking the reader to type `7` back at it is a listing pretending to be a control: it costs a screenful, it goes stale the moment anything changes, and it cannot be navigated. The select above the composer is the control.
+
+```
+ ❯ 1. 看不见的城市 （上次在读）  卡尔维诺  ·  6.4万字  ·  37%
+   2. 树上的男爵                卡尔维诺  ·  9.1万字  ·   0%
+   3. 寒冬夜行人                卡尔维诺  ·  8.7万字  ·  12%
+
+   打开《看不见的城市》，回到上次停下的地方（已读 37%，copy 方式持有）
+   例：  /open 1
+   ↑↓ 选  ·  ⏎ 确定  ·  直接打字筛选  ·  esc 取消  ·  筛选：卡尔
+```
+
+Two rules keep it usable:
+
+- **A select never touches what the reader was typing.** It has its own narrowing text, echoed on its own hint line. Opening one used to write `/effort ` into the composer and read the rows back out of it, which put a command the reader never typed on the line under their cursor.
+- **A slash always begins a command.** The library select is open the moment readio starts, so the first thing anyone ever types would otherwise be swallowed by a filter. `/` closes the select and starts a command, in every state.
+
+A path is the exception that proves the rule: `/import` leaves it in the composer. A path is text — the reader may want to edit it, and it takes a `--copy` or `--link` after it — so the filesystem is offered as menu rows that complete into the line, directories first, and only the formats readio can open. `⏎` on a directory walks in; `⏎` on a file imports it.
 
 ## The command menu
 
 Two levels, because a value is as hard to remember as a command.
 
 1. `/` and a partial name → commands, filtered by prefix first and then by containment, each with a one-line description.
-2. `/name ` for a command with a fixed set of answers — `/effort`, `/mode`, `/lang`, `/tts` — → those answers, each with what it means, and `(active)` on the one in force.
+2. `/name ` for a command with a fixed set of answers — `/effort`, `/mode`, `/lang`, `/tts` — → those answers, each with what it means, and `(active)` on the one in force. For a command whose answers are the reader's own things — `/open`, `/toc`, `/marks` — the answers are their books, chapters and bookmarks. For `/import` they are files and directories, read from disk.
 
-Anything else after a command name closes the menu: a path, a chapter number and a search term have nothing to suggest, and a menu in the way of typing one is worse than no menu.
+A row is allowed to know things about the machine, and the speech engines are where that matters. `/tts` checks whether each engine's program is actually there — and, for an engine whose voice is a separate download, whether that file is there too — so a row reads `⏎ reads with it` or `⏎ installs it`, and points `⏎` at the command that matches what it says. Nobody has to find out that an engine is missing by choosing it and hearing nothing.
+
+That menu also shows where the line between a command and a mode is drawn. `/tts` has no on and no off: read-aloud is one of the three reading modes, `shift+tab` cycles them, and two controls for one fact are interesting only in the state where they disagree.
+
+A chapter number or a search term suggests nothing: there is nothing to suggest, and a menu in the way of typing one is worse than no menu.
 
 Under the list, the highlighted row is explained in full and shown in use. That panel is where `--copy` versus `--link` versus `--move` gets settled, and it is sized before the list is: a short terminal loses rows, never the explanation.
 
-`↑` `↓` choose, `tab` completes, `⏎` runs — or completes, when the command cannot run without an argument. The bracket in the argument shape decides: `<n>` completes, `[n]` runs.
+`↑` `↓` choose, `tab` completes, `⏎` runs — or completes, when the command cannot run without an argument. The bracket in the argument shape decides: `<n>` completes, `[n]` runs. In a select there is nothing to complete, so `tab` and `⏎` both confirm, and typing narrows instead of reaching the composer.
+
+## Interruption
+
+`esc` stops the turn. One press, one meaning, and the screen says what happened:
+
+```
+ ● Read epub://看不见的城市/index_split_002.html  L1-17  ·  0.4s
+   城市与记忆之三 —— 城市不会讲述它的过去，而是像手纹一样
+
+ ❙ 已中断
+╭──────────────────────────────────────────────────────────────────────╮
+│❯ 回车继续读，/ 看命令，esc 中断                                       │
+╰──────────────────────────────────────────────────────────────────────╯
+  ⏎ 继续                                        ⏵⏵ 自动  ⸬ readio-1 (high)  74 tok  ·  0:10
+```
+
+The strip sits directly above the composer, where a coding agent puts what it is doing, and it carries no spinner: a spinner means work is happening, and the point of this state is that none is. The place is kept exactly — mid-sentence, mid-passage — and `⏎` carries on from there rather than starting the passage again.
+
+This used to escalate. One press paused, a second abandoned the turn, and the same key therefore did two different things a second apart; the reader had to know which one they were about to get, and the pause was disguised as `thinking…`, which reads as *the machine is busy* rather than *you stopped it*. Now `esc` only interrupts, `⏎` continues, and `^c` — the key that has meant this in every terminal for forty years — is what throws the turn away.
+
+The two outcomes are worded apart, because a transcript that calls both of them "中断" cannot be read back later. `esc` puts `已中断` on the strip above the prompt, where it stays until the reader deals with it; `^c` writes `✗ 这一轮已取消` into the transcript, which is where things that have finished happening go.
 
 ## Keys, by state
 
 The same key may mean different things in different states, but never two things in the same state. This table is the whole input grammar.
 
-| Key | Menu open | Streaming | Paused | Idle with a book | Library |
-| --- | --- | --- | --- | --- | --- |
-| `⏎` | run or complete the row | rush this turn to its end | resume where it stopped | load the next passage | open the last book |
-| `esc` | close the menu | pause | stop the turn | clear the prompt, else to the tail | as idle |
-| `↑` `↓` | move the selection | scroll | scroll | scroll; `↓` at the tail loads more in manual mode | scroll |
-| `tab` | complete the row | — | — | — | — |
-| `shift+tab` | cycle the mode | cycle the mode | cycle the mode | cycle the mode | cycle the mode |
-| `/` | filter further | — | — | open the menu | open the menu |
-| digits | filter | — | — | jump to a search hit | open that book |
-| other text | filter | — | — | nothing, with a hint | nothing, with a hint |
-| `^r` | next effort level | next effort level | next effort level | next effort level | next effort level |
-| `^s` | — | read-aloud on or off | same | same | same |
-| `^c` | clear | interrupt | interrupt | clear, then quit on the second press | same |
+| Key | Menu open | Select open | Streaming | Interrupted | Idle with a book | Library |
+| --- | --- | --- | --- | --- | --- | --- |
+| `⏎` | run or complete the row | confirm the row | rush this turn to its end | carry on where it stopped | load the next passage | open the last book |
+| `esc` | close the menu | cancel the question | interrupt the turn | — | clear the prompt, else to the tail | as idle |
+| `↑` `↓` | move the selection | move the selection | scroll | scroll | scroll; `↓` at the tail loads more in manual mode | scroll |
+| `tab` | complete the row | confirm the row | — | — | — | — |
+| `shift+tab` | cycle the mode | cycle the mode | cycle the mode | cycle the mode | cycle the mode | cycle the mode |
+| `/` | filter further | close it, start a command | — | — | open the menu | open the menu |
+| digits | filter | narrow the rows | — | — | jump to a search hit | pick that book |
+| other text | filter | narrow the rows | — | — | nothing, with a hint | narrow the rows |
+| `backspace` | edit the line | rub out the filter, then close | — | — | edit the line | rub out the filter |
+| `^r` | next effort level | next effort level | next effort level | next effort level | next effort level | next effort level |
+| `^s` | — | — | read-aloud on or off | same | same | same |
+| `^l` | clear the screen | clear the screen | clear the screen | clear the screen | clear the screen | clear the screen |
+| `^c` | clear | clear | discard the turn | discard the turn | clear, then quit on the second press | same |
+
+`esc` has one meaning wherever it lands: it takes back the thing that is currently in front of the reader — a menu, a question, or a running turn. It does not escalate. Pressing it twice during a turn interrupts once and then does nothing, because a key that means "interrupt" the first time and "throw the turn away" the second is a key the reader has to time rather than press. Discarding is `^c`, which has meant that in every terminal for forty years.
 
 Text that is not a command does nothing. It used to be read as a question and searched for, which turned a mistyped `2` into a `Grep` across eighty-five paragraphs; now the line stays in the prompt and the status row says commands start with a slash.
 
@@ -122,7 +180,7 @@ Text that is not a command does nothing. It used to be read as a question and se
 
 A reader should be able to learn readio without reading anything, in this order:
 
-1. **The status row** always names the next useful key: `⏎ 继续 · shift+tab 换模式 · /help 更多` when idle, `esc 暂停 · ↑↓ 滚动` while streaming, `⏎ 继续 · esc 停止这一轮` while paused.
+1. **The status row** always names the next useful key: `⏎ 继续 · shift+tab 换模式 · /help 更多` when idle, `esc 中断 · ↑↓ 滚动` while streaming, `⏎ 继续` once interrupted.
 2. **The prompt placeholder** repeats the three that matter: enter, `/`, esc.
 3. **`/`** shows every command with a description, and one more keystroke shows every value.
 4. **`/help`** is the reference: keys, commands, and what the disguised readouts actually mean.
