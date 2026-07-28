@@ -262,6 +262,8 @@ Four archives are published: `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86
 
 Releases are on a beta channel: tags look like `tui-v0.Y.0-beta.N` and anything with `-beta` or `-rc` is flagged as a prerelease. `install.sh` therefore reads the releases *list* rather than `/releases/latest`, which skips prereleases and would find nothing while the newest release is a beta.
 
+It asks twice, because the first way has a quota. The unauthenticated API answers 403 once a machine has made around sixty requests in an hour — which a developer with `gh` open manages easily, and which used to surface as "no release found", blaming the repository for the caller's rate limit. When the API says nothing useful the script reads `releases.atom` instead: the same list, on github.com, with no quota. Only if both come back empty does it give up, and then it says what actually happened and how to name a version by hand.
+
 `install.sh` is POSIX `sh`. It detects the platform, downloads the archive, **verifies it against the release's `SHA256SUMS`**, unpacks, and replaces the binary with a `mv` so an upgrade cannot disturb a running readio. It uses no sudo, writes nothing outside the install directory, never edits a shell profile, and leaves no half-installed binary behind on failure; a checksum mismatch prints both hashes and refuses.
 
 ```sh

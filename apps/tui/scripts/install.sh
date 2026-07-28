@@ -22,6 +22,8 @@ REPO="${READIO_REPO:-hrhrng/readio}"
 # installer that is believed to work and one that is known to.
 BASE_URL="${READIO_BASE_URL:-https://github.com/$REPO/releases/download}"
 API_URL="${READIO_API_URL:-https://api.github.com/repos/$REPO/releases}"
+# The same list without a quota, for when the API refuses to talk.
+FEED_URL="${READIO_FEED_URL:-https://github.com/$REPO/releases.atom}"
 # readio lives in a monorepo whose other apps release under their own tags, so
 # "latest" means the newest tag with this prefix, not whatever shipped last.
 TAG_PREFIX="${READIO_TAG_PREFIX:-tui-v}"
@@ -112,21 +114,34 @@ fi
 
 resolve_version() {
     [ "$VERSION" != "latest" ] && { echo "$VERSION"; return; }
-    # Ask the API for the latest tag. Parsed with sed rather than jq, which is
-    # not installed often enough to depend on. The list endpoint is used rather
-    # than /releases/latest on purpose: readio is in beta, its releases are
-    # flagged as prereleases, and /releases/latest skips those entirely.
-    # `tr` first: the API is pretty-printed today, but a compact body would put
-    # every tag on one line and the greedy `.*` would then return the oldest
-    # release instead of the newest. Splitting on commas keeps the API's
-    # newest-first order while giving sed one field per line.
-    _tag="$(fetch_stdout "$API_URL" \
-        | tr ',' '\n' \
-        | sed -n 's/.*"tag_name" *: *"\([^"]*\)".*/\1/p' \
-        | grep "^$TAG_PREFIX" | head -n 1)"
-    [ -n "$_tag" ] || die "no $TAG_PREFIX* release found in $REPO
+
+    # Two ways to ask, because the first one has a quota. The API is unauthenticated
+    # here, and GitHub answers 403 once a machine has made about sixty requests in
+    # an hour — a developer with `gh` open hits that regularly. The releases feed is
+    # plain HTML-adjacent XML on github.com with no such limit, so it stands in.
+    _tag="$(fetch_stdout "$API_URL" 2>/dev/null | newest_tag)"
+    [ -n "$_tag" ] || _tag="$(fetch_stdout "$FEED_URL" 2>/dev/null | newest_tag)"
+
+    [ -n "$_tag" ] || die "cannot work out the latest release of $REPO.
+Both the API and the releases feed came back empty — usually a rate limit or a
+proxy. Install a known version instead:
+  install.sh --version $TAG_PREFIX<x.y.z>
 Releases: https://github.com/$REPO/releases"
     echo "$_tag"
+}
+
+# The newest `TAG_PREFIX*` tag on stdin, whether that is JSON or the Atom feed.
+#
+# `tr` first: both sources may put everything on one line, and a greedy `.*` would
+# then match the last tag in the document rather than the first. Splitting keeps
+# the newest-first order the sources already have.
+newest_tag() {
+    tr ',<' '\n\n' \
+        | sed -n \
+            -e 's/.*"tag_name" *: *"\([^"]*\)".*/\1/p' \
+            -e 's|.*/releases/tag/\([^"/]*\).*|\1|p' \
+        | grep "^$TAG_PREFIX" \
+        | head -n 1
 }
 
 # ── verification ─────────────────────────────────────────────────────────────
