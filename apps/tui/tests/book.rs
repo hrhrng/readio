@@ -219,7 +219,7 @@ fn a_chapter_boundary_does_not_waste_a_turn() {
     assert!(
         steps
             .iter()
-            .any(|s| matches!(s, readio::app::turn::Step::Say(_))),
+            .any(|s| matches!(s, readio::app::turn::Step::Say { .. })),
         "a boundary turn must still stream content"
     );
 }

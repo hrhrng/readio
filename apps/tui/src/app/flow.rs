@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use crate::book::{Book, Hits, Para};
+use crate::book::{Book, Emphasis, Hits, Para};
 use crate::i18n::{t, tf};
 use crate::metrics;
 use crate::ui::block::{ContextInfo, Event, PlanItem, Tool, Verb};
@@ -149,7 +149,10 @@ pub fn continue_reading(book: &Book, pos: Pos, resumed: bool) -> (Vec<Step>, Pos
     // whole. Splitting here keeps the pacing logic ignorant of images.
     for run in runs(slice) {
         match run {
-            Run::Text(paras) => steps.push(Step::Say(render_markdown(paras))),
+            Run::Text(paras) => {
+                let (text, emphasis) = render_markdown(paras);
+                steps.push(Step::Say { text, emphasis });
+            }
             Run::Image { src, alt } => steps.push(Step::Image {
                 path: src.clone(),
                 alt: alt.clone(),
@@ -248,7 +251,7 @@ pub fn answer(book: &Book, question: &str) -> (Vec<Step>, String, Hits) {
     ];
 
     if hits.is_empty() {
-        steps.push(Step::Say(tf("flow.no_hits", &[&needle])));
+        steps.push(Step::say(tf("flow.no_hits", &[&needle])));
         return (steps, needle, hits);
     }
 
@@ -270,7 +273,7 @@ pub fn answer(book: &Book, question: &str) -> (Vec<Step>, String, Hits) {
         ));
     }
     answer.push_str(t("flow.jump_hint"));
-    steps.push(Step::Say(answer));
+    steps.push(Step::say(answer));
     (steps, needle, hits)
 }
 
@@ -311,17 +314,78 @@ pub fn toc(book: &Book, current: usize) -> Vec<Step> {
     ]
 }
 
-/// Reading plan: the chapter list as a todo list.
-pub fn plan(book: &Book, pos: Pos) -> Vec<Step> {
-    let items = book
-        .chapters
+/// Writing down a bookmark. The write is real, so it is shown as one.
+pub fn marked(book: &Book, mark: &crate::store::Mark, count: usize) -> Vec<Step> {
+    vec![
+        Step::Tool {
+            tool: Tool::new(Verb::Write, "~/.readio/state.json")
+                .detail(format!("mark {count}"))
+                .body(vec![format!(
+                    "{{ \"chars\": {}, \"at\": \"{:.1}%\", \"label\": \"{}\" }}",
+                    mark.chars,
+                    book.progress(mark.chapter, mark.para) * 100.0,
+                    mark.label
+                )]),
+            ms: rand_range(90, 180),
+        },
+        Step::Note(tf("cmd.mark_set", &[&count, &mark.label])),
+    ]
+}
+
+/// The bookmarks of the open book, numbered for jumping to.
+pub fn marks(book: &Book, marks: &[crate::store::Mark]) -> Vec<Step> {
+    let body: Vec<String> = marks
         .iter()
         .enumerate()
-        .map(|(i, ch)| PlanItem {
-            title: ch.title.clone(),
-            chars: ch.char_count(),
-            done: i < pos.chapter,
-            current: i == pos.chapter,
+        .map(|(i, mark)| {
+            let (chapter, para) = book.locate(mark.chars as usize);
+            format!(
+                "{:>3}  ch{}:{}  {:>5.1}%  {}",
+                i + 1,
+                chapter + 1,
+                para + 1,
+                book.progress(chapter, para) * 100.0,
+                mark.label
+            )
+        })
+        .collect();
+    vec![
+        Step::Tool {
+            tool: Tool::new(Verb::Read, "~/.readio/state.json")
+                .detail(format!("{} marks", marks.len()))
+                .body(body),
+            ms: rand_range(120, 240),
+        },
+        Step::Note(t("cmd.marks_hint").to_string()),
+    ]
+}
+
+/// Reading plan: the chapter list as a todo list.
+/// How many chapters a plan shows at once. A to-do list is a glance, not an
+/// index: a book cut at its table of contents can have seventy chapters, and
+/// `/toc` is the command for the whole list.
+const PLAN_WINDOW: usize = 9;
+
+pub fn plan(book: &Book, pos: Pos) -> Vec<Step> {
+    let total = book.chapters.len();
+    // Keep the current chapter in view with a little of its past behind it.
+    let start = pos
+        .chapter
+        .saturating_sub(2)
+        .min(total.saturating_sub(PLAN_WINDOW));
+    let end = (start + PLAN_WINDOW).min(total);
+    let items = book.chapters[start..end]
+        .iter()
+        .enumerate()
+        .map(|(offset, ch)| {
+            let index = start + offset;
+            PlanItem {
+                number: index + 1,
+                title: ch.title.clone(),
+                chars: ch.char_count(),
+                done: index < pos.chapter,
+                current: index == pos.chapter,
+            }
         })
         .collect();
     vec![Step::Plan {
@@ -333,6 +397,7 @@ pub fn plan(book: &Book, pos: Pos) -> Vec<Step> {
             ],
         ),
         items,
+        hidden: total - (end - start),
     }]
 }
 
@@ -391,7 +456,36 @@ pub fn welcome(book: &Book, pos: Pos, resumed: bool) -> Vec<Step> {
             ],
         )
     };
-    vec![Step::Note(head)]
+    let mut steps = vec![Step::Note(head)];
+    // The cover belongs to opening a book, not to going back to one: a picture
+    // that reappears every time the reader presses enter on their history is
+    // furniture, not a cover.
+    if !resumed && let Some(cover) = &book.cover {
+        let bytes = std::fs::metadata(&cover.file).map(|m| m.len()).unwrap_or(0);
+        steps.push(Step::Tool {
+            tool: Tool::new(Verb::Read, format!("{}/{}", book.uri_root(), cover.href))
+                .detail(t("flow.cover").to_string())
+                .body(vec![format!("{}  ·  {}", cover.href, size(bytes))]),
+            ms: rand_range(120, 240),
+        });
+        steps.push(Step::Image {
+            path: cover.file.clone(),
+            // The tool line above already said this is the cover; the caption is
+            // better spent naming the book it belongs to.
+            alt: book.title.clone(),
+        });
+    }
+    steps
+}
+
+/// Bytes as a reader would write them.
+fn size(bytes: u64) -> String {
+    match bytes {
+        0 => "—".to_string(),
+        n if n < 1024 => format!("{n} B"),
+        n if n < 1024 * 1024 => format!("{:.0} KB", n as f64 / 1024.0),
+        n => format!("{:.1} MB", n as f64 / (1024.0 * 1024.0)),
+    }
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -424,22 +518,40 @@ fn runs(paras: &[Para]) -> Vec<Run<'_>> {
     out
 }
 
-/// Paragraphs → the passage dialect understood by the passage renderer.
-fn render_markdown(paras: &[Para]) -> String {
+/// Paragraphs → the passage dialect understood by the passage renderer, plus
+/// the emphasis found in them, moved into the passage's own coordinates.
+fn render_markdown(paras: &[Para]) -> (String, Vec<Emphasis>) {
     let mut out = String::new();
+    let mut emphasis: Vec<Emphasis> = Vec::new();
     for (i, para) in paras.iter().enumerate() {
         if i > 0 {
             out.push_str("\n\n");
         }
+        // Where this paragraph's own text starts in the passage, once whatever
+        // marker precedes it has been written.
+        let mut carry = |out: &mut String, marker: &str| {
+            out.push_str(marker);
+            let base = out.len() as u32;
+            for span in para.emphasis() {
+                emphasis.push(Emphasis {
+                    start: base + span.start,
+                    end: base + span.end,
+                    strong: span.strong,
+                });
+            }
+        };
         match para {
             Para::Heading { text, .. } => {
                 out.push_str("## ");
                 out.push_str(text);
             }
-            Para::Text(text) => out.push_str(text),
-            Para::Quote(text) => {
-                out.push_str("> ");
-                out.push_str(text);
+            Para::Text(rich) => {
+                carry(&mut out, "");
+                out.push_str(&rich.text);
+            }
+            Para::Quote(rich) => {
+                carry(&mut out, "> ");
+                out.push_str(&rich.text);
             }
             Para::Code(text) => {
                 out.push_str("```\n");
@@ -457,7 +569,7 @@ fn render_markdown(paras: &[Para]) -> String {
             }
         }
     }
-    out
+    (out, emphasis)
 }
 
 /// Dim preview lines under a Read call: enough to prove it read something.

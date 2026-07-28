@@ -9,7 +9,9 @@ readio is a terminal ebook reader whose interface borrows the grammar of a codin
 - [Module map](#module-map)
 - [Four decisions](#four-decisions)
 - [Books, positions and progress](#books-positions-and-progress)
+- [Emphasis](#emphasis)
 - [Search](#search)
+- [Bookmarks](#bookmarks)
 - [Read-aloud](#read-aloud)
 - [Configuration](#configuration)
 - [Keys and commands](#keys-and-commands)
@@ -31,8 +33,9 @@ src/
   wrap.rs         width-aware wrapping: CJK breaks anywhere, Latin keeps words whole
   stream.rs       phrase splitting and the characters-per-second pacer
   book/
-    mod.rs        Book, Chapter, Para, and search
-    epub.rs       container → OPF → spine → XHTML
+    mod.rs        Book, Chapter, Para, Rich, and search
+    epub.rs       container → OPF → spine → XHTML, cut at ToC anchors
+    css.rs        which CSS classes mean italic or bold
     html.rs       forgiving XHTML extraction (entities, unclosed tags, img)
     pdf.rs        text-layer PDF: per-page text, rejoined lines
     media.rs      illustrations out of an EPUB (double-checked, zip-slip safe)
@@ -73,13 +76,27 @@ Three parsers produce the same shape — `Book { chapters: Vec<Chapter> }`, each
 
 | Format | Path through the code |
 | --- | --- |
-| EPUB | `container.xml` → OPF → spine order → each XHTML document is a chapter; ToC labels name them |
+| EPUB | `container.xml` → OPF → spine order → cut at the anchors the ToC points to |
 | PDF | `pdf-extract` per page, then broken lines rejoined; the outline names chapters when it lines up |
 | Markdown, text | split on `#`/`##` headings, or on blank-line runs and chapter-like lines |
 
-A position is `(chapter, paragraph)`. Progress is cumulative characters over the whole book, which is the model most readers use and the one `epy` uses. A chapter with no ToC entry and no heading of its own is numbered (`Section 4`), never named after its file: `index_split_003` is a fact about the publisher's toolchain.
+**Chapters are what the table of contents says they are**, not what the file layout says. A ToC entry may point inside a document — `part1.xhtml#ch3` — and conversion tools routinely put a dozen chapters in one file, so each entry becomes a chapter and the text before the first of them stays with the document's own name. In one real book this is the difference between 13 chapters and 72. `html::to_document` therefore reports anchor positions alongside paragraphs, and deduplication renumbers them as it merges. An anchor the document does not contain is not a cut — except when nothing has claimed the start yet, where it is almost always a ToC line naming the whole file.
 
-Positions are written to `state.json` through a temp file and a rename, so an interrupted write cannot corrupt the previous one, and the write is shown on screen as a `Write` tool call.
+Spine items marked `linear="no"` are out of the reading order and are not read: copyright pages, adverts, a duplicate cover. Fabricated line numbers continue across a document that holds several chapters, because two `Read` calls on one file should not both start at line 1. A chapter with no ToC entry and no heading of its own is numbered (`Section 4`), never named after its file: `index_split_003` is a fact about the publisher's toolchain.
+
+A position is `(chapter, paragraph)`, but the coordinate that is *stored* is the character offset, and it is the one that wins. Chapter indices are relative to how the book was cut, and that changes: the release that started honouring tables of contents turned index 3 into a different page. `restore()` keeps a stored `(chapter, para)` only while it agrees with the offset beside it, and otherwise asks `Book::locate` where that offset is now. Bookmarks work the same way, which is why one made last month still lands on its sentence.
+
+Progress is cumulative characters over the whole book, the model most readers use and the one `epy` uses. Positions are written to `state.json` through a temp file and a rename, so an interrupted write cannot corrupt the previous one, and the write is shown on screen as a `Write` tool call.
+
+The cover, when a book declares one — EPUB 3's `properties="cover-image"` or EPUB 2's `<meta name="cover">` — is shown when the book is opened, not when it is resumed. A picture that reappears every time the reader presses enter on their history is furniture.
+
+## Emphasis
+
+A book that italicises a title is saying something about the title. Emphasis is kept as byte ranges beside the paragraph's text — `Rich { text, emphasis }` — so the text stays a plain string and wrapping, pacing, search and read-aloud all keep treating a paragraph as characters. The renderer lays the ranges over the top, exactly as it already does for the speech highlight, and the two compose: an italic phrase being read aloud is italic *and* washed.
+
+Two sources feed it. Semantic tags (`em`, `i`, `cite`, `strong`, `b`) are obvious. The other is the one that matters in practice: converted EPUBs rarely contain a single `<em>`, and say `<span class="calibre14">` with `font-style: italic` in a stylesheet instead. `book::css` scans the archive's CSS for rules that lean or bolden text and collects their class names — not a CSS engine, and everything it fails to understand it ignores, which is the right failure. Inline `style="font-style: italic"` is honoured too.
+
+Offsets are the fragile part, and there are two conversions: collapsing whitespace moves every byte after the first run of it, so `collapse_ws_indexed` returns a map from input byte to output byte; and the passage adds its own markers (`## `, `> `), so `render_markdown` shifts each paragraph's ranges by where its text landed.
 
 ## Search
 
@@ -90,6 +107,12 @@ Anything typed at the prompt that is not a command runs a real full-text search,
 - **Hits are reachable.** Type a number to jump, `^g` and `^b` to walk the list; wrapping says so. Arriving lights the term deeply inside its lightly washed sentence, sharing the two-level highlight with read-aloud — the sentence comes from `tts::sentence::split`.
 - **A question is narrowed before it is searched.** A whole sentence is almost never a term. `candidates()` strips interrogative tails, then tries progressively shorter windows, widest first, and answers for the longest phrase that actually occurs in the book.
 - **No regular expressions.** Deliberately: `/find ^Chapter .$` would tear the coding-agent skin off in one keystroke.
+
+## Bookmarks
+
+`/mark [note]` keeps the current place, `/marks` lists them, `/marks <n>` goes back to one and `/unmark <n>` drops it. A mark with no note is named after the opening words of what is there, because a list of bookmarks that all say "bookmark" is a list nobody can read. Marking the same place twice renames one mark rather than making two.
+
+They live in `state.json` beside the reading position, stored as character offsets, and the listing resolves each one through `Book::locate` — so a mark keeps pointing at its sentence even after the chapter numbering under it changes. Setting one is shown as the `Write` it really is.
 
 ## Read-aloud
 
@@ -190,6 +213,7 @@ The host directory:
 | --- | --- |
 | Library | `/lib` `/open <n>` `/import <path> [-c\|-l\|-m]` `/forget <n>` `/sample` |
 | Reading | `/toc` `/goto <n>` `/next` `/prev` `/find <term>` `/auto` `/plan` `/context` `/progress` `/speed <n>` |
+| Bookmarks | `/mark [note]` `/marks [n]` `/unmark <n>` |
 | Read-aloud | `/tts [on\|off\|<engine>\|test\|config]` `/voice <name>` `/rate <0.5-3.0>` `/device` |
 | Interface | `/lang en\|zh` `/help` `/quit` |
 
@@ -198,8 +222,9 @@ The host directory:
 ## Testing
 
 ```sh
-cargo test          # 212: wrapping, pacing, parsing, import modes, reading, whole frames,
-                    # illustrations, read-aloud, the device allowlist, search and jumps
+cargo test          # 240: wrapping, pacing, parsing, import modes, reading, whole frames,
+                    # illustrations, read-aloud, the device allowlist, search and jumps,
+                    # chapter shape, emphasis, bookmarks
 ```
 
 - `tests/render.rs` draws a real `App` through ratatui's `TestBackend` and asserts on the screen, so "is the library listed", "did typing 2 open the second book" and "did esc actually interrupt" all have regression cover.
@@ -240,7 +265,7 @@ Releases are on a beta channel: tags look like `tui-v0.Y.0-beta.N` and anything 
 `install.sh` is POSIX `sh`. It detects the platform, downloads the archive, **verifies it against the release's `SHA256SUMS`**, unpacks, and replaces the binary with a `mv` so an upgrade cannot disturb a running readio. It uses no sudo, writes nothing outside the install directory, never edits a shell profile, and leaves no half-installed binary behind on failure; a checksum mismatch prints both hashes and refuses.
 
 ```sh
-sh scripts/install.sh --version tui-v0.2.0-beta.1   # a specific release
+sh scripts/install.sh --version tui-v0.2.0-beta.2   # a specific release
 sh scripts/install.sh --dir /usr/local/bin          # elsewhere (bring write access)
 ```
 

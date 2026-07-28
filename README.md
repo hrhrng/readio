@@ -10,7 +10,7 @@
 
 [中文文档](README.zh-CN.md)
 
-EPUB, text-layer PDF, Markdown and plain text. Read-aloud through a local model of your choice, with the spoken sentence and the sounded character highlighted. Illustrations drawn in the terminal. One 4 MB binary with no bundled model, no assets, no runtime dependencies, and no environment variables.
+EPUB, text-layer PDF, Markdown and plain text. Chapters as the book's own table of contents defines them, italics kept, covers and illustrations drawn in the terminal. Read-aloud through a local model of your choice, with the spoken sentence and the sounded character highlighted. One 4 MB binary with no bundled model, no assets, no runtime dependencies, and no environment variables.
 
 Every number on screen is a real reading — real paragraph offsets, real line ranges, real full-text search hits. Only the vocabulary is costume.
 
@@ -113,6 +113,7 @@ Copies land in `~/.readio/books`. Use `readio --home <dir>` to keep a separate l
 | `/lib` `/open <n>` `/import <path>` `/forget <n>` | manage the library |
 | `/toc` `/goto <n>` `/next` `/prev` | move between chapters |
 | `/find <term>` | search the whole book; type a number to jump to that hit |
+| `/mark [note]` `/marks [n]` `/unmark <n>` | keep a place, list places, drop one |
 | `/auto` `/speed <n>` | keep reading unattended · reveal speed |
 | `/context` `/progress` `/plan` | where you are |
 | `/tts` `/voice <name>` `/rate <0.5-3>` `/device` | read-aloud and audio output |
@@ -127,6 +128,18 @@ Copies land in `~/.readio/books`. Use `readio --home <dir>` to keep a separate l
 | Time since you opened the book | `0:15`, a session clock |
 | Fetching the next passage | a tool call: `● Read book.epub#ch1  L1-9  ·  0.3s` |
 | Full-text search | the question you asked, with real hit counts |
+
+## Reading a book as the book is written
+
+readio follows the file rather than the filesystem.
+
+**Chapters come from the table of contents.** A conversion tool will happily put a dozen chapters in one XHTML file and point the ToC at anchors inside it; readio cuts there, so a book whose contents page lists 71 sections has 71 chapters and not 13. Documents the spine marks `linear="no"` — copyright pages, adverts — are not part of the read. A section the ToC never names and that carries no heading is numbered rather than named after its file, because `index_split_003` says something about the publisher's toolchain and nothing about the book.
+
+**Italics survive.** Emphasis is kept as ranges over the text and drawn as a terminal modifier, whether the book spelled it `<em>` or — as converted EPUBs almost always do — as a CSS class with `font-style: italic`. It composes with read-aloud: an italic phrase being spoken is italic and washed at once.
+
+**The cover is shown when you open a book**, and not when you resume one.
+
+**Places you keep are kept properly.** `/mark` remembers where you are, `/marks` lists what you kept, `/marks <n>` goes back. Bookmarks and your reading position are stored as character offsets, so they still point at the same sentence after an update changes how the book is divided — the update that introduced ToC chapters moved every chapter number, and nobody lost their place.
 
 ## Search
 
@@ -163,7 +176,7 @@ One file, `~/.readio/config.yaml`, written with comments on first run. readio re
 
 ```sh
 cd apps/tui
-cargo test                                     # 211 tests
+cargo test                                     # 240 tests
 python3 scripts/pty_probe.py 96 24 "wait:0.6,type:/sample,key:enter,wait:2"
 ```
 

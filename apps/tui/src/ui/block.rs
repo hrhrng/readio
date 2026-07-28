@@ -177,6 +177,9 @@ pub struct ImagePlan {
 
 #[derive(Debug, Clone)]
 pub struct PlanItem {
+    /// Position in the whole book, not in this window: a plan showing chapters
+    /// 30 to 38 has to say 30 to 38.
+    pub number: usize,
     pub title: String,
     pub chars: usize,
     pub done: bool,
@@ -227,6 +230,10 @@ pub enum Block {
     /// Streamed book content. Understands `## `, `> ` and fenced code prefixes.
     Passage {
         text: String,
+        /// Byte ranges the book emphasised, in this passage's coordinates. Set
+        /// when the block is created: the text arrives a phrase at a time, but
+        /// what is emphasised in it is known from the start.
+        emphasis: Vec<crate::book::Emphasis>,
         /// What the voice is on, when speech is on.
         highlight: Option<Highlight>,
     },
@@ -235,6 +242,10 @@ pub enum Block {
     Plan {
         title: String,
         items: Vec<PlanItem>,
+        /// Chapters left out of the window, reported rather than dropped
+        /// silently. A book cut at its table of contents can have seventy of
+        /// them, and a to-do list that long is furniture.
+        hidden: usize,
     },
     Context(ContextInfo),
     /// An illustration from the book, drawn with half-block characters.
@@ -259,9 +270,10 @@ pub enum Block {
 }
 
 impl Block {
-    pub fn passage() -> Self {
+    pub fn passage(emphasis: Vec<crate::book::Emphasis>) -> Self {
         Block::Passage {
             text: String::new(),
+            emphasis,
             highlight: None,
         }
     }
@@ -310,6 +322,7 @@ impl Block {
     pub fn passage_text(text: &str) -> Self {
         Block::Passage {
             text: text.to_string(),
+            emphasis: Vec::new(),
             highlight: None,
         }
     }
@@ -382,10 +395,18 @@ impl Block {
             Block::User(text) => render_user(text, ctx),
             Block::Thinking { text, elapsed_ms } => render_thinking(text, *elapsed_ms, ctx),
             Block::Tool(tool) => render_tool(tool, ctx),
-            Block::Passage { text, highlight } => render_passage(text, *highlight, ctx),
+            Block::Passage {
+                text,
+                emphasis,
+                highlight,
+            } => render_passage(text, emphasis, *highlight, ctx),
             Block::System(text) => render_system(text, ctx),
             Block::Event(event) => render_event(event, ctx),
-            Block::Plan { title, items } => render_plan(title, items, ctx),
+            Block::Plan {
+                title,
+                items,
+                hidden,
+            } => render_plan(title, items, *hidden, ctx),
             Block::Context(info) => render_context(info, ctx),
             Block::Image {
                 path,
@@ -569,10 +590,16 @@ fn render_tool(tool: &Tool, ctx: &Ctx) -> Vec<Line<'static>> {
 
 /// Book content. A tiny markdown dialect: `## ` heading, `> ` quote, ``` fence.
 ///
-/// When `highlight` is set, the byte range it names is highlighted: that is the
-/// sentence the speech engine is saying right now, and following it with the eye
-/// is the whole point of reading along.
-fn render_passage(text: &str, highlight: Option<Highlight>, ctx: &Ctx) -> Vec<Line<'static>> {
+/// Two overlays ride on top of the text, both expressed as byte ranges into it:
+/// what the book emphasised, and what the voice is saying. Keeping them as
+/// ranges rather than as markup is what lets the text stay a plain string for
+/// wrapping, pacing, search and speech.
+fn render_passage(
+    text: &str,
+    emphasis: &[crate::book::Emphasis],
+    highlight: Option<Highlight>,
+    ctx: &Ctx,
+) -> Vec<Line<'static>> {
     let th = theme();
     let width = ctx.body_width();
     let mut out = vec![Line::from("")];
@@ -651,8 +678,8 @@ fn render_passage(text: &str, highlight: Option<Highlight>, ctx: &Ctx) -> Vec<Li
                 indent()
             };
             let mut spans = vec![lead];
-            spans.extend(highlight_spans(
-                &segment, origin, highlight, style, lit, hot,
+            spans.extend(styled_spans(
+                &segment, origin, highlight, emphasis, style, lit, hot,
             ));
             out.push(Line::from(spans));
         }
@@ -672,44 +699,69 @@ fn render_passage(text: &str, highlight: Option<Highlight>, ctx: &Ctx) -> Vec<Li
     out
 }
 
-/// Split one wrapped line into spans: plain text, the sentence being read, and
-/// the word inside it.
+/// Split one wrapped line into spans: plain text, what the book emphasised, the
+/// sentence being read, and the word inside it.
 ///
 /// `origin` is where this line's source begins in the passage, because
 /// [`wrap_indexed`] reports offsets relative to the slice it was handed. The
 /// line is cut at every boundary that falls inside it and each piece takes the
 /// style of the innermost range containing it, which keeps the word highlight
 /// correct even when it straddles a wrap.
-fn highlight_spans(
+///
+/// The two overlays compose rather than compete: emphasis is a modifier, the
+/// speech highlight is a colour, so an italicised phrase being read aloud is
+/// both italic and washed.
+fn styled_spans(
     segment: &Segment,
     origin: usize,
     highlight: Option<Highlight>,
+    emphasis: &[crate::book::Emphasis],
     plain: Style,
     lit: Style,
     hot: Style,
 ) -> Vec<Span<'static>> {
-    let Some(highlight) = highlight else {
-        return vec![Span::styled(segment.text.clone(), plain)];
-    };
     let (line_from, line_to) = (origin + segment.start, origin + segment.end);
-    let (from, to) = highlight.sentence;
-    if to <= line_from || from >= line_to {
-        return vec![Span::styled(segment.text.clone(), plain)];
-    }
-
     // Everything below is in offsets inside the text actually drawn: a wrap can
     // eat a space, so the rendered line is not the source slice byte for byte.
     let local = |offset: usize| floor_boundary(&segment.text, offset.saturating_sub(line_from));
-    let sentence = (local(from), local(to.max(from)));
-    let word = highlight
-        .word
+
+    // Emphasis that touches this line at all, in local coordinates.
+    let leaning: Vec<(usize, usize, bool)> = emphasis
+        .iter()
+        .filter(|span| span.end as usize > line_from && (span.start as usize) < line_to)
+        .map(|span| {
+            (
+                local(span.start as usize),
+                local((span.end as usize).max(span.start as usize)),
+                span.strong,
+            )
+        })
+        .filter(|(start, end, _)| end > start)
+        .collect();
+
+    let speech = highlight.filter(|h| h.sentence.1 > line_from && h.sentence.0 < line_to);
+    if leaning.is_empty() && speech.is_none() {
+        return vec![Span::styled(segment.text.clone(), plain)];
+    }
+
+    let sentence = speech.map(|h| (local(h.sentence.0), local(h.sentence.1.max(h.sentence.0))));
+    let word = speech
+        .and_then(|h| h.word)
         .filter(|(a, b)| *b > line_from && *a < line_to)
         .map(|(a, b)| (local(a), local(b.max(a))));
 
-    let mut cuts = vec![0usize, segment.text.len(), sentence.0, sentence.1];
+    let mut cuts = vec![0usize, segment.text.len()];
+    if let Some((a, b)) = sentence {
+        cuts.push(a);
+        cuts.push(b);
+    }
     if let Some((a, b)) = word {
         cuts.push(a);
         cuts.push(b);
+    }
+    for (start, end, _) in &leaning {
+        cuts.push(*start);
+        cuts.push(*end);
     }
     cuts.retain(|cut| *cut <= segment.text.len());
     cuts.sort_unstable();
@@ -721,13 +773,20 @@ fn highlight_spans(
         if end <= start {
             continue;
         }
-        let style = if word.is_some_and(|(a, b)| start >= a && end <= b) {
+        let mut style = if word.is_some_and(|(a, b)| start >= a && end <= b) {
             hot
-        } else if start >= sentence.0 && end <= sentence.1 {
+        } else if sentence.is_some_and(|(a, b)| start >= a && end <= b) {
             lit
         } else {
             plain
         };
+        if let Some((_, _, strong)) = leaning.iter().find(|(a, b, _)| start >= *a && end <= *b) {
+            style = style.add_modifier(if *strong {
+                Modifier::BOLD
+            } else {
+                Modifier::ITALIC
+            });
+        }
         spans.push(Span::styled(segment.text[start..end].to_string(), style));
     }
     if spans.is_empty() {
@@ -831,7 +890,7 @@ fn render_event(event: &Event, _ctx: &Ctx) -> Vec<Line<'static>> {
     ]
 }
 
-fn render_plan(title: &str, items: &[PlanItem], ctx: &Ctx) -> Vec<Line<'static>> {
+fn render_plan(title: &str, items: &[PlanItem], hidden: usize, ctx: &Ctx) -> Vec<Line<'static>> {
     let th = theme();
     let mut out = vec![
         Line::from(""),
@@ -843,7 +902,7 @@ fn render_plan(title: &str, items: &[PlanItem], ctx: &Ctx) -> Vec<Line<'static>>
             ),
         ]),
     ];
-    for (i, item) in items.iter().enumerate() {
+    for item in items.iter() {
         let (glyph, style) = if item.current {
             (
                 theme::ARROW,
@@ -856,7 +915,7 @@ fn render_plan(title: &str, items: &[PlanItem], ctx: &Ctx) -> Vec<Line<'static>>
         } else {
             (theme::BULLET_OPEN, Style::default().fg(th.text_faint))
         };
-        let label = format!("{:>2}. {}", i + 1, item.title);
+        let label = format!("{:>2}. {}", item.number, item.title);
         let meta = format!(
             "  {} tok",
             metrics::format_tokens(metrics::tokens_from_chars(item.chars))
@@ -877,6 +936,15 @@ fn render_plan(title: &str, items: &[PlanItem], ctx: &Ctx) -> Vec<Line<'static>>
             ),
             Span::styled(truncate(&label, room), style),
             Span::styled(meta, Style::default().fg(th.text_faint)),
+        ]));
+    }
+    if hidden > 0 {
+        out.push(Line::from(vec![
+            indent(),
+            Span::styled(
+                format!("  {} +{hidden} more", theme::ELLIPSIS),
+                Style::default().fg(th.text_faint),
+            ),
         ]));
     }
     out

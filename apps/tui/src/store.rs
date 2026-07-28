@@ -25,6 +25,30 @@ pub struct Progress {
     pub sessions: u32,
     #[serde(default)]
     pub updated: u64,
+    /// Places the reader asked to keep. Empty for a book nobody marked, and
+    /// absent from an older state file, which is what `default` is for.
+    #[serde(default)]
+    pub marks: Vec<Mark>,
+}
+
+/// A place worth coming back to.
+///
+/// `chars` is the coordinate that matters: chapter and paragraph indices are a
+/// convenience for showing where a mark is, but they are relative to how the
+/// book was cut into chapters when the mark was made, and that can change.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Mark {
+    pub chars: u64,
+    #[serde(default)]
+    pub chapter: usize,
+    #[serde(default)]
+    pub para: usize,
+    /// What the reader called it, or the opening words of the passage when they
+    /// did not say.
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

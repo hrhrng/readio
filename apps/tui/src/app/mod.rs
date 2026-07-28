@@ -101,6 +101,49 @@ struct Find {
     at: usize,
 }
 
+/// A short name for an unnamed mark: the first few words of what is there.
+///
+/// A list of bookmarks that all say "bookmark" is a list nobody can read.
+fn opening_words(book: &Book, pos: Pos) -> String {
+    let text = book
+        .chapter(pos.chapter)
+        .and_then(|chapter| chapter.paras.get(pos.para))
+        .map(|para| para.text().trim().to_string())
+        .unwrap_or_default();
+    if text.is_empty() {
+        return book
+            .chapter(pos.chapter)
+            .map(|chapter| chapter.title.clone())
+            .unwrap_or_default();
+    }
+    let mut out: String = text.chars().take(28).collect();
+    if text.chars().count() > 28 {
+        out.push('…');
+    }
+    out
+}
+
+/// Where a stored position lands in this copy of the book.///
+/// The stored chapter and paragraph are indices into however the book was cut
+/// into chapters the last time it was opened, and that can change under the
+/// reader's feet: a release that learns to honour a table of contents turns
+/// thirteen chapters into seventy-one, and index 3 is suddenly a different page.
+/// The character offset does not move, so it decides whenever the two disagree.
+fn restore(book: &Book, saved: &Progress) -> Pos {
+    let chapter = saved.chapter.min(book.chapters.len().saturating_sub(1));
+    let by_index = Pos {
+        chapter,
+        para: saved.para,
+    };
+    if saved.chars_read == 0
+        || book.chars_before(by_index.chapter, by_index.para) as u64 == saved.chars_read
+    {
+        return by_index;
+    }
+    let (chapter, para) = book.locate(saved.chars_read as usize);
+    Pos { chapter, para }
+}
+
 /// A sentence in flight: its audio clock and the words to walk through.
 struct Cursor {
     /// Scrollback entry holding the passage.
@@ -186,10 +229,7 @@ impl App {
         let saved = self.store.get(&book.id).cloned();
         let pos = saved
             .as_ref()
-            .map(|p| Pos {
-                chapter: p.chapter.min(book.chapters.len().saturating_sub(1)),
-                para: p.para,
-            })
+            .map(|p| restore(&book, p))
             .unwrap_or_default();
         let pos = flow::normalize(&book, pos);
 
@@ -277,6 +317,11 @@ impl App {
     // ── frame ────────────────────────────────────────────────────────────────
 
     /// Advance timers and the turn machine. Called once per frame.
+    /// Where the reader is: chapter and paragraph, both zero-based.
+    pub fn position(&self) -> (usize, usize) {
+        (self.pos.chapter, self.pos.para)
+    }
+
     pub fn on_tick(&mut self) {
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame).as_secs_f32() * 1000.0;
@@ -1237,6 +1282,10 @@ impl App {
                     self.system(&text);
                 }
             },
+            // ── bookmarks ──
+            "mark" | "m" => self.mark_command(arg),
+            "marks" | "bookmarks" => self.marks_command(arg),
+            "unmark" => self.unmark_command(arg),
             // ── read aloud ──
             "tts" | "speak" | "read" => self.tts_command(arg),
             "voice" => self.voice_command(arg),
@@ -1442,6 +1491,119 @@ impl App {
         self.read_more();
     }
 
+    // ── bookmarks ────────────────────────────────────────────────────────────
+
+    /// `/mark [note]`: keep this place, with a note or with the words that are
+    /// here.
+    fn mark_command(&mut self, note: &str) {
+        let Some(book) = self.book.as_ref() else {
+            self.no_book();
+            return;
+        };
+        let chars = book.chars_before(self.pos.chapter, self.pos.para) as u64;
+        let label = if note.trim().is_empty() {
+            opening_words(book, self.pos)
+        } else {
+            note.trim().to_string()
+        };
+        let id = book.id.clone();
+        let mark = crate::store::Mark {
+            chars,
+            chapter: self.pos.chapter,
+            para: self.pos.para,
+            label,
+            at: now_secs(),
+        };
+
+        // Save first: the mark is stored beside the position, and a fresh book
+        // has no entry to attach it to yet.
+        self.save_progress();
+        let mut progress = self.store.get(&id).cloned().unwrap_or_default();
+        // Marking the same place twice is one mark, renamed.
+        match progress.marks.iter_mut().find(|m| m.chars == chars) {
+            Some(existing) => *existing = mark.clone(),
+            None => progress.marks.push(mark.clone()),
+        }
+        progress.marks.sort_by_key(|m| m.chars);
+        let count = progress
+            .marks
+            .iter()
+            .position(|m| m.chars == chars)
+            .map(|index| index + 1)
+            .unwrap_or(progress.marks.len());
+        self.store.record(&id, progress);
+        let _ = self.store.save();
+
+        let book = self.book.as_ref().expect("checked above");
+        let steps = flow::marked(book, &mark, count);
+        self.turn.enqueue(steps);
+    }
+
+    /// `/marks` to list them, `/marks <n>` to go to one.
+    fn marks_command(&mut self, arg: &str) {
+        let Some(book) = self.book.as_ref() else {
+            self.no_book();
+            return;
+        };
+        let marks = self
+            .store
+            .get(&book.id)
+            .map(|p| p.marks.clone())
+            .unwrap_or_default();
+        if marks.is_empty() {
+            self.system(t("cmd.marks_none"));
+            return;
+        }
+        if arg.trim().is_empty() {
+            let steps = flow::marks(book, &marks);
+            self.turn.enqueue(steps);
+            return;
+        }
+        match arg.trim().parse::<usize>() {
+            Ok(n) if n >= 1 && n <= marks.len() => self.goto_mark(&marks[n - 1].clone(), n),
+            _ => self.system(&tf("cmd.mark_no_such", &[&marks.len()])),
+        }
+    }
+
+    /// `/unmark <n>`: drop one.
+    fn unmark_command(&mut self, arg: &str) {
+        let Some(book) = self.book.as_ref() else {
+            self.no_book();
+            return;
+        };
+        let id = book.id.clone();
+        let mut progress = self.store.get(&id).cloned().unwrap_or_default();
+        let count = progress.marks.len();
+        match arg.trim().parse::<usize>() {
+            Ok(n) if n >= 1 && n <= count => {
+                let gone = progress.marks.remove(n - 1);
+                self.store.record(&id, progress);
+                let _ = self.store.save();
+                self.system(&tf("cmd.unmark_done", &[&n, &gone.label]));
+            }
+            _ if count == 0 => self.system(t("cmd.marks_none")),
+            _ => self.system(&tf("cmd.mark_no_such", &[&count])),
+        }
+    }
+
+    /// Go to a mark. The character offset decides, not the stored indices: the
+    /// mark may predate a release that cuts this book into chapters differently.
+    fn goto_mark(&mut self, mark: &crate::store::Mark, number: usize) {
+        let Some(book) = self.book.as_ref() else {
+            self.no_book();
+            return;
+        };
+        let (chapter, para) = book.locate(mark.chars as usize);
+        self.pos = Pos { chapter, para };
+        self.resumed = false;
+        self.save_progress();
+        self.system(&tf(
+            "cmd.mark_jumped",
+            &[&number, &mark.label, &(chapter + 1)],
+        ));
+        self.read_more();
+    }
+
     /// `^g` / `^b`: the next or previous hit, wrapping round with a word about it.
     fn step_hit(&mut self, forward: bool) {
         let Some(find) = self.find.as_ref() else {
@@ -1633,6 +1795,7 @@ impl App {
             chars_read: book.chars_before(self.pos.chapter, self.pos.para) as u64,
             sessions: previous.sessions.max(1),
             updated: now_secs(),
+            marks: previous.marks,
         };
         self.store.record(&id, progress);
         let _ = self.store.save();

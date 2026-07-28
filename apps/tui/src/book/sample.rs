@@ -117,5 +117,6 @@ pub fn book() -> Book {
         path: None,
         source: Source::Sample,
         chapters,
+        cover: None,
     }
 }

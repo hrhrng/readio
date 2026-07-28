@@ -8,7 +8,7 @@
 # toolchain, nothing written outside the install directory.
 #
 # The two knobs are arguments, not magic:
-#   install.sh --version tui-v0.2.0-beta.1   a release other than the latest
+#   install.sh --version tui-v0.2.0-beta.2   a release other than the latest
 #   install.sh --dir /usr/local/bin          somewhere else (bring write access)
 #
 # POSIX sh on purpose: this has to run under dash, busybox ash and macOS's old
@@ -49,7 +49,7 @@ usage() {
     cat <<'EOF'
 Usage: install.sh [--version <tag>] [--dir <path>]
 
-  --version <tag>   release to install, e.g. tui-v0.2.0-beta.1 (default: latest)
+  --version <tag>   release to install, e.g. tui-v0.2.0-beta.2 (default: latest)
   --dir <path>      install directory (default: ~/.local/bin)
   --help            this message
 EOF

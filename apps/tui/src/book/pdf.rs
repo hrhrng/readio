@@ -76,6 +76,7 @@ pub fn load(path: &Path) -> Result<Book> {
         path: Some(path.to_path_buf()),
         source: Source::Pdf,
         chapters,
+        cover: None,
     })
 }
 
@@ -594,23 +595,20 @@ fn assemble(groups: &[Group<'_>], file: &str) -> Vec<Chapter> {
             .filter(|t| !t.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| crate::i18n::tf("pdf.part", &[&(chapters.len() + 1), &span]));
-        chapters.push(Chapter {
-            title,
-            href: format!("{file}#{span}"),
-            paras: blocks
-                .iter()
-                .map(|block| {
-                    if block.heading {
-                        Para::Heading {
-                            level: 2,
-                            text: block.text.clone(),
-                        }
-                    } else {
-                        Para::Text(block.text.clone())
+        let paras: Vec<Para> = blocks
+            .iter()
+            .map(|block| {
+                if block.heading {
+                    Para::Heading {
+                        level: 2,
+                        text: block.text.clone(),
                     }
-                })
-                .collect(),
-        });
+                } else {
+                    Para::Text(block.text.clone().into())
+                }
+            })
+            .collect();
+        chapters.push(Chapter::new(title, format!("{file}#{span}"), paras));
     }
     chapters
 }

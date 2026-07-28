@@ -118,7 +118,11 @@ grid = [[" "] * COLS for _ in range(ROWS)]
 # Background colour per cell, so highlight work can be checked from a real
 # terminal stream rather than from a unit test's idea of one.
 bg = [[None] * COLS for _ in range(ROWS)]
+# Italic per cell: emphasis in a book arrives as SGR 3, and the only way to know
+# it survived wrapping and streaming is to read it back off the wire.
+ital = [[False] * COLS for _ in range(ROWS)]
 current_bg = None
+current_italic = False
 row = col = 0
 i = 0
 csi = re.compile(rb"\x1b\[([0-9;?]*)([A-Za-z])")
@@ -139,17 +143,24 @@ while i < len(raw):
             elif cmd == b"J":
                 grid = [[" "] * COLS for _ in range(ROWS)]
                 bg = [[None] * COLS for _ in range(ROWS)]
+                ital = [[False] * COLS for _ in range(ROWS)]
                 row = col = 0
             elif cmd == b"K":
                 for x in range(col, COLS):
                     grid[row][x] = " "
                     bg[row][x] = None
+                    ital[row][x] = False
             elif cmd == b"m":
                 # Only truecolour backgrounds and resets matter here.
                 j = 0
                 while j < len(nums):
                     if nums[j] == 0:
                         current_bg = None
+                        current_italic = False
+                    elif nums[j] == 3:
+                        current_italic = True
+                    elif nums[j] == 23:
+                        current_italic = False
                     elif nums[j] == 49:
                         current_bg = None
                     elif nums[j] == 48 and j + 4 < len(nums) and nums[j + 1] == 2:
@@ -188,6 +199,7 @@ while i < len(raw):
     if char.isprintable() and 0 <= row < ROWS and 0 <= col < COLS:
         grid[row][col] = char
         bg[row][col] = current_bg
+        ital[row][col] = current_italic
         width = 2 if ord(char) > 0x2E7F else 1
         # A double-width glyph physically covers the next cell.
         if width == 2 and col + 1 < COLS:
@@ -217,4 +229,13 @@ if any(cell in (LIGHT, DEEP) for r in bg for cell in r):
 exited = "clean" if status == 0 else f"unexpected: {status!r}"
 tail = bytes(captured[cut:])
 restored = b"\x1b[?1049l" in tail or b"\x1b[?1049l" in bytes(captured)
+# Emphasis map: what the book leaned on, as the terminal received it.
+if any(ital[y][x] for y in range(ROWS) for x in range(COLS)):
+    print("\n[italic]")
+    for y in range(ROWS):
+        if not any(ital[y][x] for x in range(COLS)):
+            continue
+        run = "".join(grid[y][x] for x in range(COLS) if ital[y][x])
+        print(f"  {y:>3}:  {run.strip()}")
+
 print(f"\n[exit: {exited}]  [alt-screen restored: {restored}]  [bytes: {len(raw)}]")

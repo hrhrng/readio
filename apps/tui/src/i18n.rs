@@ -218,6 +218,18 @@ pub const TABLE: &[(&str, &str, &str)] = &[
     ("cmd.sample_opened", "已打开内置示例", "Opened the built-in sample"),
     ("cmd.lang_set", "界面语言：{0}", "Interface language: {0}"),
 
+    // ── bookmarks ──
+    ("cmd.mark_set", "第 {0} 个标记：{1}", "Mark {0}: {1}"),
+    ("cmd.marks_none", "还没有标记。/mark 记下现在这一处，/mark <备注> 顺手写句话。",
+        "No marks yet. /mark keeps this place, /mark <note> keeps it with a word about why."),
+    ("cmd.marks_hint", "输 /marks <序号> 回到某一处，/unmark <序号> 删掉它。",
+        "/marks <n> goes back to one, /unmark <n> drops it."),
+    ("cmd.mark_no_such", "只有 {0} 个标记。/marks 看列表。",
+        "There are only {0} marks. /marks lists them."),
+    ("cmd.mark_jumped", "回到第 {0} 个标记：{1}（第 {2} 章）",
+        "Back at mark {0}: {1} (chapter {2})"),
+    ("cmd.unmark_done", "已删掉第 {0} 个标记：{1}", "Dropped mark {0}: {1}"),
+
     // ── speech ──
     ("tts.on", "朗读已开启：{0}", "Read-aloud on: {0}"),
     ("tts.off", "朗读已关闭", "Read-aloud off"),
@@ -371,6 +383,7 @@ pub const TABLE: &[(&str, &str, &str)] = &[
     ("flow.toc_current", "   ← 当前", "   ← current"),
     ("flow.plan_title", "阅读清单 · {0}  ({1}% 已读)", "Reading plan · {0}  ({1}% read)"),
     ("flow.figure_inline", "> 〔插图〕", "> [figure]"),
+    ("flow.cover", "封面", "cover"),
 
     // ── command line ──
     ("cli.usage", "\

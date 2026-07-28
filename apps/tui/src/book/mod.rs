@@ -1,5 +1,6 @@
 //! Book model: the content side of the app, deliberately ignorant of the UI.
 
+pub mod css;
 pub mod epub;
 pub mod html;
 pub mod media;
@@ -11,6 +12,76 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+/// A run of emphasised text inside a paragraph.
+///
+/// Byte range into the paragraph's own text, so the text itself stays a plain
+/// string: wrapping, pacing, search and read-aloud all keep treating a paragraph
+/// as characters, and emphasis is something the renderer lays over the top —
+/// exactly how the read-aloud highlight already works.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Emphasis {
+    pub start: u32,
+    pub end: u32,
+    /// `<strong>` and `<b>` rather than `<em>`, `<i>` and `<cite>`.
+    pub strong: bool,
+}
+
+/// Paragraph text, with whatever the source emphasised inside it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Rich {
+    pub text: String,
+    pub emphasis: Vec<Emphasis>,
+}
+
+impl Rich {
+    pub fn new(text: String, emphasis: Vec<Emphasis>) -> Self {
+        Self { text, emphasis }
+    }
+}
+
+impl From<String> for Rich {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            emphasis: Vec::new(),
+        }
+    }
+}
+
+impl From<&str> for Rich {
+    fn from(text: &str) -> Self {
+        Self::from(text.to_string())
+    }
+}
+
+impl std::ops::Deref for Rich {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
+impl std::fmt::Display for Rich {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+/// Compare with a plain string and ignore the emphasis: callers asking whether a
+/// paragraph reads a certain way are asking about the words.
+impl PartialEq<str> for Rich {
+    fn eq(&self, other: &str) -> bool {
+        self.text == other
+    }
+}
+
+impl PartialEq<&str> for Rich {
+    fn eq(&self, other: &&str) -> bool {
+        self.text == *other
+    }
+}
+
 /// A block of book content. Mirrors the handful of shapes that survive the
 /// trip from XHTML to a terminal.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,8 +90,8 @@ pub enum Para {
         level: u8,
         text: String,
     },
-    Text(String),
-    Quote(String),
+    Text(Rich),
+    Quote(Rich),
     Code(String),
     /// An illustration. `src` is a path on disk — EPUB images are extracted to
     /// the host directory at load time, so rendering never has to reopen the
@@ -36,8 +107,18 @@ impl Para {
     pub fn text(&self) -> &str {
         match self {
             Para::Heading { text, .. } => text,
-            Para::Text(t) | Para::Quote(t) | Para::Code(t) => t,
+            Para::Text(t) | Para::Quote(t) => &t.text,
+            Para::Code(t) => t,
             Para::Image { alt, .. } => alt,
+        }
+    }
+
+    /// Emphasis inside this paragraph, in its own byte coordinates. Headings are
+    /// already emphatic and code means what it says, so neither carries any.
+    pub fn emphasis(&self) -> &[Emphasis] {
+        match self {
+            Para::Text(t) | Para::Quote(t) => &t.emphasis,
+            _ => &[],
         }
     }
 
@@ -60,9 +141,24 @@ pub struct Chapter {
     /// Source location, shown in tool calls (`OEBPS/ch03.xhtml`).
     pub href: String,
     pub paras: Vec<Para>,
+    /// Line this chapter starts on in its source file. Several chapters can
+    /// come from one EPUB document — a table of contents may point at three
+    /// anchors inside `part1.xhtml` — and then the second one does not start at
+    /// line 1.
+    pub first_line: usize,
 }
 
 impl Chapter {
+    /// A chapter that begins at the top of its own file.
+    pub fn new(title: String, href: String, paras: Vec<Para>) -> Self {
+        Self {
+            title,
+            href,
+            paras,
+            first_line: 1,
+        }
+    }
+
     pub fn char_count(&self) -> usize {
         self.paras.iter().map(Para::char_count).sum()
     }
@@ -79,12 +175,12 @@ impl Chapter {
             .take(para_idx)
             .map(|p| p.text().lines().count().max(1) + 1)
             .sum::<usize>()
-            + 1
+            + self.first_line
     }
 
     /// Lines this chapter occupies in its source file.
     pub fn line_count(&self) -> usize {
-        self.source_line(self.paras.len())
+        self.source_line(self.paras.len()) - self.first_line + 1
     }
 }
 
@@ -104,6 +200,17 @@ pub struct Book {
     pub path: Option<PathBuf>,
     pub source: Source,
     pub chapters: Vec<Chapter>,
+    /// The cover image, already extracted to the host directory. Books that do
+    /// not declare one, and formats that cannot have one, leave it empty.
+    pub cover: Option<Cover>,
+}
+
+/// A book's cover: where the picture is now, and where it came from.
+#[derive(Debug, Clone)]
+pub struct Cover {
+    pub file: PathBuf,
+    /// Path inside the archive, so the tool line that shows it can be truthful.
+    pub href: String,
 }
 
 impl Book {
@@ -185,6 +292,26 @@ impl Book {
     pub fn progress(&self, chapter: usize, para: usize) -> f32 {
         let total = self.char_count().max(1);
         self.chars_before(chapter, para) as f32 / total as f32
+    }
+
+    /// The position `chars` characters into the book.
+    ///
+    /// This is the durable way to name a place. Chapter and paragraph indices
+    /// are not: improve how a book is cut into chapters and every stored
+    /// `(chapter, para)` means somewhere else, while a character offset still
+    /// means the same sentence.
+    pub fn locate(&self, chars: usize) -> (usize, usize) {
+        let mut seen = 0usize;
+        for (ci, chapter) in self.chapters.iter().enumerate() {
+            for (pi, para) in chapter.paras.iter().enumerate() {
+                if seen >= chars {
+                    return (ci, pi);
+                }
+                seen += para.char_count();
+            }
+        }
+        let last = self.chapters.len().saturating_sub(1);
+        (last, self.chapters.get(last).map_or(0, |c| c.paras.len()))
     }
 
     /// Line number to quote in a tool call.
@@ -428,14 +555,15 @@ mod search_tests {
             author: None,
             source: Source::Sample,
             path: None,
-            chapters: vec![Chapter {
-                title: "one".into(),
-                href: "one.html".into(),
-                paras: paras
+            chapters: vec![Chapter::new(
+                "one".into(),
+                "one.html".into(),
+                paras
                     .iter()
-                    .map(|text| Para::Text(text.to_string()))
+                    .map(|text| Para::Text((*text).into()))
                     .collect(),
-            }],
+            )],
+            cover: None,
         }
     }
 

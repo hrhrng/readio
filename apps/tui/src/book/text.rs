@@ -48,6 +48,7 @@ pub fn load(path: &Path, assets: Option<&Path>) -> Result<Book> {
         path: Some(path.to_path_buf()),
         source: Source::Text,
         chapters,
+        cover: None,
     })
 }
 
@@ -91,7 +92,7 @@ fn resolve_images(paras: &mut Vec<Para>, base: &Path, assets: Option<&Path>) {
         if alt.trim().is_empty() {
             false
         } else {
-            *para = Para::Text(alt.clone());
+            *para = Para::Text(alt.clone().into());
             true
         }
     });
@@ -101,11 +102,7 @@ fn resolve_images(paras: &mut Vec<Para>, base: &Path, assets: Option<&Path>) {
 pub fn parse(text: &str, href: &str) -> Vec<Chapter> {
     let href = href.to_string();
     let mut chapters: Vec<Chapter> = Vec::new();
-    let mut current = Chapter {
-        title: String::new(),
-        href: href.clone(),
-        paras: Vec::new(),
-    };
+    let mut current = Chapter::new(String::new(), href.clone(), Vec::new());
 
     let mut in_code = false;
     let mut code_buf = String::new();
@@ -136,11 +133,7 @@ pub fn parse(text: &str, href: &str) -> Vec<Chapter> {
                 let (level, title) = heading;
                 if level <= 2 && !current.paras.is_empty() {
                     chapters.push(finish(current, chapters.len()));
-                    current = Chapter {
-                        title: title.clone(),
-                        href: href.clone(),
-                        paras: Vec::new(),
-                    };
+                    current = Chapter::new(title.clone(), href.clone(), Vec::new());
                 }
                 if current.title.is_empty() {
                     current.title = title.clone();
@@ -156,24 +149,24 @@ pub fn parse(text: &str, href: &str) -> Vec<Chapter> {
                 continue;
             }
             if trimmed.starts_with('>') {
-                current.paras.push(Para::Quote(
-                    trimmed.trim_start_matches('>').trim().to_string(),
-                ));
+                current
+                    .paras
+                    .push(Para::Quote(trimmed.trim_start_matches('>').trim().into()));
                 continue;
             }
             if is_bare_chapter_marker(trimmed) && !current.paras.is_empty() {
                 chapters.push(finish(current, chapters.len()));
-                current = Chapter {
-                    title: trimmed.to_string(),
-                    href: href.clone(),
-                    paras: vec![Para::Heading {
+                current = Chapter::new(
+                    trimmed.to_string(),
+                    href.clone(),
+                    vec![Para::Heading {
                         level: 2,
                         text: trimmed.to_string(),
                     }],
-                };
+                );
                 continue;
             }
-            current.paras.push(Para::Text(trimmed.to_string()));
+            current.paras.push(Para::Text(trimmed.into()));
         }
     }
     if in_code && !code_buf.is_empty() {

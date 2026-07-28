@@ -21,8 +21,12 @@ pub enum Step {
         tool: Tool,
         ms: u64,
     },
-    /// Book content, streamed at reading speed.
-    Say(String),
+    /// Book content, streamed at reading speed, with whatever the book
+    /// emphasised inside it.
+    Say {
+        text: String,
+        emphasis: Vec<crate::book::Emphasis>,
+    },
     /// An illustration, shown whole.
     Image {
         path: std::path::PathBuf,
@@ -34,6 +38,7 @@ pub enum Step {
     Plan {
         title: String,
         items: Vec<PlanItem>,
+        hidden: usize,
     },
     Context(ContextInfo),
     /// Commit a new reading position once the preceding steps have played.
@@ -41,6 +46,17 @@ pub enum Step {
         chapter: usize,
         para: usize,
     },
+}
+
+impl Step {
+    /// Text with nothing emphasised in it — a reply readio wrote itself, rather
+    /// than a passage out of a book.
+    pub fn say(text: String) -> Self {
+        Step::Say {
+            text,
+            emphasis: Vec::new(),
+        }
+    }
 }
 
 /// Things the turn asks the app to do as steps complete.
@@ -213,8 +229,8 @@ impl Turn {
                     });
                     break;
                 }
-                Step::Say(text) => {
-                    let id = sb.push_running(Block::passage());
+                Step::Say { text, emphasis } => {
+                    let id = sb.push_running(Block::passage(emphasis));
                     self.spoken = Some((id, text.clone()));
                     self.active = Some(Active::Stream {
                         id,
@@ -247,8 +263,16 @@ impl Turn {
                 Step::Event(event) => {
                     sb.push(Block::Event(event));
                 }
-                Step::Plan { title, items } => {
-                    sb.push(Block::Plan { title, items });
+                Step::Plan {
+                    title,
+                    items,
+                    hidden,
+                } => {
+                    sb.push(Block::Plan {
+                        title,
+                        items,
+                        hidden,
+                    });
                 }
                 Step::Context(info) => {
                     sb.push(Block::Context(info));
