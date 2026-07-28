@@ -112,6 +112,20 @@ else
     die "need curl or wget"
 fi
 
+# The same, but forgiving of a network that blinks: three tries a second apart.
+# Used where a failure would otherwise be read as a fact about the release.
+fetch_retry() {
+    _url="$1"
+    _out="$2"
+    _try=1
+    while :; do
+        fetch "$_url" "$_out" 2>/dev/null && return 0
+        [ "$_try" -ge 3 ] && return 1
+        _try=$((_try + 1))
+        sleep 1
+    done
+}
+
 resolve_version() {
     [ "$VERSION" != "latest" ] && { echo "$VERSION"; return; }
 
@@ -195,11 +209,19 @@ log "readio: downloading $version for $target"
 fetch "$base/$archive" "$TMP_DIR/$archive" \
     || die "no build for $target in $version — see https://github.com/$REPO/releases"
 
-if fetch "$base/SHA256SUMS" "$TMP_DIR/SHA256SUMS" 2>/dev/null; then
-    verify "$TMP_DIR/$archive" "$TMP_DIR/SHA256SUMS" "$archive"
-else
-    log "readio: this release publishes no checksums, installing unverified"
-fi
+# Every release is built by one workflow, and that workflow writes SHA256SUMS
+# next to the archives unconditionally. So a checksum file that will not arrive
+# is a fact about this attempt — a proxy, a flaky CDN, a rate limit — and never
+# about the release. Saying "this release publishes no checksums" turned that
+# into a silent downgrade to an unverified install, which is the one outcome
+# nobody would have chosen if asked.
+fetch_retry "$base/SHA256SUMS" "$TMP_DIR/SHA256SUMS" \
+    || die "could not fetch the checksums for $version after three tries.
+The archive itself came from the same place a moment ago, so this is usually a
+proxy or a rate limit rather than a missing file. Try again in a minute, or
+check the download by hand against
+  https://github.com/$REPO/releases/download/$version/SHA256SUMS"
+verify "$TMP_DIR/$archive" "$TMP_DIR/SHA256SUMS" "$archive"
 
 # -C first: BSD and GNU tar both honour it that way round.
 tar -C "$TMP_DIR" -xzf "$TMP_DIR/$archive" || die "cannot unpack $archive"
