@@ -85,6 +85,8 @@ pub struct App {
     installing: Option<Install>,
     /// Reveal speed derived from the last clip, restored when speech stops.
     speech_cps: Option<f32>,
+    /// The next passage is waiting for the voice to finish this one.
+    awaiting_voice: bool,
     /// Scrollback entry currently highlighted as spoken.
     lit: Option<u64>,
     /// Passage handed to the speech worker, kept so a `Started` event can be
@@ -255,6 +257,7 @@ impl App {
             speaker: None,
             installing: None,
             speech_cps: None,
+            awaiting_voice: false,
             lit: None,
             voiced: None,
             cursor: None,
@@ -392,6 +395,11 @@ impl App {
             self.notice = None;
         }
 
+        // Whether the next passage is going to be spoken, refreshed every frame
+        // so it can never be stale: a passage held for a voice that is not
+        // coming would simply never appear.
+        self.turn
+            .set_voiced(self.cfg.tts.enabled && self.audio_permitted());
         let effects = self.turn.pump(&mut self.sb, dt.min(200.0));
         if let Some((id, text)) = self.turn.take_spoken() {
             self.mark_match(id, &text);
@@ -401,6 +409,21 @@ impl App {
         self.pump_speech();
         self.pump_install();
         self.advance_cursor();
+        // Last line of defence: a hold belongs to a voice, and a voice that has
+        // stopped without saying so must not take the text down with it.
+        if self.turn.held() && !self.speaking() {
+            self.turn.hold_reveal(None);
+        }
+        // The next passage waits on the voice rather than on the text. Checked
+        // here, once, rather than on the idle event: a voice also stops by being
+        // stopped — a speed change re-renders the queue — and every one of those
+        // endings has to release the reader just the same.
+        if self.awaiting_voice && !self.speaking() {
+            self.awaiting_voice = false;
+            if self.auto && !self.turn.busy() && !self.at_end() {
+                self.read_more();
+            }
+        }
         for effect in effects {
             match effect {
                 Effect::Advance { chapter, para } => {
@@ -430,7 +453,15 @@ impl App {
             }));
         }
         if self.auto && !self.at_end() {
-            self.read_more();
+            // A turn ends when the last character is on screen, which in
+            // read-aloud is a beat before the last clip stops playing. Asking
+            // for the next passage then puts the reader a paragraph ahead of
+            // the voice — and by the end of a chapter, a chapter ahead.
+            if self.speaking() {
+                self.awaiting_voice = true;
+            } else {
+                self.read_more();
+            }
         }
     }
 
@@ -690,8 +721,10 @@ impl App {
         let voiced = self.voiced.clone();
         self.silence();
         self.speaker = None;
-        if let (Some(from), Some((id, text))) = (resume, voiced) {
-            self.enqueue_speech_from(id, &text, from);
+        if let (Some(from), Some((id, text))) = (resume, voiced)
+            && !self.enqueue_speech_from(id, &text, from)
+        {
+            self.turn.hold_reveal(None);
         }
 
         let times = effort::times(self.multiplier());
@@ -753,35 +786,44 @@ impl App {
 
     /// Hand a passage to the speech worker, one sentence at a time.
     fn enqueue_speech(&mut self, id: u64, text: &str) {
-        self.enqueue_speech_from(id, text, 0);
+        if !self.enqueue_speech_from(id, text, 0) {
+            // Nothing is going to say this passage, so nothing should be
+            // holding it shut. A hold with no voice behind it is a frozen
+            // screen.
+            self.turn.hold_reveal(None);
+        }
     }
 
-    /// The same, but skipping everything that ends before `from`.
+    /// The same, but skipping everything that ends before `from`. False when the
+    /// passage went nowhere.
     ///
     /// Used when the speed changes mid-passage: the sentences already spoken
     /// stay spoken, and the one in progress starts again at the new speed.
-    fn enqueue_speech_from(&mut self, id: u64, text: &str, from: usize) {
+    fn enqueue_speech_from(&mut self, id: u64, text: &str, from: usize) -> bool {
         if !self.cfg.tts.enabled || !self.audio_permitted() {
-            return;
+            return false;
         }
         if !self.start_speaker() {
             self.cfg.tts.enabled = false;
-            return;
+            return false;
         }
         let Some(speaker) = self.speaker.as_mut() else {
-            return;
+            return false;
         };
         let sentences = sentence::split(text);
         if sentences.is_empty() {
-            return;
+            return false;
         }
+        let mut queued = 0usize;
         for utterance in sentences {
             if utterance.range.1 <= from {
                 continue;
             }
             speaker.speak(id, &utterance.text, utterance.range);
+            queued += 1;
         }
         self.voiced = Some((id, text.to_string()));
+        queued > 0
     }
 
     /// Drain speech events: move the highlight and pace the text to the audio.
@@ -802,15 +844,7 @@ impl App {
                         self.lit = Some(id);
                     }
                     self.cursor = self.build_cursor(id, range, ms);
-                    // Reveal as fast as the clip is long, so the text lands on
-                    // the last syllable instead of racing ahead of it.
-                    if ms > 0 && chars > 0 {
-                        let cps = (chars as f32 / (ms as f32 / 1000.0)).clamp(4.0, 400.0);
-                        self.speech_cps = Some(cps);
-                        if !self.rushing {
-                            self.turn.set_cps(cps);
-                        }
-                    }
+                    self.follow_clip(id, range, chars, ms);
                 }
                 SpeechEvent::Finished { .. } => {
                     if let Some(cursor) = self.cursor.as_mut() {
@@ -832,6 +866,44 @@ impl App {
                     self.set_mode(ReadMode::Auto);
                 }
             }
+        }
+    }
+
+    /// Let the text out as far as the sentence now being spoken, at the speed
+    /// that sentence is being spoken at.
+    ///
+    /// Two things happen here, and they are the whole of read-aloud's pacing.
+    /// The **ceiling** is the end of this clip's sentence: nothing past it may
+    /// appear, so a synthesis wait stalls the reveal instead of handing it a
+    /// head start it can never give back. The **pace** is whatever is left to
+    /// show divided by however long the clip runs, which means a reveal that
+    /// fell behind during that wait catches up over the next sentence rather
+    /// than trailing the voice for the rest of the chapter.
+    fn follow_clip(&mut self, id: u64, range: (usize, usize), chars: usize, ms: u64) {
+        if ms == 0 {
+            return;
+        }
+        let limit = self.voiced.as_ref().and_then(|(voiced, text)| {
+            (*voiced == id && range.1 <= text.len() && text.is_char_boundary(range.1))
+                .then(|| text[..range.1].chars().count())
+        });
+        // A clip whose passage is no longer streaming — the reader turned the
+        // page, or the text is long since on screen — still sets the pace for
+        // whatever comes next, but has nothing to hold back.
+        let behind = match (limit, self.turn.streaming_passage()) {
+            (Some(limit), Some((streaming, released))) if streaming == id => {
+                self.turn.hold_reveal(Some(limit));
+                limit.saturating_sub(released)
+            }
+            _ => chars,
+        };
+        if behind == 0 {
+            return;
+        }
+        let cps = (behind as f32 / (ms as f32 / 1000.0)).clamp(4.0, 400.0);
+        self.speech_cps = Some(cps);
+        if !self.rushing {
+            self.turn.set_cps(cps);
         }
     }
 
@@ -907,12 +979,22 @@ impl App {
         self.sb.set_highlight(id, Some(state));
     }
 
+    /// Whether audio is still owed: queued, rendering, or playing out.
+    fn speaking(&self) -> bool {
+        self.cursor.is_some() || self.speaker.as_ref().is_some_and(Speaker::busy)
+    }
+
     /// Speech stopped: clear the highlight and go back to timed reading.
     fn speech_done(&mut self) {
         self.sb.clear_highlight();
         self.cursor = None;
         self.idle = false;
         self.lit = None;
+        // Whatever the reason the voice stopped, the text must not stay shut in
+        // behind it. Sentence ranges skip blank lines and code fences, so the
+        // tail of a passage can outlast its last clip; lifting the hold here is
+        // what lets those last characters land.
+        self.turn.hold_reveal(None);
         if self.speech_cps.take().is_some() {
             self.apply_pace();
         }
@@ -1567,6 +1649,9 @@ impl App {
     }
 
     fn interrupt(&mut self) {
+        // Whatever was queued behind the voice is not wanted any more: the
+        // reader asked for silence, not for the next paragraph.
+        self.awaiting_voice = false;
         self.silence();
         if self.turn.interrupt(&mut self.sb) {
             self.sb.push(Block::Event(Event::Interrupted));

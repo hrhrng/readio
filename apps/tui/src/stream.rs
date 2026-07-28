@@ -122,7 +122,18 @@ impl Pacer {
     /// Returns the concatenated text released this frame. A phrase larger than
     /// the remaining budget is released in part, so a slow reading speed still
     /// produces smooth output instead of periodic bursts.
-    pub fn pump(&mut self, queue: &mut VecDeque<Chunk>, dt_ms: f32) -> String {
+    ///
+    /// `ceiling` is a hard limit on how many characters may leave this call,
+    /// whatever the clock says — read-aloud uses it to stop the text at the
+    /// sentence being spoken. A pacer held at its ceiling stops accumulating
+    /// credit, so lifting the hold resumes the stream rather than firing off
+    /// everything the wait was worth in a single frame.
+    pub fn pump(
+        &mut self,
+        queue: &mut VecDeque<Chunk>,
+        dt_ms: f32,
+        ceiling: Option<usize>,
+    ) -> String {
         if self.hold_ms > 0.0 {
             self.hold_ms -= dt_ms;
             if self.hold_ms > 0.0 {
@@ -130,17 +141,22 @@ impl Pacer {
             }
         }
         self.credit += self.cps * dt_ms / 1000.0;
+        let mut room = ceiling.unwrap_or(usize::MAX);
+        if let Some(ceiling) = ceiling {
+            self.credit = self.credit.min(ceiling as f32);
+        }
 
         let mut released = String::new();
-        while self.credit >= 1.0 {
+        while self.credit >= 1.0 && room > 0 {
             let Some(front) = queue.front_mut() else {
                 break;
             };
-            let cost = front.text.chars().count() as f32;
+            let cost = front.text.chars().count();
 
-            if cost <= self.credit {
+            if cost as f32 <= self.credit && cost <= room {
                 let chunk = queue.pop_front().expect("front checked");
-                self.credit -= cost;
+                self.credit -= cost as f32;
+                room -= cost;
                 released.push_str(&chunk.text);
                 if chunk.pause_ms > 0 {
                     self.hold_ms = chunk.pause_ms as f32;
@@ -151,7 +167,10 @@ impl Pacer {
 
             // Partial release: hand over as many characters as the budget buys
             // and leave the remainder (and its pause) in the queue.
-            let take = self.credit.floor() as usize;
+            let take = (self.credit.floor() as usize).min(room).min(cost);
+            if take == 0 {
+                break;
+            }
             let taken: String = front.text.chars().take(take).collect();
             front.text = front.text.chars().skip(take).collect();
             self.credit -= take as f32;
@@ -217,7 +236,7 @@ mod tests {
         let mut queue = split_phrases("一二三四五六七八九十");
         let mut pacer = Pacer::new(10.0);
         // 100ms at 10 chars/s buys one character.
-        let first = pacer.pump(&mut queue, 100.0);
+        let first = pacer.pump(&mut queue, 100.0, None);
         assert!(
             first.chars().count() <= 2,
             "released too much too early: {first:?}"
@@ -230,13 +249,13 @@ mod tests {
         let mut queue = split_phrases("第一句。第二句。");
         let mut pacer = Pacer::new(1_000.0);
 
-        let first = pacer.pump(&mut queue, 16.0);
+        let first = pacer.pump(&mut queue, 16.0, None);
         assert!(first.ends_with('。'), "should stop at the pause: {first:?}");
 
         // Inside the hold window nothing comes out.
-        assert_eq!(pacer.pump(&mut queue, 10.0), "");
+        assert_eq!(pacer.pump(&mut queue, 10.0, None), "");
         // Once it expires, the rest flows.
-        let rest = pacer.pump(&mut queue, 200.0);
+        let rest = pacer.pump(&mut queue, 200.0, None);
         assert!(rest.contains("第二句"), "stream stalled: {rest:?}");
     }
 
@@ -247,12 +266,72 @@ mod tests {
         let mut pacer = Pacer::new(40.0);
         let mut out = String::new();
         for _ in 0..2_000 {
-            out.push_str(&pacer.pump(&mut queue, 16.0));
+            out.push_str(&pacer.pump(&mut queue, 16.0, None));
             if queue.is_empty() {
                 break;
             }
         }
         assert!(queue.is_empty(), "queue never drained");
         assert_eq!(out, text, "streamed text must match the source");
+    }
+
+    /// The ceiling is what keeps the text from running ahead of a voice reading
+    /// it aloud: however fast the pacer is set, it may not release past it.
+    #[test]
+    fn a_ceiling_stops_the_stream_wherever_it_is_put() {
+        let text = "第一句。第二句。第三句。";
+        let mut queue = split_phrases(text);
+        // Fast enough to drain the whole thing in one frame, were it allowed.
+        let mut pacer = Pacer::new(4_000.0);
+        let mut out = String::new();
+        for _ in 0..50 {
+            out.push_str(&pacer.pump(&mut queue, 16.0, Some(4 - out.chars().count())));
+        }
+        assert_eq!(out, "第一句。", "the ceiling is a hard stop, not a hint");
+        assert!(!queue.is_empty(), "the rest must still be waiting");
+    }
+
+    /// A stream held at its ceiling must not save the wait up and spend it the
+    /// moment the hold lifts. Before the credit was clamped, a sentence that
+    /// spent three seconds waiting for its audio came out all at once.
+    #[test]
+    fn a_held_stream_does_not_burst_when_the_hold_lifts() {
+        let mut queue = split_phrases("一二三四五六七八九十十一十二");
+        let mut pacer = Pacer::new(50.0);
+        for _ in 0..60 {
+            assert_eq!(
+                pacer.pump(&mut queue, 16.0, Some(0)),
+                "",
+                "nothing may leave while the ceiling is zero"
+            );
+        }
+        // Nearly a second of waiting, worth 50 characters at this pace. One
+        // frame after the hold lifts should still only be worth one frame.
+        let burst = pacer.pump(&mut queue, 16.0, None);
+        assert!(
+            burst.chars().count() <= 2,
+            "the wait was spent in one frame: {burst:?}"
+        );
+    }
+
+    /// Lifting the ceiling entirely leaves the text exactly as it was written:
+    /// the hold delays characters, it never drops them.
+    #[test]
+    fn a_ceiling_delays_text_without_losing_any_of_it() {
+        let text = "读书这件事，慢一点也没关系。真正折磨人的不是还剩很多。";
+        let mut queue = split_phrases(text);
+        let mut pacer = Pacer::new(200.0);
+        let mut out = String::new();
+        for frame in 0..2_000 {
+            // A ceiling that creeps up two characters every other frame, the
+            // way a sentence of audio releases the text behind it.
+            let ceiling = (frame / 2 * 2usize).saturating_sub(out.chars().count());
+            out.push_str(&pacer.pump(&mut queue, 16.0, Some(ceiling)));
+            if queue.is_empty() {
+                break;
+            }
+        }
+        assert!(queue.is_empty(), "queue never drained");
+        assert_eq!(out, text, "a held stream must still be the same text");
     }
 }

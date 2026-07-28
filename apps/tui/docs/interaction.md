@@ -69,6 +69,7 @@ Rules that follow from calling it a mode:
 - **A mode that cannot work is skipped, not entered.** No speech engine means `shift+tab` steps past read-aloud, having said why once.
 - **A mode explains itself the first time and flashes afterwards.** Cycling should not reprint a paragraph.
 - **The voice follows the page, not the session.** Which language a sentence is in is read off the sentence, and the engine is given the matching voice and phonemes; a bilingual chapter switches mid-page with nothing to set. A reader who wants one voice throughout pins `tts.language`.
+- **In read-aloud the voice is the clock.** The text may not go past the sentence being spoken, and the next passage is not fetched until the voice is finished with this one. See below.
 
 ## Pace, as reasoning effort
 
@@ -86,6 +87,21 @@ Six levels, the six a coding agent offers, and the honest consequence of asking 
 One multiplier drives both worlds: text appears at `reading.speed × multiplier`, and read-aloud plays at the multiplier itself. So a level means the same thing whether the book is being typed out or spoken, and `^r` is one key that always means "change how fast I am reading".
 
 The numbers belong to the reader. All six live under `effort.multipliers` in `~/.readio/config.yaml`, `/rate <0.5-3.0>` retunes the level in force without opening the file, and `/speed <n>` moves the base the multipliers scale. `/effort` with no argument opens the ladder as a select, with each level's multiplier beside it and the one in force marked — the one place the honest numbers and the costume sit side by side.
+
+## Pace, when the voice has it
+
+Read-aloud takes the clock off the reveal and gives it to the audio, which needs more than a change of speed: **the text is not allowed past the sentence being spoken.**
+
+Speed alone is not enough because the two are not merely different, they drift. Chinese comes out of Kokoro at about four characters a second and the default reveal is forty-six, so the reveal has ten seconds of work for every second the voice has. Setting the reveal to the clip's own rate once the clip starts — which is what readio used to do — closes the gap only while a clip is playing. It leaves every synthesis wait wide open, and there is a wait before the first sentence of every passage and between every pair of sentences the renderer has not got ahead of. Each one is small. They only ever accumulate in the same direction.
+
+So there are two rules, and neither is about speed:
+
+- **A passage shows nothing until its first clip exists,** and never goes further than the end of the sentence now playing. A wait for audio is a wait on screen too.
+- **The next passage is fetched when the voice finishes, not when the text does.** Otherwise the reasoning line and tool call belonging to the next turn arrive underneath a paragraph still being read, scrolling the highlighted sentence out of sight.
+
+Within a sentence the pace is still a pace: whatever is left to show, divided by however long the clip runs. Dividing by what is *left* rather than by the sentence's own length is what lets a reveal that fell behind during a wait catch up over the next sentence instead of trailing the voice for the rest of the chapter.
+
+Every hold releases on its own. The voice stopping — finished, interrupted, switched off, or an engine that died — lifts it, and a frame in which something is held with nothing left to speak lifts it too. A reveal waiting on a voice is one missed event away from a page that never fills, so it is worth more than one guard.
 
 ## Where things are shown
 

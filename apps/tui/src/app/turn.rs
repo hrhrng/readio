@@ -78,6 +78,9 @@ enum Active {
         kind: StreamKind,
         queue: VecDeque<Chunk>,
         started: Instant,
+        /// Characters of this stream already on screen, counted the way the
+        /// speech ranges count them — newlines included — so the two agree.
+        released: usize,
     },
     Tool {
         id: u64,
@@ -106,6 +109,17 @@ pub struct Turn {
     pub images: bool,
     /// Passage that just began streaming, for the reader-aloud queue.
     spoken: Option<(u64, String)>,
+    /// How far into the current passage the text may go, in characters.
+    ///
+    /// Read-aloud sets this to the end of the sentence being spoken. Without it
+    /// the reveal is only *nudged* towards the audio — the pacer is told the
+    /// clip's characters per second once the clip starts — and a voice that
+    /// reads Chinese at four characters a second cannot catch a reveal that
+    /// spent the whole synthesis wait running at forty-six.
+    reveal_limit: Option<usize>,
+    /// Whether a passage starting from now is going to be read aloud, and so
+    /// should wait for its first clip instead of streaming into the silence.
+    voiced: bool,
     /// When the reader pressed pause. Everything in flight keeps its place; the
     /// clocks are wound forward by this much on the way back, so a tool call
     /// paused for a minute does not come back claiming it took a minute.
@@ -126,6 +140,8 @@ impl Turn {
             image_rows: 16,
             images: true,
             spoken: None,
+            reveal_limit: None,
+            voiced: false,
             paused: None,
         }
     }
@@ -183,6 +199,42 @@ impl Turn {
         self.reading.cps
     }
 
+    /// Stop the passage reveal at `chars` characters in. `None` lets it run at
+    /// whatever pace it was given.
+    pub fn hold_reveal(&mut self, limit: Option<usize>) {
+        self.reveal_limit = limit;
+    }
+
+    /// Whether something is currently holding the reveal back.
+    pub fn held(&self) -> bool {
+        self.reveal_limit.is_some()
+    }
+
+    /// Tell the turn that passages from here on are read aloud, so each one
+    /// waits for its own audio before showing a character.
+    ///
+    /// The alternative — arming the hold from the app once the passage has been
+    /// handed to the speech worker — leaves one frame in which the old pace is
+    /// still in force, and one frame of a 4000 characters-per-second rush is a
+    /// visible flash of the paragraph before it snaps back.
+    pub fn set_voiced(&mut self, voiced: bool) {
+        self.voiced = voiced;
+    }
+
+    /// The passage streaming right now: which block it is, and how many of its
+    /// characters have been shown.
+    pub fn streaming_passage(&self) -> Option<(u64, usize)> {
+        match &self.active {
+            Some(Active::Stream {
+                id,
+                kind: StreamKind::Passage,
+                released,
+                ..
+            }) => Some((*id, *released)),
+            _ => None,
+        }
+    }
+
     pub fn busy(&self) -> bool {
         self.active.is_some() || !self.steps.is_empty()
     }
@@ -200,6 +252,7 @@ impl Turn {
         let was_busy = self.busy();
         self.steps.clear();
         self.spoken = None;
+        self.reveal_limit = None;
         match self.active.take() {
             Some(Active::Stream { id, started, .. }) => {
                 sb.finish(id, Some(elapsed_ms(started)));
@@ -231,19 +284,29 @@ impl Turn {
                     kind,
                     queue,
                     started,
+                    released,
                 }) => {
                     let pacer = match kind {
                         StreamKind::Thinking => &mut self.thinking,
                         StreamKind::Passage => &mut self.reading,
                     };
-                    let released = pacer.pump(queue, dt_ms);
-                    if !released.is_empty() {
-                        let counted = released.chars().filter(|c| *c != '\n').count();
+                    // Reasoning is readio's own voice and nobody speaks it, so
+                    // only book content answers to the hold.
+                    let ceiling = match kind {
+                        StreamKind::Passage => self
+                            .reveal_limit
+                            .map(|limit| limit.saturating_sub(*released)),
+                        StreamKind::Thinking => None,
+                    };
+                    let text = pacer.pump(queue, dt_ms, ceiling);
+                    if !text.is_empty() {
+                        *released += text.chars().count();
+                        let counted = text.chars().filter(|c| *c != '\n').count();
                         if *kind == StreamKind::Passage {
                             self.turn_chars += counted;
                             self.session_chars += counted;
                         }
-                        sb.push_chunk(*id, &released);
+                        sb.push_chunk(*id, &text);
                     }
                     if queue.is_empty() {
                         sb.finish(*id, Some(elapsed_ms(*started)));
@@ -280,17 +343,23 @@ impl Turn {
                         kind: StreamKind::Thinking,
                         queue: split_phrases(&text),
                         started: Instant::now(),
+                        released: 0,
                     });
                     break;
                 }
                 Step::Say { text, emphasis } => {
                     let id = sb.push_running(Block::passage(emphasis));
                     self.spoken = Some((id, text.clone()));
+                    // A passage about to be read aloud starts held shut: the
+                    // first characters belong to the first clip, and that clip
+                    // does not exist yet.
+                    self.reveal_limit = self.voiced.then_some(0);
                     self.active = Some(Active::Stream {
                         id,
                         kind: StreamKind::Passage,
                         queue: split_phrases(&text),
                         started: Instant::now(),
+                        released: 0,
                     });
                     break;
                 }
@@ -354,4 +423,111 @@ impl Turn {
 
 fn elapsed_ms(since: Instant) -> u64 {
     since.elapsed().as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::scrollback::Scrollback;
+
+    fn passage(text: &str) -> Step {
+        Step::Say {
+            text: text.to_string(),
+            emphasis: Vec::new(),
+        }
+    }
+
+    /// Fast enough to empty any of these passages in a single frame, which is
+    /// the point: everything these tests hold back is held back by the hold.
+    fn turn(voiced: bool) -> (Turn, Scrollback) {
+        let mut turn = Turn::new(4_000.0);
+        turn.set_voiced(voiced);
+        (turn, Scrollback::new())
+    }
+
+    fn shown(turn: &Turn) -> usize {
+        turn.streaming_passage()
+            .map(|(_, chars)| chars)
+            .unwrap_or(0)
+    }
+
+    /// The whole of the bug this exists for: read-aloud used to stream the text
+    /// at the reading speed and only *nudge* it towards the audio once a clip
+    /// started. Chinese is spoken at about four characters a second and the
+    /// reveal ran at forty-six, so by the time the first clip existed the
+    /// paragraph was already on screen — and with auto-advance on, so was the
+    /// rest of the chapter.
+    #[test]
+    fn a_passage_waiting_for_its_voice_shows_nothing() {
+        let (mut turn, mut sb) = turn(true);
+        turn.enqueue(vec![passage("第一句。第二句。第三句。")]);
+        for _ in 0..120 {
+            turn.pump(&mut sb, 16.0);
+        }
+        assert_eq!(shown(&turn), 0, "not one character before the first clip");
+        assert!(turn.busy(), "the passage is waiting, not finished");
+    }
+
+    /// Nothing past the sentence being spoken, and everything up to it.
+    #[test]
+    fn the_reveal_stops_where_the_voice_is() {
+        let (mut turn, mut sb) = turn(true);
+        turn.enqueue(vec![passage("第一句。第二句。第三句。")]);
+        turn.pump(&mut sb, 16.0);
+
+        turn.hold_reveal(Some(4));
+        for _ in 0..60 {
+            turn.pump(&mut sb, 16.0);
+        }
+        assert_eq!(shown(&turn), 4, "「第一句。」 and not a character more");
+
+        turn.hold_reveal(Some(8));
+        for _ in 0..60 {
+            turn.pump(&mut sb, 16.0);
+        }
+        assert_eq!(shown(&turn), 8, "the second sentence, once it is spoken");
+    }
+
+    /// The hold is lifted when the voice stops for any reason, and the rest of
+    /// the passage has to be able to land: sentence ranges skip blank lines and
+    /// code fences, so a passage can outlive its last clip.
+    #[test]
+    fn lifting_the_hold_lets_the_rest_of_the_passage_land() {
+        let (mut turn, mut sb) = turn(true);
+        turn.enqueue(vec![passage("第一句。第二句。")]);
+        turn.pump(&mut sb, 16.0);
+        turn.hold_reveal(None);
+        for _ in 0..60 {
+            turn.pump(&mut sb, 16.0);
+        }
+        assert!(!turn.busy(), "the passage should have finished");
+    }
+
+    /// Silent reading is untouched: no voice, no hold.
+    #[test]
+    fn a_passage_nobody_is_speaking_streams_straight_away() {
+        let (mut turn, mut sb) = turn(false);
+        turn.enqueue(vec![passage("第一句。第二句。")]);
+        // The first frame starts the stream; the second is the first one that
+        // can release anything.
+        turn.pump(&mut sb, 16.0);
+        turn.pump(&mut sb, 16.0);
+        assert!(
+            shown(&turn) > 0,
+            "silent reading must not wait for anything"
+        );
+    }
+
+    /// Reasoning is readio's own voice and nothing speaks it, so a hold left
+    /// over from a passage must not freeze the thinking line too.
+    #[test]
+    fn a_hold_meant_for_a_passage_does_not_stop_the_thinking() {
+        let (mut turn, mut sb) = turn(true);
+        turn.enqueue(vec![Step::Think("正在检索相关段落。".to_string())]);
+        turn.hold_reveal(Some(0));
+        for _ in 0..60 {
+            turn.pump(&mut sb, 16.0);
+        }
+        assert!(!turn.busy(), "thinking answers to no clip");
+    }
 }
