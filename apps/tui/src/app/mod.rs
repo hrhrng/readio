@@ -15,8 +15,11 @@ use ratatui::widgets::{Block as UiBlock, Widget};
 
 use crate::book::Book;
 use crate::config::Config;
+use crate::effort::{self, Effort};
 use crate::i18n::{t, tf};
 use crate::library::{Library, Mode};
+// The library's `Mode` is how a file is held; this one is how the reader moves.
+use crate::mode::Mode as ReadMode;
 use crate::paths;
 use crate::store::{Progress, Store, now_secs};
 use crate::theme::theme;
@@ -25,6 +28,7 @@ use crate::tts::sentence::Unit;
 use crate::tts::{Speaker, SpeechEvent, command::CommandSynth, sentence};
 use crate::ui::block::{Block, Event, Highlight, LibraryRow};
 use crate::ui::chrome::{self, Chrome};
+use crate::ui::menu;
 use crate::ui::prompt::Prompt;
 use crate::ui::scrollback::Scrollback;
 
@@ -55,6 +59,9 @@ pub struct App {
     resumed: bool,
     /// Keep queueing turns until interrupted.
     auto: bool,
+    /// Modes whose full explanation has already been printed this session, so
+    /// that cycling with shift+tab does not reprint the same paragraph.
+    explained: [bool; 3],
     /// Reader's configured speed, restored after a rush.
     base_cps: f32,
     rushing: bool,
@@ -85,6 +92,9 @@ pub struct App {
     gate: Option<Gate>,
     /// The last search, kept so its hits can be walked and lit up.
     find: Option<Find>,
+    /// Row highlighted in the slash-command menu. The list itself is derived
+    /// from what is typed, so only the cursor has to be remembered.
+    menu_at: usize,
     /// Term to highlight in the next passage that contains it, set when a jump
     /// lands on a hit.
     marking: Option<String>,
@@ -171,10 +181,12 @@ impl App {
     pub fn new(library: Library, store: Store, opened: Option<Book>, note: Option<String>) -> Self {
         let (cfg, cfg_note) = Config::load();
         let cps = cfg.reading.speed;
+        // The pacer starts at the pace the effort level asks for, not the base.
+        let paced = (cps * cfg.effort.multipliers.get(cfg.effort.level)).clamp(4.0, 4000.0);
         let mut app = Self {
             sb: Scrollback::new(),
             prompt: Prompt::new(),
-            turn: Turn::new(cps),
+            turn: Turn::new(paced),
             book: None,
             pos: Pos::default(),
             store,
@@ -185,6 +197,7 @@ impl App {
             notice: None,
             resumed: false,
             auto: false,
+            explained: [false; 3],
             base_cps: cps,
             rushing: false,
             resume: None,
@@ -201,6 +214,7 @@ impl App {
             gate: None,
             find: None,
             marking: None,
+            menu_at: 0,
         };
 
         if app.cfg.tts.output.is_active() {
@@ -360,8 +374,8 @@ impl App {
 
     fn on_turn_finished(&mut self) {
         if self.rushing {
-            self.turn.set_cps(self.base_cps);
             self.rushing = false;
+            self.apply_pace();
         }
         let chars = self.turn.turn_chars;
         if chars > 0 {
@@ -588,21 +602,96 @@ impl App {
 
     // ── read aloud ───────────────────────────────────────────────────────────
 
-    /// Engine name while a sentence is actually sounding, for the status line.
+    // ── pace ─────────────────────────────────────────────────────────────────
+
+    /// What the current effort level is worth, as a multiplier.
+    ///
+    /// One number for both worlds: the reveal speed is scaled by it and the voice
+    /// plays at it, so `xhigh` reads slowly whether readio is typing or speaking.
+    pub fn multiplier(&self) -> f32 {
+        self.cfg.effort.multipliers.get(self.cfg.effort.level)
+    }
+
+    /// Characters per second the pacer should run at, effort included.
+    fn reveal_cps(&self) -> f32 {
+        (self.base_cps * self.multiplier()).clamp(4.0, 4000.0)
+    }
+
+    /// Hand the pacer the current pace, unless a rush or a clip owns it.
+    fn apply_pace(&mut self) {
+        if !self.rushing && self.speech_cps.is_none() {
+            let cps = self.reveal_cps();
+            self.turn.set_cps(cps);
+        }
+    }
+
+    /// `/effort <level>` and `^r`: change the pace of everything at once.
+    ///
+    /// Clips are rendered at a speed rather than resampled at playback, so
+    /// everything already prefetched is wrong the moment this changes. Dropping
+    /// the speaker throws those away, and re-queueing from the start of the
+    /// sentence that was playing means the reader hears the new pace within a
+    /// sentence instead of at the next passage.
+    fn set_effort(&mut self, level: Effort) {
+        self.cfg.effort.level = level;
+        let _ = self.cfg.save();
+        self.apply_pace();
+
+        let resume = self
+            .cursor
+            .as_ref()
+            .map(|cursor| cursor.sentence.0)
+            .filter(|_| self.cfg.tts.enabled);
+        let voiced = self.voiced.clone();
+        self.silence();
+        self.speaker = None;
+        if let (Some(from), Some((id, text))) = (resume, voiced) {
+            self.enqueue_speech_from(id, &text, from);
+        }
+
+        let times = effort::times(self.multiplier());
+        self.notice(&tf("effort.set", &[&level.label(), &times]));
+    }
+
+    /// `/effort` with no argument: the whole ladder, with the active level marked
+    /// and each level's multiplier spelled out, since the multipliers are the
+    /// reader's to change.
+    fn effort_report(&mut self) {
+        let level = self.cfg.effort.level;
+        let rows: Vec<String> = effort::LEVELS
+            .iter()
+            .map(|candidate| {
+                let mark = if *candidate == level { "❯" } else { " " };
+                format!(
+                    "{mark} {:<8} {:>6}   {}",
+                    candidate.label(),
+                    effort::times(self.cfg.effort.multipliers.get(*candidate)),
+                    candidate.about()
+                )
+            })
+            .collect();
+        let cps = format!("{:.0}", self.reveal_cps());
+        self.system(&tf(
+            "effort.now",
+            &[&level.label(), &effort::times(self.multiplier()), &cps],
+        ));
+        for row in rows {
+            self.system(&row);
+        }
+        self.system(t("effort.tune"));
+    }
+
     /// What the status line says while audio is playing: the engine, plus the
-    /// speed whenever it is not 1× — the number an audiobook listener wants to
-    /// glance at without opening a menu.
+    /// multiplier whenever it is not 1× — the number a listener wants to glance
+    /// at without opening a menu.
     fn speaking_engine(&self) -> Option<String> {
         match (&self.speaker, self.lit) {
             (Some(speaker), Some(_)) => {
                 let engine = speaker.engine();
-                if (self.cfg.tts.rate - 1.0).abs() < 0.001 {
+                if (self.multiplier() - 1.0).abs() < 0.001 {
                     Some(engine.to_string())
                 } else {
-                    Some(format!(
-                        "{engine} {}",
-                        crate::tts::speed_label(self.cfg.tts.rate)
-                    ))
+                    Some(format!("{engine} {}", effort::times(self.multiplier())))
                 }
             }
             _ => None,
@@ -623,7 +712,7 @@ impl App {
             &self.cfg.tts.engine,
             spec,
             self.cfg.active_voice(),
-            self.cfg.tts.rate,
+            self.multiplier(),
         );
         if !synth.is_available() {
             let program = synth.program().unwrap_or_default();
@@ -795,30 +884,21 @@ impl App {
         self.cursor = None;
         self.idle = false;
         self.lit = None;
-        if self.speech_cps.take().is_some() && !self.rushing {
-            self.turn.set_cps(self.base_cps);
+        if self.speech_cps.take().is_some() {
+            self.apply_pace();
         }
     }
 
-    /// Ctrl+S and `/tts`: flip read-aloud on or off.
+    /// Ctrl+S and `/tts on|off`: step in and out of read-aloud.
+    ///
+    /// Leaving read-aloud lands in auto-scroll rather than manual: the text was
+    /// moving a moment ago, and silence is the only thing the reader asked to
+    /// change.
     fn toggle_speech(&mut self) {
         if self.cfg.tts.enabled {
-            self.cfg.tts.enabled = false;
-            self.silence();
-            self.notice(t("tts.off"));
+            self.set_mode(ReadMode::Auto);
         } else {
-            self.cfg.tts.enabled = true;
-            if self.start_speaker() {
-                let engine = self.speech_label();
-                self.notice(&tf("tts.on", &[&engine]));
-                // Turning speech on while routed to the wrong output should not
-                // look like it worked.
-                if !self.audio_permitted() {
-                    self.report_audio_block();
-                }
-            } else {
-                self.cfg.tts.enabled = false;
-            }
+            self.set_mode(ReadMode::Speak);
         }
     }
 
@@ -848,9 +928,16 @@ impl App {
             .render(area, frame.buffer_mut());
 
         let prompt_h = self.prompt.height(area.width);
-        let [header, body, prompt, status] = Layout::vertical([
+        let rows = self.menu_rows();
+        let menu_selected = self.menu_at.min(rows.len().saturating_sub(1));
+        // The menu may not eat the whole screen: the header, the prompt, the
+        // status line and three lines of book always come first.
+        let menu_h = menu::height(&rows, menu_selected, area.width)
+            .min(area.height.saturating_sub(prompt_h + 5));
+        let [header, body, menu_area, prompt, status] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(3),
+            Constraint::Length(menu_h),
             Constraint::Length(prompt_h),
             Constraint::Length(1),
         ])
@@ -883,9 +970,14 @@ impl App {
                 .book
                 .as_ref()
                 .map_or(0.0, |b| b.progress(self.pos.chapter, self.pos.para)),
-            cps: self.turn.cps(),
+            // The chip shows the speed the reader chose, not the rushed one a
+            // held-down enter produces.
+            cps: self.base_cps,
+            mode: self.mode(),
+            effort: self.cfg.effort.level,
             session_chars: self.turn.session_chars,
             busy: self.turn.busy(),
+            paused: self.turn.paused(),
             tick: self.tick,
             notice: self.notice.as_ref().map(|(m, _)| m.as_str()),
             scrolled: self.sb.scrolled_away(),
@@ -900,6 +992,9 @@ impl App {
         let buf = frame.buffer_mut();
         chrome::render_header(header, buf, &chrome);
         self.sb.render(inset(body), buf, self.tick);
+        if !rows.is_empty() {
+            menu::render(menu_area, buf, &rows, menu_selected);
+        }
         self.prompt.render(prompt, buf, self.turn.busy());
         chrome::render_status(status, buf, &chrome);
         if self.show_help {
@@ -979,10 +1074,19 @@ impl App {
                     self.prompt.end();
                 }
             }
+            // While the command menu is open the arrows belong to it: moving a
+            // cursor through six offered commands is what those keys mean here.
+            (KeyCode::Up, _) if self.menu_open() => self.menu_step(-1),
+            (KeyCode::Down, _) if self.menu_open() => self.menu_step(1),
+            (KeyCode::Tab, _) if self.menu_open() => self.menu_complete(),
+            // shift+tab cycles the reading mode. crossterm reports it as
+            // BackTab, but some terminals send a plain shifted tab instead.
+            (KeyCode::BackTab, _) => self.cycle_mode(),
+            (KeyCode::Tab, _) if key.modifiers.contains(KeyModifiers::SHIFT) => self.cycle_mode(),
             (KeyCode::Up, _) => self.sb.scroll_lines(-2),
-            (KeyCode::Down, _) => self.sb.scroll_lines(2),
+            (KeyCode::Down, _) => self.scroll_down(2),
             (KeyCode::PageUp, _) => self.sb.page(-1),
-            (KeyCode::PageDown, _) => self.sb.page(1),
+            (KeyCode::PageDown, _) => self.page_down(),
             _ => {}
         }
     }
@@ -990,7 +1094,7 @@ impl App {
     pub fn on_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
             MouseEventKind::ScrollUp => self.sb.scroll_lines(-3),
-            MouseEventKind::ScrollDown => self.sb.scroll_lines(3),
+            MouseEventKind::ScrollDown => self.scroll_down(3),
             _ => {}
         }
     }
@@ -1017,9 +1121,91 @@ impl App {
         }
     }
 
+    // ── the slash-command menu ───────────────────────────────────────────────
+
+    /// What the menu needs to know about the reader: which level, which mode,
+    /// which engines, and the base pace the multipliers scale.
+    fn menu_ctx(&self) -> menu::Ctx<'_> {
+        menu::Ctx {
+            cfg: &self.cfg,
+            mode: self.mode(),
+            base_cps: self.base_cps,
+        }
+    }
+
+    /// Whether the menu is on screen, which decides who owns the arrow keys.
+    fn menu_open(&self) -> bool {
+        !self.menu_rows().is_empty()
+    }
+
+    /// The rows on offer: commands while a name is being typed, and the answers
+    /// to that command once it has one.
+    fn menu_rows(&self) -> Vec<menu::Row> {
+        menu::offer(self.prompt.line(), &self.menu_ctx())
+    }
+
+    fn menu_step(&mut self, delta: isize) {
+        let count = self.menu_rows().len();
+        if count == 0 {
+            return;
+        }
+        let at = self.menu_at.min(count - 1) as isize + delta;
+        // Wrapping, because a list of six with no wrap makes the reader hold a
+        // key down and wonder whether it is stuck.
+        self.menu_at = at.rem_euclid(count as isize) as usize;
+    }
+
+    /// `tab`: write the highlighted row into the prompt. A command that still
+    /// needs an argument is left with a trailing space, which is also what opens
+    /// the second level of the menu.
+    fn menu_complete(&mut self) {
+        let rows = self.menu_rows();
+        let Some(row) = rows.get(self.menu_at.min(rows.len().saturating_sub(1))) else {
+            return;
+        };
+        let line = row.insert.clone();
+        self.prompt.set(&line);
+        self.menu_at = 0;
+    }
+
+    /// `⏎` with the menu open runs the highlighted row rather than whatever
+    /// half-typed name is in the prompt.
+    fn menu_submit(&mut self) -> bool {
+        let rows = self.menu_rows();
+        let Some(row) = rows.get(self.menu_at.min(rows.len().saturating_sub(1))) else {
+            return false;
+        };
+        // A row still waiting for an argument is completed, not run: `⏎` on
+        // `/goto <n>` cannot mean anything yet.
+        if !row.run {
+            self.menu_complete();
+            return true;
+        }
+        let name = row.insert.trim_start_matches('/').to_string();
+        self.prompt.clear();
+        self.menu_at = 0;
+        self.sb.push(Block::User(format!("/{name}")));
+        self.sb.to_bottom();
+        self.command(&name);
+        true
+    }
+
+    /// `esc`: pause what is playing, then stop it if pressed again.
+    ///
+    /// Pausing used to be interrupting, and interrupting threw the turn away
+    /// without advancing the position — so the next enter re-read the passage
+    /// from the top and the screen filled with the same paragraphs twice. Pause
+    /// keeps the place; a second press is the way out.
     fn on_escape(&mut self) {
-        if self.turn.busy() {
+        if self.menu_open() {
+            // Closing the menu is what esc means here; the typed text stays, so
+            // one more press clears it.
+            self.prompt.clear();
+            self.menu_at = 0;
+        } else if self.turn.paused() {
             self.interrupt();
+        } else if self.turn.busy() {
+            self.pause();
         } else if !self.prompt.is_empty() {
             self.prompt.clear();
         } else if self.sb.scrolled_away() {
@@ -1027,27 +1213,173 @@ impl App {
         }
     }
 
+    fn pause(&mut self) {
+        if !self.turn.pause() {
+            return;
+        }
+        // The mode is a setting, not a consequence: pausing holds the place
+        // without demoting auto-scroll to manual. Audio cannot be frozen
+        // mid-clip, so it stops and picks up at the sentence the reader was on.
+        self.silence();
+    }
+
+    fn resume_turn(&mut self) {
+        if !self.turn.paused() {
+            return;
+        }
+        self.turn.resume();
+        let voiced = self.voiced.clone();
+        let from = self.cursor.as_ref().map(|cursor| cursor.sentence.0);
+        if self.cfg.tts.enabled
+            && let (Some(from), Some((id, text))) = (from, voiced)
+        {
+            self.enqueue_speech_from(id, &text, from);
+        }
+    }
+
+    // ── the three reading modes ──────────────────────────────────────────────
+
+    /// Which of the three modes the two underlying switches add up to.
+    pub fn mode(&self) -> ReadMode {
+        ReadMode::of(self.auto, self.cfg.tts.enabled)
+    }
+
+    /// `shift+tab`: the next mode, the way a coding agent cycles its own.
+    fn cycle_mode(&mut self) {
+        let want = self.mode().next();
+        if !self.set_mode(want) && want == ReadMode::Speak {
+            // No usable voice on this machine: skip the mode that cannot work
+            // rather than making the reader press the key twice for nothing.
+            self.set_mode(ReadMode::Manual);
+        }
+    }
+
+    /// Move to `want`, reconcile both switches, and say what it means.
+    ///
+    /// False when the mode could not be entered, which happens only for
+    /// read-aloud with no working engine — and `start_speaker` has already said
+    /// why by then.
+    fn set_mode(&mut self, want: ReadMode) -> bool {
+        if want.speaks() && !self.cfg.tts.enabled {
+            self.cfg.tts.enabled = true;
+            if !self.start_speaker() {
+                self.cfg.tts.enabled = false;
+                self.notice(t("mode.tts_unavailable"));
+                return false;
+            }
+            // Speech routed to a device the reader excluded is not read-aloud.
+            if !self.audio_permitted() {
+                self.report_audio_block();
+            }
+        } else if !want.speaks() && self.cfg.tts.enabled {
+            self.cfg.tts.enabled = false;
+            self.silence();
+        }
+        self.auto = want.scrolls();
+        self.cfg.reading.auto = self.auto;
+        let _ = self.cfg.save();
+
+        // The first visit to a mode explains it, including how to change its
+        // speed: a chip that says `⏵⏵` is not documentation. After that a switch
+        // is one line in the status row, because someone cycling with shift+tab
+        // does not want the paragraph three times.
+        if self.explained[want.index()] {
+            // The chip already shows the glyph, so the flash names the mode and
+            // the number that mode obeys.
+            let flash = match want {
+                ReadMode::Manual => want.name().to_string(),
+                ReadMode::Auto => format!(
+                    "{}  ·  {}",
+                    want.name(),
+                    crate::metrics::rate_label(self.reveal_cps())
+                ),
+                ReadMode::Speak => {
+                    format!("{}  ·  {}", want.name(), effort::times(self.multiplier()))
+                }
+            };
+            self.notice(&flash);
+        } else {
+            self.explained[want.index()] = true;
+            let message = match want {
+                ReadMode::Manual => t("mode.set_manual").to_string(),
+                ReadMode::Auto => tf(
+                    "mode.set_auto",
+                    &[&crate::metrics::rate_label(self.reveal_cps())],
+                ),
+                ReadMode::Speak => tf("mode.set_tts", &[&effort::times(self.multiplier())]),
+            };
+            self.system(&message);
+        }
+
+        // A mode that moves by itself should start moving.
+        if want.scrolls() && self.book.is_some() && !self.turn.busy() && !self.at_end() {
+            self.sb.to_bottom();
+            self.read_more();
+        }
+        true
+    }
+
+    /// `↓` and the wheel: scroll, unless the reader is already at the bottom in
+    /// manual mode, where it means "more book".
+    fn scroll_down(&mut self, lines: i32) {
+        if !self.load_more_if_at_tail() {
+            self.sb.scroll_lines(lines);
+        }
+    }
+
+    /// `pgdn`, same rule by the page.
+    fn page_down(&mut self) {
+        if !self.load_more_if_at_tail() {
+            self.sb.page(1);
+        }
+    }
+
+    /// At the very bottom in manual mode, scrolling down is a request for more
+    /// book — the way reaching the end of a list loads the next page. In the modes
+    /// that scroll themselves it is only ever scrolling.
+    fn load_more_if_at_tail(&mut self) -> bool {
+        let ready = !self.sb.scrolled_away()
+            && self.mode() == ReadMode::Manual
+            && self.book.is_some()
+            && !self.turn.busy()
+            && !self.at_end();
+        if ready {
+            self.read_more();
+        }
+        ready
+    }
+
     fn interrupt(&mut self) {
-        self.auto = false;
         self.silence();
         if self.turn.interrupt(&mut self.sb) {
             self.sb.push(Block::Event(Event::Interrupted));
         }
         if self.rushing {
-            self.turn.set_cps(self.base_cps);
             self.rushing = false;
+            self.apply_pace();
         }
         self.save_progress();
     }
 
     fn on_enter(&mut self) {
+        if self.menu_open() && self.menu_submit() {
+            return;
+        }
         if self.prompt.is_empty() {
-            // Enter during a turn means "get on with it".
+            // Paused: pick up where the reader stopped, rather than starting
+            // the passage again from its first word.
+            if self.turn.paused() {
+                self.resume_turn();
+                return;
+            }
+            // Enter during a turn means "get on with it" — including the tool
+            // call that is spinning, which used to ignore the key entirely.
             if self.turn.busy() {
                 if !self.rushing {
                     self.rushing = true;
                     self.turn.set_cps(RUSH_CPS);
                 }
+                self.turn.rush();
                 return;
             }
             self.sb.to_bottom();
@@ -1063,42 +1395,42 @@ impl App {
             }
             return;
         }
-        let line = self.prompt.take();
-        self.sb.push(Block::User(line.clone()));
-        self.sb.to_bottom();
+        let typed = self.prompt.line().trim().to_string();
 
-        if let Some(rest) = line.strip_prefix('/') {
-            self.command(rest.trim());
-            return;
-        }
-        // A bare number means the numbered list on screen. With a book open and
-        // a search in hand that list is the hits; otherwise it is the library.
-        if let Ok(index) = line.trim().parse::<usize>() {
-            if self.book.is_some()
+        // A bare number picks from the numbered list on screen: the search hits
+        // when there are any, the library otherwise. It is not a question and
+        // never was, which is why it comes first.
+        if let Ok(index) = typed.parse::<usize>() {
+            let hits_live = self.book.is_some()
                 && self
                     .find
                     .as_ref()
-                    .is_some_and(|find| !find.hits.shown.is_empty())
-            {
-                self.goto_hit(index.saturating_sub(1));
-                return;
-            }
-            if self.library.get(index).is_some() {
-                self.open_entry(index);
+                    .is_some_and(|find| !find.hits.shown.is_empty());
+            if hits_live || self.library.get(index).is_some() {
+                let line = self.prompt.take();
+                self.sb.push(Block::User(line));
+                self.sb.to_bottom();
+                if hits_live {
+                    self.goto_hit(index.saturating_sub(1));
+                } else {
+                    self.open_entry(index);
+                }
                 return;
             }
         }
-        match self.book.as_ref() {
-            Some(book) => {
-                let (steps, needle, hits) = flow::answer(book, &line);
-                self.remember_search(needle, hits);
-                self.turn.enqueue(steps);
-            }
-            None => {
-                self.system(t("cmd.no_book"));
-                self.show_library();
-            }
+
+        // Anything else that is not a command is left alone. readio used to read
+        // a stray line as a question and search the book for it, which turned a
+        // typo into a Grep for `2` across eighty-five paragraphs. The text stays
+        // in the prompt, and the status line says what a command looks like.
+        if !typed.starts_with('/') {
+            self.notice(t("cmd.needs_slash"));
+            return;
         }
+        let line = self.prompt.take();
+        self.sb.push(Block::User(line.clone()));
+        self.sb.to_bottom();
+        self.command(line.trim_start_matches('/').trim());
     }
 
     // ── actions ──────────────────────────────────────────────────────────────
@@ -1110,7 +1442,6 @@ impl App {
         };
         if self.at_end() {
             self.sb.push(Block::Event(Event::BookComplete));
-            self.auto = false;
             return;
         }
         let (steps, _next) = flow::continue_reading(book, self.pos, self.resumed);
@@ -1233,30 +1564,47 @@ impl App {
                     self.jump(self.pos.chapter - 1);
                 }
             }
+            // The base pace the effort multiplier scales. `/effort` is the
+            // everyday control; this is the one for someone who knows they read
+            // at 70 characters a second.
             "speed" | "cps" => match arg.parse::<f32>() {
                 Ok(v) if (4.0..=4000.0).contains(&v) => {
                     self.base_cps = v;
-                    self.turn.set_cps(v);
                     self.cfg.reading.speed = v;
                     let _ = self.cfg.save();
-                    self.system(&tf("cmd.speed_set", &[&format!("{v:.0}")]));
+                    self.apply_pace();
+                    let effective = format!("{:.0}", self.reveal_cps());
+                    let level = self.cfg.effort.level.label();
+                    self.system(&tf("cmd.speed_set", &[&effective, &level]));
                 }
                 _ => self.system(t("cmd.usage_speed")),
             },
-            "auto" => {
-                if self.book.is_none() {
-                    self.no_book();
-                    return;
+            "effort" => self.effort_command(arg),
+            // No `m` alias: that belongs to `/mark`, which readers reach for far
+            // more often than they switch modes.
+            "mode" => match arg {
+                "" => {
+                    let mode = self.mode();
+                    let chip = crate::mode::chip(mode);
+                    let name = mode.name();
+                    self.system(&tf("mode.now", &[&name, &chip]));
                 }
-                self.auto = !self.auto;
-                if self.auto {
-                    self.system(t("cmd.auto_on"));
-                    if !self.turn.busy() {
-                        self.read_more();
+                other => match ReadMode::parse(other) {
+                    Some(want) => {
+                        self.set_mode(want);
                     }
+                    None => self.system(t("mode.usage")),
+                },
+            },
+            // `/auto` predates the three modes and still means what it did: on
+            // and off, between auto-scroll and manual.
+            "auto" => {
+                let want = if self.mode() == ReadMode::Auto {
+                    ReadMode::Manual
                 } else {
-                    self.system(t("cmd.auto_off"));
-                }
+                    ReadMode::Auto
+                };
+                self.set_mode(want);
             }
             "progress" => match self.book.as_ref() {
                 None => self.no_book(),
@@ -1372,62 +1720,46 @@ impl App {
         self.system(&tf("tts.voice_set", &[&arg]));
     }
 
-    /// `/rate <0.5-3.0>` — speech tempo, which then drives the reveal speed.
-    fn rate_command(&mut self, arg: &str) {
-        match arg {
-            "" => {
-                let ladder = crate::tts::SPEEDS
-                    .iter()
-                    .map(|speed| crate::tts::speed_label(*speed))
-                    .collect::<Vec<_>>()
-                    .join("  ");
-                self.system(&tf(
-                    "tts.speed_now",
-                    &[&crate::tts::speed_label(self.cfg.tts.rate), &ladder],
-                ));
-            }
-            _ => match arg.trim_end_matches(['x', 'X', '×']).parse::<f32>() {
-                Ok(v) if (0.5..=3.0).contains(&v) => self.set_speed(v),
-                _ => self.system(t("tts.usage_rate")),
-            },
+    /// `/effort [minimal|low|medium|high|xhigh|max]`
+    fn effort_command(&mut self, arg: &str) {
+        if arg.is_empty() {
+            self.effort_report();
+            return;
+        }
+        match Effort::parse(arg) {
+            Some(level) => self.set_effort(level),
+            None => self.system(t("effort.usage")),
         }
     }
 
-    /// `^r`: the next speed on the ladder, the way an audiobook app cycles.
-    fn step_speed(&mut self) {
-        self.set_speed(crate::tts::next_speed(self.cfg.tts.rate));
-    }
-
-    /// Change the playback speed and make it audible immediately.
+    /// `/rate [0.5-3.0]` — what the current level is worth.
     ///
-    /// Clips are rendered at a speed, not resampled at playback, so everything
-    /// already prefetched is wrong the moment this changes. Dropping the speaker
-    /// throws those away; re-queueing from the start of the sentence that was
-    /// playing means the reader hears the new speed within a sentence instead of
-    /// at the next passage.
-    fn set_speed(&mut self, speed: f32) {
-        self.cfg.tts.rate = speed;
-        let _ = self.cfg.save();
-
-        let resume = self
-            .cursor
-            .as_ref()
-            .map(|cursor| cursor.sentence.0)
-            .filter(|_| self.cfg.tts.enabled);
-        let voiced = self.voiced.clone();
-
-        self.silence();
-        self.speaker = None;
-
-        let label = crate::tts::speed_label(speed);
-        if let (Some(from), Some((id, text))) = (resume, voiced) {
-            self.enqueue_speech_from(id, &text, from);
-            self.notice(&tf("tts.speed_set", &[&label]));
-        } else if self.cfg.tts.enabled {
-            self.notice(&tf("tts.speed_set", &[&label]));
-        } else {
-            self.system(&tf("tts.speed_later", &[&label]));
+    /// The levels are labels; the multipliers behind them belong to the reader,
+    /// and this is the way to change one without opening the config file. It edits
+    /// the level in force, so `/effort xhigh` then `/rate 0.9` is how someone
+    /// makes their slow gear their own.
+    fn rate_command(&mut self, arg: &str) {
+        if arg.is_empty() {
+            self.effort_report();
+            return;
         }
+        match arg.trim_end_matches(['x', 'X', '×']).parse::<f32>() {
+            Ok(v) if (0.5..=3.0).contains(&v) => {
+                let level = self.cfg.effort.level;
+                self.cfg.effort.multipliers.set(level, v);
+                // Re-entering the level applies it and re-queues the audio.
+                self.set_effort(level);
+                let times = effort::times(self.multiplier());
+                self.system(&tf("effort.tuned", &[&level.label(), &times]));
+            }
+            _ => self.system(t("tts.usage_rate")),
+        }
+    }
+
+    /// `^r`: the next effort level, and with it the next pace — one key that
+    /// means "read faster" whether the words are being typed or spoken.
+    fn step_speed(&mut self) {
+        self.set_effort(self.cfg.effort.level.next());
     }
 
     /// `/lang zh | en | auto`

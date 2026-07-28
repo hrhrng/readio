@@ -152,12 +152,26 @@ fn enter_starts_a_reading_turn_with_a_tool_call() {
 }
 
 #[test]
-fn a_question_runs_a_real_search() {
+fn plain_text_does_nothing_and_says_so() {
+    let (mut app, mut terminal) = fixture();
+    run_until_idle(&mut app, &mut terminal);
+
+    // Typing prose at a reader is a mistake, not a request: the line stays in
+    // the prompt, nothing is run, and the status line says where commands live.
+    type_line(&mut app, "进度条");
+    let view = screen(&mut app, &mut terminal, 3);
+
+    assert!(!view.contains("Grep"), "nothing should have run:\n{view}");
+    assert!(view.contains("/find"), "expected the hint:\n{view}");
+}
+
+#[test]
+fn find_runs_a_real_search() {
     let (mut app, mut terminal) = fixture();
     run_until_idle(&mut app, &mut terminal);
     app.turn.set_cps(3_000.0);
 
-    type_line(&mut app, "进度条");
+    type_line(&mut app, "/find 进度条");
     let view = run_until_idle(&mut app, &mut terminal);
 
     assert!(view.contains("Grep"), "expected a Grep tool call:\n{view}");
@@ -172,7 +186,7 @@ fn a_question_runs_a_real_search() {
 }
 
 #[test]
-fn escape_interrupts_a_running_turn() {
+fn escape_pauses_and_enter_picks_it_back_up() {
     let (mut app, mut terminal) = fixture();
     screen(&mut app, &mut terminal, 20);
     app.turn.set_cps(20.0);
@@ -183,9 +197,69 @@ fn escape_interrupts_a_running_turn() {
 
     press(&mut app, crossterm::event::KeyCode::Esc);
     let view = screen(&mut app, &mut terminal, 4);
+    assert!(app.turn.paused(), "esc should pause, not stop");
+    assert!(app.turn.busy(), "a paused turn is still the current turn");
+    assert!(
+        view.contains("思考") || view.contains("thinking"),
+        "a pause should read as thinking:\n{view}"
+    );
+
+    press_enter(&mut app);
+    screen(&mut app, &mut terminal, 4);
+    assert!(!app.turn.paused(), "enter should resume");
+    assert!(app.turn.busy(), "and carry on reading");
+}
+
+#[test]
+fn escape_twice_stops_the_turn() {
+    let (mut app, mut terminal) = fixture();
+    screen(&mut app, &mut terminal, 20);
+    app.turn.set_cps(20.0);
+
+    press_enter(&mut app);
+    screen(&mut app, &mut terminal, 8);
+    assert!(app.turn.busy(), "turn should be running");
+
+    press(&mut app, crossterm::event::KeyCode::Esc);
+    screen(&mut app, &mut terminal, 2);
+    press(&mut app, crossterm::event::KeyCode::Esc);
+    let view = screen(&mut app, &mut terminal, 4);
 
     assert!(!app.turn.busy(), "turn should be stopped");
     assert!(view.contains("已中断"), "expected interrupt event:\n{view}");
+}
+
+#[test]
+fn the_slash_menu_explains_the_highlighted_command() {
+    let (mut app, mut terminal) = fixture();
+    run_until_idle(&mut app, &mut terminal);
+
+    press(&mut app, crossterm::event::KeyCode::Char('/'));
+    let view = screen(&mut app, &mut terminal, 2);
+    assert!(view.contains("/lib"), "expected the menu:\n{view}");
+    assert!(view.contains("↑↓"), "expected the key hints:\n{view}");
+    assert!(
+        view.contains("序号就是 /open"),
+        "the highlighted row should be explained in full:\n{view}"
+    );
+
+    // Down twice reaches /import, and the explanation follows the selection.
+    press(&mut app, crossterm::event::KeyCode::Down);
+    press(&mut app, crossterm::event::KeyCode::Down);
+    let view = screen(&mut app, &mut terminal, 2);
+    assert!(
+        view.contains("三种持有方式"),
+        "expected /import explained:\n{view}"
+    );
+    assert!(
+        view.contains("例：") && view.contains("--link"),
+        "expected a worked example:\n{view}"
+    );
+
+    // Tab completes the name and leaves the argument to the reader.
+    press(&mut app, crossterm::event::KeyCode::Tab);
+    let view = screen(&mut app, &mut terminal, 2);
+    assert!(view.contains("❯ /import"), "expected completion:\n{view}");
 }
 
 #[test]

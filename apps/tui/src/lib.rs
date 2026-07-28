@@ -13,6 +13,8 @@
 //!   file. readio reads no environment variables.
 //! - [`ui`] — blocks, the scrollback surface, the prompt, the chrome.
 //! - [`app`] — the turn state machine and the reading logic that feeds it.
+//! - [`mode`] / [`effort`] — the three ways a reader moves through a book, and
+//!   the pace they read at, worn as an agent's reasoning effort.
 //! - [`i18n`] — every user-visible string, Chinese and English.
 //! - [`tts`] — read-aloud: local speech engines and playback.
 
@@ -20,9 +22,11 @@ pub mod app;
 pub mod book;
 pub mod cli;
 pub mod config;
+pub mod effort;
 pub mod i18n;
 pub mod library;
 pub mod metrics;
+pub mod mode;
 pub mod paths;
 pub mod store;
 pub mod stream;

@@ -41,6 +41,13 @@ pub struct Theme {
     pub bg_speaking_word: Color,
     /// Foreground for that sentence, a step brighter than body text.
     pub fg_speaking: Color,
+
+    /// Row under the cursor in the slash-command menu.
+    pub bg_selected: Color,
+    /// Latin words and numbers sitting inside Chinese prose. A coding agent
+    /// tints identifiers; a book full of `Invisible Cities, 1972` gets the same
+    /// treatment, and the page reads the way a tool's output reads.
+    pub fg_latin: Color,
 }
 
 pub const THEME: Theme = Theme {
@@ -71,6 +78,9 @@ pub const THEME: Theme = Theme {
     bg_speaking: rgb(44, 40, 62),
     bg_speaking_word: rgb(92, 74, 148),
     fg_speaking: rgb(242, 240, 248),
+
+    bg_selected: rgb(40, 40, 48),
+    fg_latin: rgb(122, 194, 214),
 };
 
 pub fn theme() -> &'static Theme {
@@ -90,16 +100,20 @@ pub const BULLET_OPEN: &str = "○";
 pub const CHECK: &str = "✓";
 pub const CROSS: &str = "✗";
 pub const ARROW: &str = "❯";
+/// One arrow: something is running, or a mode that runs on its own. Two of them
+/// mean "and it keeps going", the way a coding agent marks its unattended mode.
+pub const PLAY: &str = "⏵";
 pub const QUOTE_BAR: &str = "❙";
 /// Marks an illustration's caption.
 pub const IMAGE: &str = "⛶";
 /// Marks something the reader should notice and can act on.
 pub const WARNING: &str = "⚠";
-/// Read-aloud is on.
-pub const NOTE: &str = "♪";
 /// Read-aloud is on but held back — the output device is not allowed. A plain
-/// single-width glyph, because a combining slash over the note lands wherever
-/// the terminal feels like putting it.
+/// single-width glyph, because a combining slash over anything lands wherever the
+/// terminal feels like putting it.
+///
+/// There is deliberately no glyph for "read-aloud is on": a musical note in the
+/// chrome would announce a media player, and the chip says `⏵⏵ voice` instead.
 pub const NOTE_MUTED: &str = "⊘";
 pub const ELLIPSIS: &str = "…";
 

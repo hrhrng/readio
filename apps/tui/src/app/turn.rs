@@ -106,6 +106,10 @@ pub struct Turn {
     pub images: bool,
     /// Passage that just began streaming, for the reader-aloud queue.
     spoken: Option<(u64, String)>,
+    /// When the reader pressed pause. Everything in flight keeps its place; the
+    /// clocks are wound forward by this much on the way back, so a tool call
+    /// paused for a minute does not come back claiming it took a minute.
+    paused: Option<Instant>,
 }
 
 impl Turn {
@@ -122,6 +126,51 @@ impl Turn {
             image_rows: 16,
             images: true,
             spoken: None,
+            paused: None,
+        }
+    }
+
+    /// Hold everything where it is. `false` means there was nothing in flight.
+    pub fn pause(&mut self) -> bool {
+        if !self.busy() || self.paused.is_some() {
+            return false;
+        }
+        self.paused = Some(Instant::now());
+        true
+    }
+
+    /// Carry on from exactly where the pause caught it.
+    pub fn resume(&mut self) {
+        let Some(at) = self.paused.take() else {
+            return;
+        };
+        // The pacer runs on frame deltas and simply stopped receiving them, so
+        // only the wall-clock deadlines need moving.
+        let slept = at.elapsed();
+        if let Some(Active::Tool { started, until, .. }) = self.active.as_mut() {
+            *started += slept;
+            *until += slept;
+        }
+        if let Some(Active::Stream { started, .. }) = self.active.as_mut() {
+            *started += slept;
+        }
+        if let Some(started) = self.started.as_mut() {
+            *started += slept;
+        }
+    }
+
+    pub fn paused(&self) -> bool {
+        self.paused.is_some()
+    }
+
+    /// Skip the theatre: finish the current thinking or tool wait now, and let
+    /// the rest of the turn stream at whatever speed the caller set.
+    ///
+    /// Without this, pressing enter during the two seconds a `Read` call spends
+    /// spinning does nothing at all, which reads as a dead keyboard.
+    pub fn rush(&mut self) {
+        if let Some(Active::Tool { until, .. }) = self.active.as_mut() {
+            *until = Instant::now();
         }
     }
 
@@ -168,6 +217,11 @@ impl Turn {
     /// Advance by `dt_ms`, mutating the scrollback. Returns queued effects.
     pub fn pump(&mut self, sb: &mut Scrollback, dt_ms: f32) -> Vec<Effect> {
         let mut effects = Vec::new();
+        if self.paused.is_some() {
+            // Paused means paused: no text released, no tool completing behind
+            // the reader's back, and the position not advanced.
+            return effects;
+        }
 
         loop {
             // 1. Service whatever is currently running.

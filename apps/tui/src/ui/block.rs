@@ -699,6 +699,55 @@ fn render_passage(
     out
 }
 
+/// Latin words and numbers sitting inside Chinese prose, in local coordinates.
+///
+/// A coding agent tints identifiers, and a page of Chinese with `Invisible
+/// Cities, 1972` in it reads like a tool's output when those runs are tinted the
+/// same way. The rule is deliberately narrow: only when the line is mostly
+/// ideographic, because tinting every word of an English book would just be a
+/// different colour scheme.
+fn latin_runs(text: &str) -> Vec<(usize, usize)> {
+    let ideographic = text
+        .chars()
+        .filter(|c| crate::metrics::is_ideographic(*c))
+        .count();
+    let letters = text.chars().filter(|c| c.is_alphanumeric()).count();
+    if ideographic == 0 || ideographic * 3 < letters {
+        return Vec::new();
+    }
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut run: Option<(usize, usize)> = None;
+    for (index, c) in text.char_indices() {
+        // Punctuation that belongs to an identifier or a citation keeps the run
+        // together: `1923-1985`, `Invisible Cities, 1972`, `state.json`.
+        let inside = c.is_ascii_alphanumeric()
+            || (run.is_some() && matches!(c, '.' | '-' | '_' | '/' | ':' | ',' | ' ' | '\'' | '&'));
+        match (inside, run) {
+            (true, None) => run = Some((index, index + c.len_utf8())),
+            (true, Some((start, _))) => run = Some((start, index + c.len_utf8())),
+            (false, Some((start, end))) => {
+                out.push((start, end));
+                run = None;
+            }
+            (false, None) => {}
+        }
+    }
+    if let Some(span) = run {
+        out.push(span);
+    }
+    // Trim the trailing joiners a run may have swallowed, and drop anything that
+    // is not really a word: a lone comma between two Chinese clauses is not code.
+    out.into_iter()
+        .filter_map(|(start, end)| {
+            let piece = &text[start..end];
+            let trimmed = piece.trim_end_matches([' ', ',', '.', ':', '-', '/', '&', '\'']);
+            let end = start + trimmed.len();
+            let has_word = trimmed.chars().any(|c| c.is_ascii_alphanumeric());
+            (end > start && has_word).then_some((start, end))
+        })
+        .collect()
+}
+
 /// Split one wrapped line into spans: plain text, what the book emphasised, the
 /// sentence being read, and the word inside it.
 ///
@@ -740,7 +789,9 @@ fn styled_spans(
         .collect();
 
     let speech = highlight.filter(|h| h.sentence.1 > line_from && h.sentence.0 < line_to);
-    if leaning.is_empty() && speech.is_none() {
+    // Latin runs are measured on the drawn text itself, so they need no mapping.
+    let latin = latin_runs(&segment.text);
+    if leaning.is_empty() && speech.is_none() && latin.is_empty() {
         return vec![Span::styled(segment.text.clone(), plain)];
     }
 
@@ -763,6 +814,10 @@ fn styled_spans(
         cuts.push(*start);
         cuts.push(*end);
     }
+    for (start, end) in &latin {
+        cuts.push(*start);
+        cuts.push(*end);
+    }
     cuts.retain(|cut| *cut <= segment.text.len());
     cuts.sort_unstable();
     cuts.dedup();
@@ -780,6 +835,13 @@ fn styled_spans(
         } else {
             plain
         };
+        // Tint before emphasis: a foreground change survives a modifier, and an
+        // italicised English title should be both.
+        if latin.iter().any(|(a, b)| start >= *a && end <= *b)
+            && !word.is_some_and(|(a, b)| start >= a && end <= b)
+        {
+            style = style.fg(theme().fg_latin);
+        }
         if let Some((_, _, strong)) = leaning.iter().find(|(a, b, _)| start >= *a && end <= *b) {
             style = style.add_modifier(if *strong {
                 Modifier::BOLD

@@ -105,9 +105,72 @@ pub const TABLE: &[(&str, &str, &str)] = &[
     ("chrome.pick_tail", "  ·  /lib 书库  ·  /import <路径>  ·  /help 更多",
         "  ·  /lib library  ·  /import <path>  ·  /help for more"),
     ("chrome.continue", "⏎ 继续", "⏎ keep reading"),
-    ("chrome.idle_tail", "  ·  ^t 思考  ·  ^o 工具  ·  /help 更多",
-        "  ·  ^t thinking  ·  ^o tools  ·  /help for more"),
-    ("chrome.busy_tail", "  ·  esc 停下  ·  ↑↓ 滚动", "  ·  esc to stop  ·  ↑↓ to scroll"),
+    ("chrome.idle_tail", "  ·  shift+tab 换模式  ·  /help 更多",
+        "  ·  shift+tab cycles modes  ·  /help for more"),
+    ("chrome.busy_tail", "  ·  esc 暂停  ·  ↑↓ 滚动", "  ·  esc to pause  ·  ↑↓ to scroll"),
+    // Pausing wears the agent's own clothes: a stopped stream is a model
+    // thinking, which is the one state a coding agent is always allowed to be in.
+    ("chrome.paused", "思考中…", "thinking…"),
+    ("chrome.paused_tail", "  ·  ⏎ 继续  ·  esc 停止这一轮",
+        "  ·  ⏎ to continue  ·  esc again stops the turn"),
+    ("menu.hint", "↑↓ 选  ·  tab 补全  ·  ⏎ 执行  ·  esc 关掉",
+        "↑↓ to choose  ·  tab completes  ·  ⏎ runs it  ·  esc closes"),
+    ("menu.hint_more", "↑↓ 选  ·  tab 补全  ·  ⏎ 执行  ·  还有 {0} 条",
+        "↑↓ to choose  ·  tab completes  ·  ⏎ runs it  ·  {0} more below"),
+    ("menu.example", "例：", "e.g."),
+    ("menu.active", "（当前）", "(active)"),
+    ("menu.also", "也可写作", "also"),
+
+    // ── the three reading modes ──
+    // A coding agent shows its mode as a chip and cycles it with shift+tab; the
+    // chip has to stay narrow, so the explaining is done by the message.
+    ("mode.manual", "手动", "manual"),
+    ("mode.auto", "自动滚动", "auto-scroll"),
+    ("mode.tts", "朗读", "read-aloud"),
+    ("mode.chip_manual", "逐段", "step"),
+    ("mode.chip_auto", "自动", "auto"),
+    ("mode.chip_tts", "朗读", "voice"),
+
+    // ── reading pace, worn as reasoning effort ──
+    // Higher effort is slower, which is exactly how the real thing behaves, so the
+    // costume and the meaning point the same way.
+    ("effort.minimal", "扫读，几乎不停", "skim, barely pausing"),
+    ("effort.low", "快读", "quick read"),
+    ("effort.medium", "偏快，仍跟得上", "brisk, still easy to follow"),
+    ("effort.high", "常速阅读", "normal reading pace"),
+    ("effort.xhigh", "慢读，字句留得住", "slow, words stay with you"),
+    ("effort.max", "细读，一句一句来", "close reading, sentence by sentence"),
+    ("effort.set", "推理强度 {0}  ·  {1}", "Reasoning effort {0} · {1}"),
+    ("effort.now", "推理强度 {0}（{1}，约 {2} 字/秒）", "Reasoning effort {0} — {1}, about {2} chars/s"),
+    ("effort.tune", "改这一档的倍数：/rate <0.5-3.0>；全部六档写在 config.yaml 的 effort.multipliers 里",
+        "Retune this level with /rate <0.5-3.0>; all six live under effort.multipliers in config.yaml"),
+    ("effort.tuned", "{0} 这一档现在是 {1}，已写回 config.yaml",
+        "Level {0} is now {1}, written back to config.yaml"),
+    ("effort.row_more", "{0}：{1}，{2}。文字约 {3}，朗读也按这个倍数播。倍数可以在 config.yaml 里改，或者 /rate。",
+        "{0} is {1} — {2}. Text arrives at about {3}, and read-aloud plays at the same multiplier. Change it in config.yaml, or with /rate."),
+    ("effort.usage", "用法：/effort minimal | low | medium | high | xhigh | max（^r 循环切换）",
+        "Usage: /effort minimal | low | medium | high | xhigh | max (^r cycles)"),
+    ("mode.set_manual", "手动模式：不会自己往下走。⏎ 载入下一段，滚到底按 ↓ 也可以。shift+tab 换模式",
+        "Manual: nothing advances on its own. ⏎ loads the next passage, and so does ↓ at the bottom. shift+tab cycles modes"),
+    ("mode.set_auto", "自动滚动：一段接一段，当前 {0}。/effort 或 ^r 调速，esc 暂停，shift+tab 换模式",
+        "Auto-scroll: passage after passage at {0}. /effort or ^r changes the pace, esc pauses, shift+tab cycles modes"),
+    ("mode.set_tts", "朗读模式（自带滚动）：由人声定速，当前 {0}。/effort 或 ^r 调倍速，esc 暂停，shift+tab 换模式",
+        "Read-aloud, which scrolls itself: the voice sets the pace, now {0}. /effort or ^r changes it, esc pauses, shift+tab cycles modes"),
+    ("mode.row_manual", "你说一段算一段", "nothing moves until you say so"),
+    ("mode.row_auto", "一段接一段自己往下走", "passages follow one another by themselves"),
+    ("mode.row_tts", "念出来，滚动跟着人声", "read out loud, scrolling with the voice"),
+    ("mode.row_auto_more", "自动滚动：读完一段接着下一段，速度按当前推理强度。esc 暂停，再按一次停下；shift+tab 也能切模式。",
+        "Auto-scroll: each passage is followed by the next at the pace the current effort level sets. esc pauses, esc again stops, and shift+tab cycles the modes."),
+    ("mode.row_tts_more", "朗读模式：readio 调用你配置好的引擎念出来，文字跟着音频走，推理强度就是播放倍速。装不上引擎时会说明原因并跳过这个模式。",
+        "Read-aloud: readio drives the engine you configured, the text keeps pace with the audio, and the effort level is the playback multiplier. If no engine can start, it says why and skips the mode."),
+    ("mode.now", "当前是{0}模式（{1}）。shift+tab 循环切换，或 /mode manual|auto|tts",
+        "Mode: {0} ({1}). shift+tab cycles, or /mode manual|auto|tts"),
+    ("mode.usage", "用法：/mode manual | auto | tts；也可以 shift+tab 循环切换",
+        "Usage: /mode manual | auto | tts — or just press shift+tab"),
+    ("mode.tts_unavailable", "朗读起不来，先跳过朗读模式",
+        "Read-aloud could not start, so that mode is skipped"),
+    ("cmd.needs_slash", "命令以 / 开头，比如 /find。要检索全书就用 /find <词>",
+        "Commands start with a slash — /find, say. To search the book: /find <term>"),
     ("chrome.scrolled", "{0} 已上滚 {1}%", "{0} scrolled up {1}%"),
     ("chrome.scrolled_tail", "  ·  end 回到底部", "  ·  end returns to the tail"),
     ("chrome.cps", "{0} 字/秒", "{0} chars/s"),
@@ -116,8 +179,8 @@ pub const TABLE: &[(&str, &str, &str)] = &[
     ("chrome.help_close", " 按任意键关闭", " any key closes"),
 
     // ── prompt placeholders ──
-    ("prompt.reading", "回车继续阅读，或提问 / 输入命令",
-        "enter to keep reading, or ask a question / type a command"),
+    ("prompt.reading", "回车继续读，/ 看命令，esc 暂停",
+        "enter reads on  ·  / for commands  ·  esc pauses"),
     ("prompt.pick", "输入序号选书，或 /import <路径> 导入",
         "type a number to pick a book, or /import <path>"),
     ("prompt.empty", "readio <文件> 导入一本，或 /sample 试试内置示例",
@@ -196,17 +259,37 @@ pub const TABLE: &[(&str, &str, &str)] = &[
     ("cmd.tools_expanded", "工具调用已展开", "Tool calls expanded"),
     ("cmd.tools_folded", "工具调用已折叠", "Tool calls folded"),
     ("cmd.quit_again", "再按一次 ctrl+c 退出", "press ctrl+c again to quit"),
-    ("cmd.usage_import", "用法：/import <路径> [-c | -l | -m]（默认 -c 复制进书库）",
-        "Usage: /import <path> [-c | -l | -m] (default -c, copies into the library)"),
+    // Spelled out on purpose: `-c | -l | -m` is three letters nobody can decode,
+    // and the reader is deciding what happens to their file.
+    ("cmd.usage_import", "\
+用法：/import <路径> [方式]
+
+  --copy    复制一份进书库（默认，原文件留在原处）
+  --link    只记下路径，不复制（原文件挪走就读不到了）
+  --move    搬进书库，原位置不再保留
+
+短写 -c / -l / -m 也认。",
+        "\
+Usage: /import <path> [how]
+
+  --copy    copy it into the library (default; your file stays where it is)
+  --link    remember the path only (move the file and the entry goes stale)
+  --move    move it into the library, leaving nothing behind
+
+The short forms -c / -l / -m work too."),
     ("cmd.usage_open", "用法：/open <序号> 或 /open <路径>", "Usage: /open <n> or /open <path>"),
     ("cmd.usage_forget", "用法：/forget <序号>（从书库移除，引用和移入的原文件不会删）",
         "Usage: /forget <n> (removes the entry; linked and moved originals are kept)"),
     ("cmd.usage_find", "用法：/find <关键词>", "Usage: /find <term>"),
     ("cmd.usage_goto", "用法：/goto <1-{0}>", "Usage: /goto <1-{0}>"),
-    ("cmd.usage_speed", "用法：/speed <4-4000>，例如 /speed 60",
-        "Usage: /speed <4-4000>, for example /speed 60"),
+    ("cmd.usage_speed", "用法：/speed <4-4000>，例如 /speed 60；平时用 /effort 就够了",
+        "Usage: /speed <4-4000>, e.g. /speed 60 — day to day, /effort is the one you want"),
+    ("cmd.lang_row", "换界面语言，正文不动", "switch the interface; the book is untouched"),
+    ("cmd.lang_row_more", "只改界面用哪种语言，并写回 config.yaml。书永远保持作者写它时的语言。",
+        "Changes which language the interface speaks and remembers it in config.yaml. A book always stays in the language it was written in."),
     ("cmd.usage_lang", "用法：/lang zh | en | auto", "Usage: /lang zh | en | auto"),
-    ("cmd.speed_set", "阅读速度设为 {0} 字/秒", "Reading speed set to {0} chars/s"),
+    ("cmd.speed_set", "基准速度已改，当前 {0} 字/秒（强度 {1}）",
+        "Base pace changed: {0} chars/s at effort {1}"),
     ("cmd.auto_on", "自动续读已开启，esc 可以随时停下",
         "Auto-continue is on; esc stops it"),
     ("cmd.auto_off", "自动续读已关闭", "Auto-continue is off"),
@@ -233,12 +316,19 @@ pub const TABLE: &[(&str, &str, &str)] = &[
     // ── speech ──
     ("tts.on", "朗读已开启：{0}", "Read-aloud on: {0}"),
     ("tts.off", "朗读已关闭", "Read-aloud off"),
+    ("tts.row_on", "打开朗读（等于朗读模式）", "turn read-aloud on"),
+    ("tts.row_off", "关掉朗读，回到自动滚动", "turn it off, back to auto-scroll"),
+    ("tts.row_test", "念一句，验证引擎接得通", "speak one line to prove the wiring"),
+    ("tts.row_config", "告诉我配置文件在哪", "print where the config file lives"),
+    ("tts.row_engine", "引擎，需要 {0}", "engine, needs {0}"),
+    ("tts.row_engine_more", "改用 {0} 引擎，它调用的是 {1}——没装的话 readio 会告诉你缺什么、去哪配。音色用 /voice 换。",
+        "Switches to the {0} engine, which runs {1}. If it is not installed readio says what is missing and where to configure it. /voice picks the voice."),
     ("tts.engine_set", "朗读引擎：{0}", "Speech engine: {0}"),
     ("tts.voice_set", "朗读音色：{0}", "Speech voice: {0}"),
     ("tts.speed_set", "朗读倍速 {0}", "Read-aloud speed {0}"),
     ("tts.speed_later", "朗读倍速 {0}，下次开启朗读时生效",
         "Read-aloud speed {0}; it takes effect when you turn speech on"),
-    ("tts.speed_now", "当前倍速 {0}　可选：{1}　（^r 循环切换）",
+    ("tts.speed_now", "当前倍速 {0}  ·  可选 {1}  ·  ^r 循环切换",
         "Speed {0}   ladder: {1}   (^r cycles)"),
     ("tts.unknown_engine", "没有这个引擎：{0}。可用：{1}", "No such engine: {0}. Available: {1}"),
     ("tts.missing_binary", "找不到 {0}。装好之后再开 /tts，或改 {1} 换一个引擎。",
@@ -249,8 +339,8 @@ pub const TABLE: &[(&str, &str, &str)] = &[
     ("tts.usage", "用法：/tts [on | off | <引擎> | test | config]",
         "Usage: /tts [on | off | <engine> | test | config]"),
     ("tts.usage_voice", "用法：/voice <音色>", "Usage: /voice <name>"),
-    ("tts.usage_rate", "用法：/rate <0.5-3.0>，或 ^r 在常用倍速间循环",
-        "Usage: /rate <0.5-3.0>, or ^r to cycle the usual speeds"),
+    ("tts.usage_rate", "用法：/rate <0.5-3.0>，改的是当前强度这一档的倍数",
+        "Usage: /rate <0.5-3.0> — it retunes the level you are on"),
     ("tts.testing", "试念一句：{0}", "Test line: {0}"),
     ("tts.test_line", "界面不是中立的，它替你决定了什么值得注意。",
         "An interface is never neutral: it decides for you what deserves attention."),
@@ -389,10 +479,10 @@ pub const TABLE: &[(&str, &str, &str)] = &[
     ("cli.usage", "\
 用法：
   readio                 进入书库，列出所有导入过的书
-  readio <文件>          导入并开始读（默认 -c）
-  readio <文件> -c       复制一份到书库目录
-  readio <文件> -l       只登记引用，文件留在原处
-  readio <文件> -m       移动进书库，原文件不再保留
+  readio <文件>          导入并开始读（默认复制一份）
+  readio <文件> --copy   复制一份到书库目录（-c）
+  readio <文件> --link   只登记引用，文件留在原处（-l）
+  readio <文件> --move   移动进书库，原位置不再保留（-m）
 
 支持 .epub / .pdf / .txt / .md。
 书库目录：{0}
@@ -402,10 +492,10 @@ pub const TABLE: &[(&str, &str, &str)] = &[
         "\
 Usage:
   readio                 open the library and list everything imported
-  readio <file>          import and start reading (default -c)
-  readio <file> -c       copy the file into the books directory
-  readio <file> -l       link it: the file stays where it is
-  readio <file> -m       move it in; the original is not kept
+  readio <file>          import and start reading (a copy, by default)
+  readio <file> --copy   copy it into the books directory (-c)
+  readio <file> --link   link it: your file stays where it is (-l)
+  readio <file> --move   move it in; nothing is left behind (-m)
 
 Supports .epub / .pdf / .txt / .md.
 Books:    {0}

@@ -63,6 +63,15 @@ pub fn format_tokens(tokens: usize) -> String {
     }
 }
 
+/// Reveal speed as the status chip shows it: `35 tok/s`.
+///
+/// The disguise again — characters per second is what readio actually paces, and
+/// tokens per second is what a coding agent would print, so the same conversion
+/// used for the session readout is used here.
+pub fn rate_label(cps: f32) -> String {
+    format!("{} tok/s", tokens_from_chars(cps.max(0.0).round() as usize))
+}
+
 /// Session clock: `0:42`, `18:07`, `2:15:31`.
 pub fn format_duration(elapsed: Duration) -> String {
     let total = elapsed.as_secs();
@@ -201,7 +210,10 @@ const LATIN_CHARS_PER_WORD: f64 = 5.1;
 const CJK_CHARS_PER_WORD: f64 = 1.6;
 
 /// Is this one of the scripts that writes without spaces?
-fn is_ideographic(c: char) -> bool {
+///
+/// Public because the renderer needs the same question answered: a Latin word is
+/// only worth tinting when the text around it is written in a script like this.
+pub fn is_ideographic(c: char) -> bool {
     matches!(c,
         '\u{3040}'..='\u{30ff}'      // hiragana, katakana
         | '\u{3400}'..='\u{4dbf}'    // CJK extension A

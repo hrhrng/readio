@@ -26,6 +26,18 @@ KEYS = {
     "ctrl-t": b"\x14",
     "ctrl-o": b"\x0f",
     "ctrl-r": b"\x12",
+    "up": b"\x1b[A",
+    "down": b"\x1b[B",
+    "right": b"\x1b[C",
+    "left": b"\x1b[D",
+    "pgup": b"\x1b[5~",
+    "pgdn": b"\x1b[6~",
+    "home": b"\x1b[H",
+    "end": b"\x1b[F",
+    "tab": b"\t",
+    # shift+tab, which is how readio cycles its reading mode.
+    "btab": b"\x1b[Z",
+    "space": b" ",
 }
 
 pid, fd = pty.fork()
@@ -121,7 +133,11 @@ bg = [[None] * COLS for _ in range(ROWS)]
 # Italic per cell: emphasis in a book arrives as SGR 3, and the only way to know
 # it survived wrapping and streaming is to read it back off the wire.
 ital = [[False] * COLS for _ in range(ROWS)]
+# Foreground per cell: readio tints Latin words inside Chinese prose the way a
+# coding agent tints identifiers, and that only shows up as an SGR 38;2 run.
+fg = [[None] * COLS for _ in range(ROWS)]
 current_bg = None
+current_fg = None
 current_italic = False
 row = col = 0
 i = 0
@@ -144,18 +160,21 @@ while i < len(raw):
                 grid = [[" "] * COLS for _ in range(ROWS)]
                 bg = [[None] * COLS for _ in range(ROWS)]
                 ital = [[False] * COLS for _ in range(ROWS)]
+                fg = [[None] * COLS for _ in range(ROWS)]
                 row = col = 0
             elif cmd == b"K":
                 for x in range(col, COLS):
                     grid[row][x] = " "
                     bg[row][x] = None
                     ital[row][x] = False
+                    fg[row][x] = None
             elif cmd == b"m":
                 # Only truecolour backgrounds and resets matter here.
                 j = 0
                 while j < len(nums):
                     if nums[j] == 0:
                         current_bg = None
+                        current_fg = None
                         current_italic = False
                     elif nums[j] == 3:
                         current_italic = True
@@ -166,6 +185,11 @@ while i < len(raw):
                     elif nums[j] == 48 and j + 4 < len(nums) and nums[j + 1] == 2:
                         current_bg = (nums[j + 2], nums[j + 3], nums[j + 4])
                         j += 4
+                    elif nums[j] == 38 and j + 4 < len(nums) and nums[j + 1] == 2:
+                        current_fg = (nums[j + 2], nums[j + 3], nums[j + 4])
+                        j += 4
+                    elif nums[j] == 39:
+                        current_fg = None
                     j += 1
             i = match.end()
             continue
@@ -199,6 +223,7 @@ while i < len(raw):
     if char.isprintable() and 0 <= row < ROWS and 0 <= col < COLS:
         grid[row][col] = char
         bg[row][col] = current_bg
+        fg[row][col] = current_fg
         ital[row][col] = current_italic
         width = 2 if ord(char) > 0x2E7F else 1
         # A double-width glyph physically covers the next cell.
@@ -237,5 +262,14 @@ if any(ital[y][x] for y in range(ROWS) for x in range(COLS)):
             continue
         run = "".join(grid[y][x] for x in range(COLS) if ital[y][x])
         print(f"  {y:>3}:  {run.strip()}")
+
+# Latin runs in prose, tinted like a coding agent tints identifiers.
+LATIN = (122, 194, 214)
+if any(fg[y][x] == LATIN for y in range(ROWS) for x in range(COLS)):
+    print("\n[tinted]")
+    for y in range(ROWS):
+        run = "".join(grid[y][x] for x in range(COLS) if fg[y][x] == LATIN)
+        if run.strip():
+            print(f"  {y:>3}:  {run.strip()}")
 
 print(f"\n[exit: {exited}]  [alt-screen restored: {restored}]  [bytes: {len(raw)}]")

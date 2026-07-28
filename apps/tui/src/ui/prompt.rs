@@ -46,6 +46,19 @@ impl Prompt {
         self.buf.trim().is_empty()
     }
 
+    /// What is typed, for anyone deciding what to offer next.
+    pub fn line(&self) -> &str {
+        &self.buf
+    }
+
+    /// Replace the line and put the cursor at its end, which is what completing
+    /// a command means.
+    pub fn set(&mut self, text: &str) {
+        self.buf = text.to_string();
+        self.cursor = self.buf.len();
+        self.browse = None;
+    }
+
     pub fn insert_str(&mut self, text: &str) {
         let cleaned: String = text.replace(['\n', '\r', '\t'], " ");
         self.buf.insert_str(self.cursor, &cleaned);

@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::effort::{Effort, Ladder};
 use crate::i18n::Lang;
 use crate::paths;
 use crate::tts::config::{EngineSpec, presets};
@@ -25,6 +26,8 @@ pub struct Config {
     /// Interface language.
     pub language: Lang,
     pub reading: Reading,
+    /// Reading pace, worn as an agent's reasoning effort.
+    pub effort: EffortConfig,
     pub images: Images,
     pub tts: Tts,
     /// Diagnostics: append every terminal event to this file. Unset normally —
@@ -40,6 +43,18 @@ pub struct Reading {
     pub speed: f32,
     /// Keep queueing the next passage without being asked.
     pub auto: bool,
+}
+
+/// The chosen level and what each level is worth.
+///
+/// One multiplier per level, and it drives both the reveal speed and read-aloud
+/// playback, so a level means the same thing however the reader is taking the book
+/// in. The reader is expected to edit these.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EffortConfig {
+    pub level: Effort,
+    pub multipliers: Ladder,
 }
 
 /// Whether and how large in-terminal images are drawn.
@@ -61,8 +76,6 @@ pub struct Tts {
     pub engine: String,
     /// Overrides the engine's own default voice when non-empty.
     pub voice: String,
-    /// Speaking rate multiplier, where the engine supports it.
-    pub rate: f32,
     /// How many sentences to synthesize ahead of playback.
     pub prefetch: usize,
     /// Which audio outputs may be spoken through.
@@ -94,7 +107,6 @@ impl Default for Tts {
             enabled: false,
             engine: "kokoro".to_string(),
             voice: String::new(),
-            rate: 1.0,
             prefetch: 2,
             output: Output::default(),
             engines: presets(),
@@ -146,11 +158,7 @@ impl Config {
         } else {
             Reading::default().speed
         };
-        self.tts.rate = if self.tts.rate.is_finite() {
-            self.tts.rate.clamp(0.5, 3.0)
-        } else {
-            1.0
-        };
+        self.effort.multipliers.clamp_all();
         self.tts.prefetch = self.tts.prefetch.clamp(1, 8);
         self.tts.output.poll = self.tts.output.poll.clamp(1, 120);
         self.images.max_rows = self.images.max_rows.clamp(2, 60);
@@ -205,6 +213,17 @@ impl Config {
              \x20 speed: {speed}\n\
              \x20 auto: {auto}\n\
              \n\
+             effort:\n\
+             {EFFORT_NOTE}\
+             \x20 level: {level}\n\
+             \x20 multipliers:\n\
+             \x20   minimal: {minimal}\n\
+             \x20   low: {low}\n\
+             \x20   medium: {medium}\n\
+             \x20   high: {high}\n\
+             \x20   xhigh: {xhigh}\n\
+             \x20   max: {max}\n\
+             \n\
              images:\n\
              {IMAGES_NOTE}\
              \x20 enabled: {images}\n\
@@ -215,7 +234,6 @@ impl Config {
              \x20 enabled: {tts}\n\
              \x20 engine: {engine}\n\
              \x20 voice: \"{voice}\"\n\
-             \x20 rate: {rate}\n\
              \x20 prefetch: {prefetch}\n\
              {OUTPUT_NOTE}\
              \x20 output:\n\
@@ -229,12 +247,18 @@ impl Config {
             lang = self.language.code(),
             speed = trim_float(self.reading.speed),
             auto = self.reading.auto,
+            level = self.effort.level.code(),
+            minimal = trim_float(self.effort.multipliers.minimal),
+            low = trim_float(self.effort.multipliers.low),
+            medium = trim_float(self.effort.multipliers.medium),
+            high = trim_float(self.effort.multipliers.high),
+            xhigh = trim_float(self.effort.multipliers.xhigh),
+            max = trim_float(self.effort.multipliers.max),
             images = self.images.enabled,
             rows = self.images.max_rows,
             tts = self.tts.enabled,
             engine = self.tts.engine,
             voice = self.tts.voice,
-            rate = trim_float(self.tts.rate),
             prefetch = self.tts.prefetch,
             allow = if self.tts.output.allow.is_empty() {
                 " []".to_string()
@@ -263,12 +287,16 @@ impl Config {
 }
 
 /// `46` rather than `46.0`, and `1.5` rather than `1.5000001`.
+/// A number written the way a person would write it: `46`, `1.5`, `0.85`.
+///
+/// Trailing zeros matter here because this file is read by people — a ladder of
+/// `2.50  2  1.50  1  0.85  0.70` looks like six different kinds of number.
 fn trim_float(value: f32) -> String {
     if (value - value.round()).abs() < f32::EPSILON {
-        format!("{:.0}", value.round())
-    } else {
-        format!("{value:.2}")
+        return format!("{:.0}", value.round());
     }
+    let text = format!("{value:.2}");
+    text.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 const HEADER: &str = "\
@@ -284,9 +312,19 @@ const HEADER: &str = "\
 
 # en or zh / 界面语言";
 
-const READING_NOTE: &str = "  # speed: characters revealed per second; read-aloud overrides it
-  # speed: 每秒吐出多少字；朗读打开时按音频长度自动接管
-  # auto: keep going without pressing enter / 读完一段自动接着读
+const READING_NOTE: &str =
+    "  # speed: characters per second at effort high; the effort multiplier scales it,
+  #   and read-aloud takes the pace from the audio instead
+  # speed: 强度 high 时每秒吐出多少字；其它档按倍数缩放，朗读时改为跟着音频走
+  # auto: auto-scroll, the mode shift+tab cycles into / 自动滚动，shift+tab 可切
+";
+
+const EFFORT_NOTE: &str = "  # Reading pace, shown as the reasoning effort of the model.
+  # Each level is a multiplier: the text appears at speed × multiplier, and
+  # read-aloud plays at the multiplier itself. More effort reads more slowly.
+  # 阅读节奏，界面上显示为模型的推理强度。每档就是一个倍数：
+  # 文字按 speed × 倍数 吐出，朗读直接按这个倍数播放。强度越高读得越慢。
+  # level: minimal | low | medium | high | xhigh | max —— /effort 或 ^r 切换
 ";
 
 const IMAGES_NOTE: &str =
@@ -358,7 +396,11 @@ mod tests {
         config.reading.speed = 72.0;
         config.tts.enabled = true;
         config.tts.voice = "zf_xiaoyi".to_string();
-        config.tts.rate = 1.25;
+        config.effort.level = crate::effort::Effort::Xhigh;
+        config
+            .effort
+            .multipliers
+            .set(crate::effort::Effort::Xhigh, 0.9);
         config.images.max_rows = 24;
 
         let body = config.render().expect("render");
@@ -414,11 +456,21 @@ mod tests {
 
     #[test]
     fn hand_edited_nonsense_is_clamped_not_obeyed() {
-        let raw = "reading:\n  speed: 900000\ntts:\n  rate: 40\n  prefetch: 500\nimages:\n  max_rows: 900\n";
+        let raw = "reading:\n  speed: 900000\neffort:\n  multipliers:\n    minimal: 40\n    max: 0\ntts:\n  prefetch: 500\nimages:\n  max_rows: 900\n";
         let mut config: Config = serde_yaml_ng::from_str(raw).expect("parse");
         config.clamp();
         assert_eq!(config.reading.speed, 4000.0);
-        assert_eq!(config.tts.rate, 3.0);
+        assert_eq!(
+            config
+                .effort
+                .multipliers
+                .get(crate::effort::Effort::Minimal),
+            3.0
+        );
+        assert_eq!(
+            config.effort.multipliers.get(crate::effort::Effort::Max),
+            0.5
+        );
         assert_eq!(config.tts.prefetch, 8);
         assert_eq!(config.images.max_rows, 60);
     }
