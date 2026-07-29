@@ -15,9 +15,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::effort::{Effort, Ladder};
 use crate::i18n::Lang;
+use crate::mode::Mode;
 use crate::paths;
-use crate::tts::config::{EngineSpec, presets};
-use crate::tts::device::Output;
+use crate::voice::config::{EngineSpec, presets};
+use crate::voice::device::Output;
 
 /// Everything readio can be told to do differently.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -29,7 +30,14 @@ pub struct Config {
     /// Reading pace, worn as an agent's reasoning effort.
     pub effort: EffortConfig,
     pub images: Images,
-    pub tts: Tts,
+    /// Read-aloud, all of it: which engine, which voice, which language, and
+    /// the books that asked for something else.
+    ///
+    /// It answered to `tts:` until v0.2.0, and still does when reading an older
+    /// file — the section was renamed rather than split, because "which engine"
+    /// and "which voice" were never two questions.
+    #[serde(alias = "tts")]
+    pub voice: Voice,
     /// Diagnostics: append every terminal event to this file. Unset normally —
     /// it exists because a keystroke going missing is otherwise unprovable.
     pub input_log: Option<String>,
@@ -41,8 +49,13 @@ pub struct Config {
 pub struct Reading {
     /// Characters per second, when speech is not driving the pace.
     pub speed: f32,
-    /// Keep queueing the next passage without being asked.
-    pub auto: bool,
+    /// Which of the three ways of reading is in force. One value, written here
+    /// whenever it changes and restored on the next launch.
+    pub mode: Mode,
+    /// Auto-scroll as older files spelled it, before the mode had a name of its
+    /// own. Read once, folded into `mode`, and never written again.
+    #[serde(default, skip_serializing)]
+    auto: Option<bool>,
 }
 
 /// The chosen level and what each level is worth.
@@ -66,36 +79,104 @@ pub struct Images {
     pub max_rows: u16,
 }
 
-/// Read-aloud settings and the engine table.
+/// Read-aloud: who reads, and everything that follows from it.
+///
+/// One section rather than an engine here and a voice there. In every engine
+/// worth using the two are one decision — Kokoro's `zf_*` voices are Mandarin
+/// and its `af_*` ones American English, so a voice implies an engine and a
+/// language the way a key implies a lock — and settings that can be made to
+/// disagree eventually are.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct Tts {
-    /// Start with read-aloud on.
-    pub enabled: bool,
+pub struct Voice {
     /// Which entry of `engines` to use.
     pub engine: String,
-    /// Overrides the engine's own default voice when non-empty.
-    pub voice: String,
-    /// Which language to read in: `auto`, or a key of the engine's `languages`
-    /// table — `zh`, `en`.
+    /// The voice itself, handed to the engine as it is spelled there. Empty
+    /// keeps the selected model preset's declared default.
     ///
-    /// `auto` looks at the sentence, which is what a shelf holding books in two
-    /// languages needs. Naming one pins it, for a reader whose book is in a
-    /// language the guess gets wrong, or who simply wants every page read in
-    /// the same voice.
+    /// Spelled `voice:` inside a section that was called `tts:`, which is why
+    /// the old name is still accepted.
+    #[serde(alias = "voice")]
+    pub name: String,
+    /// Which language to read in: a key of the engine's `languages` table such
+    /// as `zh` or `en`. Empty keeps the model preset's declared default.
     pub language: String,
+    /// Engine-specific arguments selected in the Voice workspace. Empty keeps
+    /// the model preset's own defaults.
+    #[serde(default)]
+    pub params: String,
     /// How many sentences to synthesize ahead of playback.
     pub prefetch: usize,
     /// Which audio outputs may be spoken through.
     pub output: Output,
+    /// Books that asked for a different voice, keyed by content id — the same
+    /// id the library and the progress store use.
+    ///
+    /// A shelf is not read in one voice. A Chinese novel and an English manual
+    /// want different engines as often as different voices, and a reader who
+    /// sets one up per book should not have to set it up again every time they
+    /// switch. Only what a book actually said is stored; everything else falls
+    /// through to the settings above.
+    pub books: BTreeMap<String, BookVoice>,
     pub engines: BTreeMap<String, EngineSpec>,
+    /// Whether text is spoken. Independent from `reading.mode`: manual/auto
+    /// controls continuation, while this controls audio.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// What one book wants, where it differs from the default.
+///
+/// Every field is optional and an absent one means "whatever the default says",
+/// which is the difference between a book with no opinion about its language
+/// and a book that explicitly restores the model default.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BookVoice {
+    /// The book's title as it was when this was written. Nothing reads it —
+    /// it is here so that a file full of content ids can be read by a person.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+    #[serde(alias = "voice", skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Per-book engine arguments. `Some("")` deliberately restores the model
+    /// defaults even when the global configuration carries custom arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<String>,
+}
+
+/// The voice in force: the default with the open book's entry laid over it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Chosen {
+    pub engine: String,
+    /// The reader's explicit choice, which may be empty — the model preset then
+    /// supplies its default voice.
+    pub name: String,
+    pub language: String,
+    pub params: String,
+}
+
+/// Where a choice is written down.
+///
+/// The scope explicitly selected in the Voice workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope<'a> {
+    /// Every book that has no entry of its own.
+    Default,
+    /// One book, named so the config file can be read.
+    Book { id: &'a str, title: &'a str },
 }
 
 impl Default for Reading {
     fn default() -> Self {
         Self {
             speed: 46.0,
-            auto: false,
+            mode: Mode::default(),
+            auto: None,
         }
     }
 }
@@ -109,17 +190,31 @@ impl Default for Images {
     }
 }
 
-impl Default for Tts {
+impl Default for Voice {
     fn default() -> Self {
         Self {
-            enabled: false,
-            engine: "kokoro".to_string(),
-            voice: String::new(),
-            language: "auto".to_string(),
+            engine: String::new(),
+            name: String::new(),
+            language: String::new(),
+            params: String::new(),
             prefetch: 2,
             output: Output::default(),
+            books: BTreeMap::new(),
             engines: presets(),
+            enabled: false,
         }
+    }
+}
+
+impl BookVoice {
+    /// Whether this entry still says anything. An entry that does not is
+    /// deleted rather than written: a book listed with nothing under it reads
+    /// as a setting nobody can find.
+    fn speaks_up(&self) -> bool {
+        self.engine.is_some()
+            || self.name.is_some()
+            || self.language.is_some()
+            || self.params.is_some()
     }
 }
 
@@ -138,14 +233,15 @@ impl Config {
                 return (config, note);
             }
         };
-        match serde_yaml_ng::from_str::<Self>(&raw) {
-            Ok(mut config) => {
+        match Self::parse(&raw) {
+            Ok((mut config, stale)) => {
                 // A saved config is the reader's settings, not a snapshot of
                 // what readio knew when it was written: engines added since
                 // appear, and the parts of an engine that describe its package
                 // rather than the reader's taste follow the binary. Written back
-                // straight away, so the file says what is actually in force.
-                if crate::tts::config::reconcile(&mut config.tts.engines) {
+                // straight away, so the file says what is actually in force —
+                // and so does a file still spelling read-aloud the old way.
+                if stale || crate::voice::config::reconcile(&mut config.voice.engines) {
                     let _ = config.save();
                 }
                 config.clamp();
@@ -156,6 +252,28 @@ impl Config {
                 Some(format!("{}: {err}", paths::display(&path))),
             ),
         }
+    }
+
+    /// Parse a config file, folding what older readios wrote into what this one
+    /// reads. The flag is true when something was folded, which is the caller's
+    /// cue to write the file back in the current spelling.
+    pub fn parse(raw: &str) -> Result<(Self, bool), serde_yaml_ng::Error> {
+        let mut config: Self = serde_yaml_ng::from_str(raw)?;
+        let stale = config.migrate();
+        Ok((config, stale))
+    }
+
+    /// Fold settings older readios wrote into the two independent controls.
+    fn migrate(&mut self) -> bool {
+        let scrolled = self.reading.auto.take();
+        let legacy_aloud = self.reading.mode == Mode::Speak;
+        if legacy_aloud {
+            self.reading.mode = Mode::Auto;
+            self.voice.enabled = true;
+        } else if scrolled == Some(true) && self.reading.mode == Mode::Manual {
+            self.reading.mode = Mode::Auto;
+        }
+        legacy_aloud || scrolled.is_some()
     }
 
     /// Write the file back, comments and all.
@@ -171,50 +289,199 @@ impl Config {
             Reading::default().speed
         };
         self.effort.multipliers.clamp_all();
-        self.tts.prefetch = self.tts.prefetch.clamp(1, 8);
-        self.tts.output.poll = self.tts.output.poll.clamp(1, 120);
+        self.voice.prefetch = self.voice.prefetch.clamp(1, 8);
+        self.voice.output.poll = self.voice.output.poll.clamp(1, 120);
         self.images.max_rows = self.images.max_rows.clamp(2, 60);
+        // A book entry that says nothing is not a setting, it is clutter.
+        self.voice.books.retain(|_, entry| entry.speaks_up());
     }
 
     pub fn spec(&self, name: &str) -> Option<&EngineSpec> {
-        self.tts.engines.get(name)
+        self.voice.engines.get(name)
     }
 
-    /// The engine in use, if it exists.
-    pub fn active_engine(&self) -> Option<&EngineSpec> {
-        self.spec(&self.tts.engine)
-    }
+    // ── who reads ────────────────────────────────────────────────────────────
 
-    /// Voice for the active engine: the explicit choice, else the preset's.
-    pub fn active_voice(&self) -> String {
-        if !self.tts.voice.trim().is_empty() {
-            return self.tts.voice.clone();
+    /// The voice in force for `book`: its own entry where it has one, the
+    /// default everywhere else.
+    ///
+    /// `None` is the library, where there is no book to have an opinion.
+    pub fn voice_for(&self, book: Option<&str>) -> Chosen {
+        let entry = book.and_then(|id| self.voice.books.get(id));
+        let pick = |chosen: Option<&String>, fallback: &String| {
+            chosen.unwrap_or(fallback).trim().to_string()
+        };
+        Chosen {
+            engine: pick(entry.and_then(|e| e.engine.as_ref()), &self.voice.engine),
+            name: pick(entry.and_then(|e| e.name.as_ref()), &self.voice.name),
+            language: pick(
+                entry.and_then(|e| e.language.as_ref()),
+                &self.voice.language,
+            ),
+            params: pick(entry.and_then(|e| e.params.as_ref()), &self.voice.params),
         }
-        self.active_engine()
-            .map(|s| s.voice.clone())
+    }
+
+    /// The engine `book` is read with, if it exists in the table.
+    pub fn engine_for(&self, book: Option<&str>) -> Option<&EngineSpec> {
+        self.spec(&self.voice_for(book).engine)
+    }
+
+    /// The voice name to show for `book`: the explicit choice, else whatever
+    /// the engine brings of its own.
+    pub fn voice_name(&self, book: Option<&str>) -> String {
+        let chosen = self.voice_for(book);
+        if !chosen.name.is_empty() {
+            return chosen.name;
+        }
+        self.spec(&chosen.engine)
+            .map(|spec| spec.voice.clone())
             .unwrap_or_default()
     }
 
-    /// Engine names, sorted, for error messages and `/tts`.
+    /// What this book asked for, where it asked for anything.
+    pub fn book_voice(&self, id: &str) -> Option<&BookVoice> {
+        self.voice.books.get(id)
+    }
+
+    /// Engine names, sorted, for error messages and `/voice`.
     pub fn engine_names(&self) -> Vec<String> {
-        self.tts.engines.keys().cloned().collect()
+        self.voice.engines.keys().cloned().collect()
+    }
+
+    // ── writing a choice down ────────────────────────────────────────────────
+
+    /// Read with this engine, here or everywhere.
+    pub fn set_engine(&mut self, scope: Scope<'_>, engine: &str) {
+        match scope {
+            Scope::Default => self.voice.engine = engine.to_string(),
+            Scope::Book { id, title } => {
+                self.entry(id, title).engine = Some(engine.to_string());
+            }
+        }
+        self.tidy();
+    }
+
+    /// Read in this voice. An empty name hands the choice back to the language
+    /// of the page, which is what `/voice auto` means.
+    pub fn set_voice_name(&mut self, scope: Scope<'_>, name: &str) {
+        match scope {
+            Scope::Default => self.voice.name = name.to_string(),
+            Scope::Book { id, title } => {
+                self.entry(id, title).name = Some(name.to_string());
+            }
+        }
+        self.tidy();
+    }
+
+    /// Read in this language, or keep the preset default when empty.
+    pub fn set_language(&mut self, scope: Scope<'_>, language: &str) {
+        match scope {
+            Scope::Default => self.voice.language = language.to_string(),
+            Scope::Book { id, title } => {
+                self.entry(id, title).language = Some(language.to_string());
+            }
+        }
+        self.tidy();
+    }
+
+    /// Store model-specific arguments for one scope. These are applied to a
+    /// cloned engine specification at runtime; downloading the engine never
+    /// writes them.
+    pub fn set_voice_params(&mut self, scope: Scope<'_>, params: &str) {
+        match scope {
+            Scope::Default => self.voice.params = params.to_string(),
+            Scope::Book { id, title } => {
+                self.entry(id, title).params = Some(params.to_string());
+            }
+        }
+        self.tidy();
+    }
+
+    /// Let this book fall back to the default again. False when it never had an
+    /// entry, so the caller can say so rather than claiming to have undone
+    /// something.
+    pub fn follow_default(&mut self, id: &str) -> bool {
+        self.voice.books.remove(id).is_some()
+    }
+
+    /// Make what this book is read with the default for every book.
+    ///
+    /// The entry is removed as it is promoted: leaving it behind would mean two
+    /// records of the same decision, and the only interesting thing about two
+    /// records of one decision is what happens when they disagree.
+    pub fn adopt_as_default(&mut self, id: &str) -> bool {
+        let chosen = self.voice_for(Some(id));
+        let had = self.voice.books.remove(id).is_some();
+        self.voice.engine = chosen.engine;
+        self.voice.name = chosen.name;
+        self.voice.language = chosen.language;
+        self.voice.params = chosen.params;
+        had
+    }
+
+    /// The book's entry, created empty if this is the first thing it asks for.
+    fn entry(&mut self, id: &str, title: &str) -> &mut BookVoice {
+        let entry = self.voice.books.entry(id.to_string()).or_default();
+        if entry.title.is_empty() {
+            entry.title = title.to_string();
+        }
+        entry
+    }
+
+    /// Drop book entries that no longer differ from the default, and empty ones.
+    ///
+    /// A book that asks for exactly what everyone else gets is not a preference,
+    /// it is a copy — and a copy that stops following the default the next time
+    /// the default changes, which is a surprise nobody asked for.
+    fn tidy(&mut self) {
+        let default = self.voice_for(None);
+        self.voice.books.retain(|_, entry| {
+            if let Some(engine) = entry.engine.as_ref()
+                && engine.trim() == default.engine
+            {
+                entry.engine = None;
+            }
+            if let Some(name) = entry.name.as_ref()
+                && name.trim() == default.name
+            {
+                entry.name = None;
+            }
+            if let Some(language) = entry.language.as_ref()
+                && language.trim() == default.language
+            {
+                entry.language = None;
+            }
+            if let Some(params) = entry.params.as_ref()
+                && params.trim() == default.params
+            {
+                entry.params = None;
+            }
+            entry.speaks_up()
+        });
     }
 
     /// Render the file: scalars written by hand so the comments survive a save,
-    /// the engine table serialized.
+    /// the engine table and the per-book voices serialized.
     pub fn render(&self) -> Result<String> {
-        let engines = serde_yaml_ng::to_string(&self.tts.engines)
-            .context("cannot serialise the engine table")?;
-        let engines: String = engines
-            .lines()
-            .map(|line| {
-                if line.trim().is_empty() {
-                    "\n".to_string()
-                } else {
-                    format!("    {line}\n")
-                }
-            })
-            .collect();
+        let engines = indent(
+            &serde_yaml_ng::to_string(&self.voice.engines)
+                .context("cannot serialise the engine table")?,
+        );
+        // Absent until a book asks for something, because a `books: {}` in a
+        // file nobody has used the feature in is a question with no question
+        // mark. The commented example in the notes above is what teaches it.
+        let books = if self.voice.books.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "{BOOKS_NOTE}  books:\n{}",
+                indent(
+                    &serde_yaml_ng::to_string(&self.voice.books)
+                        .context("cannot serialise the per-book voices")?
+                )
+            )
+        };
 
         Ok(format!(
             "{HEADER}\n\
@@ -223,7 +490,7 @@ impl Config {
              reading:\n\
              {READING_NOTE}\
              \x20 speed: {speed}\n\
-             \x20 auto: {auto}\n\
+             \x20 mode: {mode}\n\
              \n\
              effort:\n\
              {EFFORT_NOTE}\
@@ -241,12 +508,13 @@ impl Config {
              \x20 enabled: {images}\n\
              \x20 max_rows: {rows}\n\
              \n\
-             tts:\n\
-             {TTS_NOTE}\
-             \x20 enabled: {tts}\n\
+             voice:\n\
+             {VOICE_NOTE}\
              \x20 engine: {engine}\n\
-             \x20 voice: \"{voice}\"\n\
-             \x20 language: {tts_lang}\n\
+             \x20 name: \"{name}\"\n\
+             \x20 language: {voice_lang}\n\
+             \x20 params: \"{voice_params}\"\n\
+             \x20 enabled: {voice_enabled}\n\
              \x20 prefetch: {prefetch}\n\
              {OUTPUT_NOTE}\
              \x20 output:\n\
@@ -254,12 +522,13 @@ impl Config {
              \x20   query: \"{query}\"\n\
              \x20   poll: {poll}\n\
              \x20   on_mismatch: {mismatch}\n\
+             {books}\
              {ENGINES_NOTE}\
              \x20 engines:\n{engines}\
              {input_log}",
             lang = self.language.code(),
             speed = trim_float(self.reading.speed),
-            auto = self.reading.auto,
+            mode = self.reading.mode.code(),
             level = self.effort.level.code(),
             minimal = trim_float(self.effort.multipliers.minimal),
             low = trim_float(self.effort.multipliers.low),
@@ -269,26 +538,27 @@ impl Config {
             max = trim_float(self.effort.multipliers.max),
             images = self.images.enabled,
             rows = self.images.max_rows,
-            tts = self.tts.enabled,
-            engine = self.tts.engine,
-            voice = self.tts.voice,
-            tts_lang = self.tts.language,
-            prefetch = self.tts.prefetch,
-            allow = if self.tts.output.allow.is_empty() {
+            engine = self.voice.engine,
+            name = self.voice.name,
+            voice_lang = self.voice.language,
+            voice_params = self.voice.params.replace('"', "\\\""),
+            voice_enabled = self.voice.enabled,
+            prefetch = self.voice.prefetch,
+            allow = if self.voice.output.allow.is_empty() {
                 " []".to_string()
             } else {
-                self.tts
+                self.voice
                     .output
                     .allow
                     .iter()
                     .map(|rule| format!("\n      - \"{rule}\""))
                     .collect::<String>()
             },
-            query = self.tts.output.query,
-            poll = self.tts.output.poll,
-            mismatch = match self.tts.output.on_mismatch {
-                crate::tts::device::Mismatch::Silence => "silence",
-                crate::tts::device::Mismatch::Play => "play",
+            query = self.voice.output.query,
+            poll = self.voice.output.poll,
+            mismatch = match self.voice.output.on_mismatch {
+                crate::voice::device::Mismatch::Silence => "silence",
+                crate::voice::device::Mismatch::Play => "play",
             },
             input_log = match &self.input_log {
                 Some(path) => format!(
@@ -298,6 +568,20 @@ impl Config {
             },
         ))
     }
+}
+
+/// Serialized YAML, moved one nesting level in so it can sit under a key.
+fn indent(block: &str) -> String {
+    block
+        .lines()
+        .map(|line| {
+            if line.trim().is_empty() {
+                "\n".to_string()
+            } else {
+                format!("    {line}\n")
+            }
+        })
+        .collect()
 }
 
 /// `46` rather than `46.0`, and `1.5` rather than `1.5000001`.
@@ -317,10 +601,10 @@ const HEADER: &str = "\
 # readio configuration / 配置
 #
 # The one configuration file — readio reads no environment variables. Edit it
-# and restart, or let commands like /speed, /voice and /tts write it for you.
+# and restart, or let commands like /speed, /voice and /mode write it for you.
 #
 # 这是唯一的配置文件，readio 不读任何环境变量。改完存盘，下次启动生效；
-# /speed、/voice、/tts 之类的命令也会写回这里。
+# /speed、/voice、/mode 之类的命令也会写回这里。
 #
 # A different host directory / 换目录: readio --home <dir>
 
@@ -330,7 +614,10 @@ const READING_NOTE: &str =
     "  # speed: characters per second at effort high; the effort multiplier scales it,
   #   and read-aloud takes the pace from the audio instead
   # speed: 强度 high 时每秒吐出多少字；其它档按倍数缩放，朗读时改为跟着音频走
-  # auto: auto-scroll, the mode shift+tab cycles into / 自动滚动，shift+tab 可切
+  # mode: manual | auto — whether the next passage arrives by itself.
+  #   shift+tab toggles it. Voice is a separate enabled switch below.
+  # mode: manual | auto，只决定读完后会不会自动取下一段；shift+tab 切换。
+  #   朗读由下面 Voice 的 enabled 单独控制。
 ";
 
 const EFFORT_NOTE: &str = "  # Reading pace, shown as the reasoning effort of the model.
@@ -346,19 +633,37 @@ const IMAGES_NOTE: &str =
   # 书里的插图用半块字符画在终端里；max_rows 是最高几行
 ";
 
-const TTS_NOTE: &str = "  # readio ships no model: it drives whatever engine you installed, so
+const VOICE_NOTE: &str =
+    "  # Who reads to you. One section, because which engine and which voice are
+  # one question: a Kokoro zf_* voice is Mandarin and an af_* one is English,
+  # so choosing a voice chooses an engine and a language with it.
+  # 朗读设置都在这一节：引擎、音色、语种本来就是一件事，分开配迟早互相打架。
+  # readio ships no model — it drives whatever engine you installed, so
   # switching models is an edit here rather than a new release.
   # readio 自己不带模型，只调用你装好的引擎，所以换模型就是改这里。
-  # an empty voice lets readio pick one per language, from the table below
-  # voice 留空，readio 就按每段文字的语种挑音色
-  # language: auto reads each sentence in the language it is written in, and
-  # picks the matching voice from the engine's `languages` table below. Pin it
-  # to zh or en if you would rather every page sounded the same.
-  # language: auto 按每句话本身的语种朗读，音色也跟着换；想固定就写 zh 或 en。
-  # rate is the playback speed, 0.5 to 3.0; ^r cycles 0.75× 1× 1.25× 1.5× 2×
-  # rate 是朗读倍速（0.5~3.0）；^r 在 0.75× 1× 1.25× 1.5× 2× 之间循环
+  # A fresh config selects nothing. /voice opens one workspace: downloads on
+  # the left, explicit global/per-book configuration on the right.
+  # 新配置默认不选引擎；/voice 左边下载模型，右边明确选择全局或单书配置。
+  # engine: empty, or one of the `engines:` below / 留空或选下面的引擎
+  # name: a voice that engine knows; empty keeps the model's declared default.
+  # language: a key such as zh or en; text never changes it sentence by sentence.
+  # name 留空使用模型默认音色；language 写 zh 或 en，不按句子自动切换。
+  # params: model-specific arguments saved by the Voice form; empty is default.
+  # params 是模型支持的独立参数；留空使用模型默认值。
+  # enabled: Voice on/off, independent from manual/auto continuation.
+  # enabled 单独开关朗读，不会改变上面的手动/自动阅读。
+  # The playback speed is not here: it is the effort multiplier above, so one
+  # ladder covers reading and listening / 倍速在上面的 effort，读和听共用一套。
   # prefetch: sentences rendered ahead of the one playing, so there is no gap
   # at a sentence boundary. Raise it if your engine is slow / 提前合成几句
+";
+
+const BOOKS_NOTE: &str =
+    "  # One book, its own voice. Keyed by the same content id the library uses,
+  # and only what that book asked for is stored — anything absent follows the
+  # settings above. The Voice form selects the book explicitly.
+  # 单独给某本书配音，键是书的内容 id；这里没写的项就跟随上面的默认设置。
+  # Voice 表单里明确选择某本书后写在这里；“沿用全局”会删掉这本书的设置。
 ";
 
 const OUTPUT_NOTE: &str =
@@ -386,8 +691,9 @@ const ENGINES_NOTE: &str = "  # placeholders / 占位符:
   # spoken to in lines of JSON. Starting a model for every sentence costs more
   # than saying the sentence does, and an engine slower than speech can never be
   # caught up with. Kept resident, kokoro goes from half of real time to three
-  # times it. {python} is the interpreter the engine was installed into and
-  # {worker} is the script readio writes into ~/.readio/engines.
+  # times it. {python} is the interpreter the engine was installed into,
+  # {worker} is the script readio writes into ~/.readio/engines, and {model}
+  # is loaded once when that process starts.
   # serve: 常驻进程，逐句用 JSON 交互；模型只加载一次。
   #
   # languages: what changes when the page changes language. `lang` holds the
@@ -404,19 +710,42 @@ const ENGINES_NOTE: &str = "  # placeholders / 占位符:
 mod tests {
     use super::*;
 
+    /// A book id, spelled the way `crate::book::content_id` spells one.
+    const BOOK: &str = "3f9a1c7d5e2b4a10";
+
     #[test]
     fn defaults_are_usable_without_a_file() {
         let config = Config::default();
         assert_eq!(config.language, Lang::En, "English is the default");
-        assert!(!config.tts.enabled, "read-aloud is opt-in");
+        assert_eq!(
+            config.reading.mode,
+            Mode::Manual,
+            "nothing moves until the reader says so"
+        );
         assert!(config.images.enabled, "images are on by default");
         assert!(
-            config.active_engine().is_some(),
-            "the default engine must exist in the table"
+            config.engine_for(None).is_none(),
+            "a fresh reader has not chosen or downloaded a speech engine"
         );
         assert!(
-            !config.active_voice().is_empty(),
-            "the default engine brings its own voice"
+            config.voice_name(None).is_empty(),
+            "no engine also means no implicit voice"
+        );
+    }
+
+    /// readio ships engine recipes, not model weights. MOSS and Kokoro are the
+    /// recommended Chinese and English choices, but neither becomes active
+    /// until the reader explicitly downloads and selects it.
+    #[test]
+    fn a_fresh_reader_offers_moss_and_kokoro_without_choosing_either() {
+        let config = Config::default();
+        assert!(config.voice.engine.is_empty());
+        assert!(config.voice.name.is_empty());
+        assert!(config.voice.books.is_empty());
+        assert!(
+            config.voice.engines.contains_key("moss")
+                && config.voice.engines.contains_key("kokoro"),
+            "both recommended engines must be available to choose"
         );
     }
 
@@ -427,8 +756,16 @@ mod tests {
             ..Config::default()
         };
         config.reading.speed = 72.0;
-        config.tts.enabled = true;
-        config.tts.voice = "zf_xiaoyi".to_string();
+        config.reading.mode = Mode::Auto;
+        config.voice.enabled = true;
+        config.voice.name = "zf_xiaoyi".to_string();
+        config.set_voice_name(
+            Scope::Book {
+                id: BOOK,
+                title: "论语",
+            },
+            "af_heart",
+        );
         config.effort.level = crate::effort::Effort::Xhigh;
         config
             .effort
@@ -437,8 +774,9 @@ mod tests {
         config.images.max_rows = 24;
 
         let body = config.render().expect("render");
-        let back: Config = serde_yaml_ng::from_str(&body).expect("the file we write must parse");
+        let (back, stale) = Config::parse(&body).expect("the file we write must parse");
         assert_eq!(back, config, "a save/load round trip must be lossless");
+        assert!(!stale, "readio's own output is never in an older spelling");
         assert!(
             body.contains("# readio configuration"),
             "comments belong in the file:\n{body}"
@@ -447,19 +785,33 @@ mod tests {
             body.contains("speed: 72"),
             "whole numbers should stay whole:\n{body}"
         );
+        assert!(
+            body.contains("mode: auto") && body.contains("enabled: true"),
+            "the mode is a setting, written where the reader can read it:\n{body}"
+        );
+        // A file full of content ids is unreadable without them.
+        assert!(
+            body.contains("论语"),
+            "a per-book entry should say which book it is:\n{body}"
+        );
     }
 
     #[test]
     fn a_partial_file_fills_in_the_rest() {
         let raw = "language: en\nreading:\n  speed: 90\n";
-        let config: Config = serde_yaml_ng::from_str(raw).expect("partial config should parse");
+        let (config, _) = Config::parse(raw).expect("partial config should parse");
         assert_eq!(config.language, Lang::En);
         assert_eq!(config.reading.speed, 90.0);
-        assert!(!config.reading.auto, "unset fields take their default");
-        assert_eq!(config.tts.engine, "kokoro");
+        assert_eq!(
+            config.reading.mode,
+            Mode::Manual,
+            "unset fields take their default"
+        );
+        assert!(config.voice.engine.is_empty());
         assert!(
-            config.active_engine().is_some(),
-            "a file that mentions no engines still gets the presets"
+            config.voice.engines.contains_key("moss")
+                && config.voice.engines.contains_key("kokoro"),
+            "a file that mentions no engines still gets the presets without selecting one"
         );
     }
 
@@ -469,17 +821,200 @@ mod tests {
         assert_eq!(config, Config::default());
     }
 
+    /// Old files already carried two independent switches. Migration keeps both
+    /// facts rather than collapsing Voice into continuation again.
+    #[test]
+    fn the_old_pair_of_switches_remains_two_independent_settings() {
+        let (config, stale) = Config::parse("tts:\n  enabled: true\n").expect("parse");
+        assert_eq!(config.reading.mode, Mode::Manual);
+        assert!(config.voice.enabled, "they were listening");
+        assert!(
+            !stale,
+            "the section alias already maps directly to independent Voice state"
+        );
+
+        let (config, stale) = Config::parse("reading:\n  auto: true\n").expect("parse");
+        assert_eq!(config.reading.mode, Mode::Auto);
+        assert!(!config.voice.enabled);
+        assert!(stale);
+
+        let (config, _) =
+            Config::parse("reading:\n  auto: true\ntts:\n  enabled: true\n").expect("parse");
+        assert_eq!(config.reading.mode, Mode::Auto);
+        assert!(config.voice.enabled);
+
+        // The short-lived three-state spelling maps to continuous read-aloud:
+        // auto continuation with Voice enabled.
+        let (config, stale) = Config::parse("reading:\n  mode: aloud\n").expect("parse");
+        assert_eq!(config.reading.mode, Mode::Auto);
+        assert!(config.voice.enabled);
+        assert!(stale);
+
+        let (config, _) = Config::parse("tts:\n  enabled: true\n").expect("parse");
+        let body = config.render().expect("render");
+        let voice_section = body.split("\nvoice:\n").nth(1).expect("a voice section");
+        assert!(
+            voice_section.contains("enabled: true"),
+            "Voice remains explicit and independent:\n{voice_section}"
+        );
+        let (again, stale) = Config::parse(&body).expect("parse what we wrote");
+        assert_eq!(again.reading.mode, Mode::Manual);
+        assert!(again.voice.enabled);
+        assert!(!stale, "with nothing left to fold");
+    }
+
+    /// The section was renamed, not split: an engine and a voice were always one
+    /// choice, so a file that says `tts:` is not wrong, only older.
+    #[test]
+    fn a_file_that_still_says_tts_is_read_as_voice() {
+        let raw = "tts:\n  engine: espeak\n  voice: af_heart\n  language: en\n";
+        let (config, _) = Config::parse(raw).expect("parse");
+        assert_eq!(config.voice.engine, "espeak");
+        assert_eq!(config.voice.name, "af_heart", "`voice:` is `name:`");
+        assert_eq!(config.voice.language, "en");
+    }
+
+    /// A shelf is not read in one voice, and the reader who sets a book up should
+    /// not have to set it up again every time they open it.
+    #[test]
+    fn a_book_can_be_read_in_its_own_voice() {
+        let mut config = Config::default();
+        config.voice.engine = "kokoro".to_string();
+        config.voice.name = "zf_xiaoxiao".to_string();
+
+        config.set_engine(
+            Scope::Book {
+                id: BOOK,
+                title: "The Analects",
+            },
+            "espeak",
+        );
+        config.set_voice_name(
+            Scope::Book {
+                id: BOOK,
+                title: "The Analects",
+            },
+            "af_heart",
+        );
+
+        let mine = config.voice_for(Some(BOOK));
+        assert_eq!(mine.engine, "espeak");
+        assert_eq!(mine.name, "af_heart");
+        assert_eq!(
+            mine.language, "",
+            "what the book said nothing about follows the default"
+        );
+
+        let everyone = config.voice_for(None);
+        assert_eq!(everyone.engine, "kokoro", "the default is untouched");
+        assert_eq!(everyone.name, "zf_xiaoxiao");
+        assert_eq!(
+            config.voice_for(Some("another-book")),
+            everyone,
+            "and so is every other book"
+        );
+    }
+
+    #[test]
+    fn model_parameters_can_be_global_or_belong_to_one_book() {
+        let mut config = Config::default();
+        config.set_voice_params(Scope::Default, "temperature=0.8");
+        config.set_voice_params(
+            Scope::Book {
+                id: BOOK,
+                title: "论语",
+            },
+            "temperature=0.65 top_p=0.9",
+        );
+
+        assert_eq!(config.voice_for(None).params, "temperature=0.8");
+        assert_eq!(
+            config.voice_for(Some(BOOK)).params,
+            "temperature=0.65 top_p=0.9"
+        );
+        assert_eq!(
+            config.voice_for(Some("another-book")).params,
+            "temperature=0.8"
+        );
+
+        let body = config.render().expect("render");
+        let (back, _) = Config::parse(&body).expect("parse");
+        assert_eq!(
+            back.voice_for(Some(BOOK)).params,
+            "temperature=0.65 top_p=0.9"
+        );
+    }
+
+    /// The two ways a choice moves between one book and all of them. Promoting
+    /// removes the entry: two records of one decision is exactly what this whole
+    /// section exists to avoid.
+    #[test]
+    fn a_book_can_hand_its_voice_to_everyone_or_give_it_back() {
+        let mut config = Config::default();
+        config.set_engine(
+            Scope::Book {
+                id: BOOK,
+                title: "论语",
+            },
+            "espeak",
+        );
+        assert!(config.book_voice(BOOK).is_some());
+
+        config.adopt_as_default(BOOK);
+        assert_eq!(config.voice.engine, "espeak", "everyone reads with it now");
+        assert!(
+            config.book_voice(BOOK).is_none(),
+            "and the book stops carrying a copy"
+        );
+
+        config.set_voice_name(
+            Scope::Book {
+                id: BOOK,
+                title: "论语",
+            },
+            "af_heart",
+        );
+        assert!(config.follow_default(BOOK), "there was something to undo");
+        assert!(!config.follow_default(BOOK), "and now there is not");
+        assert_eq!(
+            config.voice_for(Some(BOOK)),
+            config.voice_for(None),
+            "the book is back to whatever everyone gets"
+        );
+    }
+
+    /// A book asking for exactly what everyone gets is not a preference, it is a
+    /// copy — and a copy stops following the default the next time the default
+    /// changes, which is a surprise nobody asked for.
+    #[test]
+    fn a_book_that_asks_for_the_default_stops_asking() {
+        let mut config = Config::default();
+        config.voice.engine = "kokoro".to_string();
+        config.set_engine(
+            Scope::Book {
+                id: BOOK,
+                title: "论语",
+            },
+            "kokoro",
+        );
+        assert!(
+            config.book_voice(BOOK).is_none(),
+            "nothing to record: {:?}",
+            config.voice.books
+        );
+    }
+
     #[test]
     fn a_hand_added_engine_survives_the_preset_merge() {
-        let raw = "tts:\n  engine: mine\n  engines:\n    mine:\n      synth: my-tts {text} {out}\n      play: afplay {file}\n";
-        let mut config: Config = serde_yaml_ng::from_str(raw).expect("parse");
-        crate::tts::config::reconcile(&mut config.tts.engines);
+        let raw = "voice:\n  engine: mine\n  engines:\n    mine:\n      synth: my-tts {text} {out}\n      play: afplay {file}\n";
+        let (mut config, _) = Config::parse(raw).expect("parse");
+        crate::voice::config::reconcile(&mut config.voice.engines);
         assert!(
-            config.active_engine().is_some(),
+            config.engine_for(None).is_some(),
             "the reader's own engine must not be replaced by a preset"
         );
         assert_eq!(
-            config.tts.engines["mine"].synth, "my-tts {text} {out}",
+            config.voice.engines["mine"].synth, "my-tts {text} {out}",
             "and it must survive intact"
         );
         assert!(
@@ -510,18 +1045,18 @@ tts:
       synth: my-tts {text} {out}
       play: afplay {file}
 ";
-        let mut config: Config = serde_yaml_ng::from_str(raw).expect("parse");
-        assert!(config.tts.engines["kokoro"].pip.is_empty(), "as saved");
+        let (mut config, _) = Config::parse(raw).expect("parse");
+        assert!(config.voice.engines["kokoro"].pip.is_empty(), "as saved");
 
         assert!(
-            crate::tts::config::reconcile(&mut config.tts.engines),
+            crate::voice::config::reconcile(&mut config.voice.engines),
             "something changed, so the file should be written back"
         );
 
-        let kokoro = &config.tts.engines["kokoro"];
+        let kokoro = &config.voice.engines["kokoro"];
         assert_eq!(
             kokoro.synth,
-            crate::tts::config::presets()["kokoro"].synth,
+            crate::voice::config::presets()["kokoro"].synth,
             "a command readio shipped and later corrected is replaced"
         );
         assert!(!kokoro.pip.is_empty(), "and it knows how to install itself");
@@ -530,7 +1065,7 @@ tts:
             "but a voice they chose is still a choice"
         );
         assert_eq!(
-            config.tts.engines["mine"].synth, "my-tts {text} {out}",
+            config.voice.engines["mine"].synth, "my-tts {text} {out}",
             "while an engine the reader wrote is left alone"
         );
     }
@@ -540,7 +1075,7 @@ tts:
     #[test]
     fn a_reader_who_edited_a_preset_keeps_their_edit() {
         let raw = "\
-tts:
+voice:
   engines:
     piper:
       synth: piper --model /opt/voices/mine.onnx --output-file {out}
@@ -548,10 +1083,10 @@ tts:
       model: /opt/voices/mine.onnx
       stdin: true
 ";
-        let mut config: Config = serde_yaml_ng::from_str(raw).expect("parse");
-        crate::tts::config::reconcile(&mut config.tts.engines);
+        let (mut config, _) = Config::parse(raw).expect("parse");
+        crate::voice::config::reconcile(&mut config.voice.engines);
 
-        let piper = &config.tts.engines["piper"];
+        let piper = &config.voice.engines["piper"];
         assert_eq!(
             piper.synth, "piper --model /opt/voices/mine.onnx --output-file {out}",
             "their line is their line"
@@ -581,15 +1116,15 @@ tts:
       voice: zf_xiaobei
       stdin: true
 ";
-        let mut config: Config = serde_yaml_ng::from_str(raw).expect("parse");
+        let (mut config, _) = Config::parse(raw).expect("parse");
         assert!(
-            config.tts.engines["kokoro"].languages.is_empty(),
+            config.voice.engines["kokoro"].languages.is_empty(),
             "as saved"
         );
 
-        assert!(crate::tts::config::reconcile(&mut config.tts.engines));
+        assert!(crate::voice::config::reconcile(&mut config.voice.engines));
 
-        let kokoro = &config.tts.engines["kokoro"];
+        let kokoro = &config.voice.engines["kokoro"];
         assert!(
             kokoro.synth.contains("{lang}"),
             "the corrected line has somewhere to put the language: {}",
@@ -607,8 +1142,8 @@ tts:
 
     #[test]
     fn hand_edited_nonsense_is_clamped_not_obeyed() {
-        let raw = "reading:\n  speed: 900000\neffort:\n  multipliers:\n    minimal: 40\n    max: 0\ntts:\n  prefetch: 500\nimages:\n  max_rows: 900\n";
-        let mut config: Config = serde_yaml_ng::from_str(raw).expect("parse");
+        let raw = "reading:\n  speed: 900000\neffort:\n  multipliers:\n    minimal: 40\n    max: 0\nvoice:\n  prefetch: 500\n  books:\n    empty-entry:\n      title: 一本没说什么的书\nimages:\n  max_rows: 900\n";
+        let (mut config, _) = Config::parse(raw).expect("parse");
         config.clamp();
         assert_eq!(config.reading.speed, 4000.0);
         assert_eq!(
@@ -622,16 +1157,20 @@ tts:
             config.effort.multipliers.get(crate::effort::Effort::Max),
             0.5
         );
-        assert_eq!(config.tts.prefetch, 8);
+        assert_eq!(config.voice.prefetch, 8);
         assert_eq!(config.images.max_rows, 60);
+        assert!(
+            config.voice.books.is_empty(),
+            "a book entry that says nothing is clutter, not a setting"
+        );
     }
 
     #[test]
     fn an_unknown_engine_name_is_visible_rather_than_silently_default() {
         let mut config = Config::default();
-        config.tts.engine = "nope".to_string();
-        assert!(config.active_engine().is_none());
-        assert!(config.active_voice().is_empty());
+        config.voice.engine = "nope".to_string();
+        assert!(config.engine_for(None).is_none());
+        assert!(config.voice_name(None).is_empty());
         assert!(config.engine_names().contains(&"kokoro".to_string()));
     }
 }

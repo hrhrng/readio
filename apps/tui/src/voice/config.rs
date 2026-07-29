@@ -25,7 +25,8 @@ pub struct EngineSpec {
     ///
     /// `{python}` is the interpreter behind `synth`'s own program — the one the
     /// engine's package was installed into — and `{worker}` is readio's worker
-    /// script, written out beside the config.
+    /// script, written out beside the config. `{model}` is also available here:
+    /// a resident process loads it once at startup.
     #[serde(default)]
     pub serve: String,
     /// Command that plays a file, `{file}` being the clip. Empty means the
@@ -45,13 +46,13 @@ pub struct EngineSpec {
     /// other CLIs read their text that way.
     #[serde(default)]
     pub stdin: bool,
-    /// One-line description shown by `/tts`.
+    /// One-line description shown by `/voice`.
     #[serde(default)]
     pub about: String,
     /// PyPI distribution that provides this engine's command, if it has one.
     ///
     /// readio does not bundle a model and will not vendor an installer either.
-    /// This is the one fact it needs to offer `/tts install`: the package name.
+    /// This is the one fact it needs to offer `/voice install`: the package name.
     /// Everything else — whether to use `uv`, `pipx` or `pip`, and which of them
     /// this machine actually has — is worked out at the moment of installing,
     /// because the answer differs per machine and changes over time.
@@ -79,8 +80,8 @@ pub struct EngineSpec {
     /// Where to read about the engine when readio cannot install it.
     #[serde(default)]
     pub docs: String,
-    /// What to change when the passage is in another language, keyed the way
-    /// the rest of readio names languages: `zh`, `en`.
+    /// Explicit language choices offered by the Voice form, keyed the way the
+    /// rest of readio names languages: `zh`, `en`.
     ///
     /// A library is not monolingual, and a multilingual model still has to be
     /// told which language it is looking at. Kokoro's `--lang` defaults to
@@ -94,7 +95,7 @@ pub struct EngineSpec {
     pub languages: BTreeMap<String, LanguageSpec>,
 }
 
-/// The parts of an engine's invocation that depend on what is being read.
+/// The parts of an engine's invocation selected by the configured language.
 ///
 /// Every field is optional: an unset one leaves the engine's own default alone,
 /// which is what an engine that only speaks one language wants.
@@ -114,35 +115,6 @@ pub struct LanguageSpec {
     /// leaving it empty removes the flag entirely rather than passing a blank.
     #[serde(default)]
     pub lang: String,
-}
-
-/// Which language a passage is written in, as far as choosing a voice goes.
-///
-/// One Han character in eight is enough to call it Chinese: Chinese prose
-/// quoting an English term is still Chinese, and an English page quoting a
-/// single 字 is still English. Everything else answers `en`, which is readio's
-/// default throughout rather than a claim about the alphabet — a Russian book
-/// gets English phonemes because that is the entry that exists, and the reader
-/// who has a Russian voice says so in `config.yaml`.
-pub fn language_of(text: &str) -> &'static str {
-    let mut han = 0usize;
-    let mut total = 0usize;
-    for ch in text.chars().filter(|c| !c.is_whitespace()) {
-        total += 1;
-        if matches!(ch as u32,
-            0x3400..=0x4DBF        // CJK extension A
-            | 0x4E00..=0x9FFF      // CJK unified ideographs
-            | 0xF900..=0xFAFF      // CJK compatibility ideographs
-            | 0x2_0000..=0x2_FFFF  // extensions B onwards
-        ) {
-            han += 1;
-        }
-    }
-    if han > 0 && han * 8 >= total {
-        "zh"
-    } else {
-        "en"
-    }
 }
 
 /// One file to download before an engine can speak.
@@ -272,11 +244,14 @@ pub fn presets() -> BTreeMap<String, EngineSpec> {
                 },
             ],
             docs: "https://github.com/nazdridoy/kokoro-tts".to_string(),
-            // The four `zf_*` voices are Kokoro's Mandarin set; `af_heart` is
-            // its best-rated English one. Pairing each with the matching
-            // `--lang` is what this table is for: a Chinese voice under
-            // `en-us` is the worst of both, an English phonemizer driving a
-            // model that knows how the sentence should sound.
+            // The four `zf_*` voices are Kokoro's Mandarin set — `zf_xiaobei`,
+            // `zf_xiaoni`, `zf_xiaoxiao`, `zf_xiaoyi`, all female; the model
+            // ships no `zm_*` — and `af_heart` is its best-rated English one.
+            // Any of them is `/voice <name>`; what is named here is only the
+            // default. Pairing each with the matching `--lang` is what this
+            // table is for: a Chinese voice under `en-us` is the worst of both,
+            // an English phonemizer driving a model that knows how the sentence
+            // should sound.
             languages: BTreeMap::from([
                 (
                     "zh".to_string(),
@@ -295,6 +270,138 @@ pub fn presets() -> BTreeMap<String, EngineSpec> {
                     },
                 ),
             ]),
+        },
+    );
+
+    // Qwen3-TTS 0.6B — the best Chinese voice readio can drive, and the one
+    // with the least margin. Nine named speakers, and it reads 中文 as prose
+    // rather than as a sequence of syllables.
+    //
+    // Two things make it different from every other preset here. It is Apple
+    // Silicon only: `mlx` has no wheel for anything else, so the install fails
+    // at the dependency on a Linux or Intel machine. And it is only viable
+    // resident. Measured on an M-series laptop, one sentence:
+    //
+    //     via the CLI       10.0 s for 4.7 s of audio   2.12× realtime
+    //     kept resident      4.1 s for 3.8 s of audio   1.08× realtime
+    //
+    // Almost none of that gap is inference; it is a fresh Python and 3.5 s of
+    // loading 0.6B parameters, paid again for every sentence. At 2.12× it is
+    // slower than speech and can never be caught up with, so `serve:` is not an
+    // optimisation here the way it is for Kokoro — it is the difference between
+    // an engine that works and one that stalls at every sentence boundary. Even
+    // resident the margin is thin: this is the engine for a reader who wants the
+    // voice more than they want the certainty of never waiting.
+    //
+    // The `synth:` line is the fallback for a reader who deletes `serve:`, and
+    // it deliberately carries no `{rate}`: the CLI has no speed flag at all, so
+    // the effort multiplier reaches this engine only through the worker. Its
+    // `--no-autoplay` matters — the CLI plays the clip itself by default, which
+    // would mean every sentence spoken twice, once by the engine and once by
+    // readio.
+    //
+    // One honest limitation, measured on the same sentence: this model treats
+    // speed as a stylistic hint rather than a tempo. 0.75× gives 4.16 s, 1× gives
+    // 3.84 s and 1.5× gives 3.68 s, where a real tempo knob would give about
+    // 5.1 / 3.84 / 2.56. So `^r` shifts the delivery a little and the ladder
+    // does not mean here what it means for Kokoro. The text still follows the
+    // voice exactly, because the reveal is paced from each clip's measured
+    // length rather than from the number that was asked for.
+    out.insert(
+        "qwen".to_string(),
+        EngineSpec {
+            synth: "qwen3-tts speak --text {text} --output {out} --speaker {voice} \
+                    --model-id {model} {lang} --no-autoplay --no-stream {extra}"
+                .to_string(),
+            // No `{voice}` here: a `serve:` line starts one process for the whole
+            // session. The model is stable and belongs on that startup line;
+            // the voice belongs to the sentence, so it travels per request in
+            // the JSON — and the worker's own default covers the warm-up, which
+            // is the only utterance that happens before a sentence exists.
+            serve: "{python} {worker} --model {model}".to_string(),
+            play: default_player(),
+            // Never empty, because an empty `--speaker` is an argparse error
+            // rather than a shrug. `serena` is the model's own default.
+            voice: "serena".to_string(),
+            model: "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16".to_string(),
+            extra: String::new(),
+            stdin: false,
+            about: "Qwen3-TTS 0.6B · Apache-2.0 · best Chinese here · Apple Silicon only"
+                .to_string(),
+            pip: "qwen3-tts".to_string(),
+            system: String::new(),
+            // The package declares >=3.13, and mlx follows the interpreter.
+            python: "3.13".to_string(),
+            // The weights come from Hugging Face on first use, into ~/.cache.
+            fetch: Vec::new(),
+            docs: "https://github.com/QwenLM/Qwen3-TTS".to_string(),
+            // Its speakers are multilingual — `serena` reads both languages —
+            // so an explicit language choice changes the language code alone,
+            // and no entry needs to name another voice.
+            languages: BTreeMap::from([
+                (
+                    "zh".to_string(),
+                    LanguageSpec {
+                        voice: String::new(),
+                        model: String::new(),
+                        lang: "--lang-code chinese".to_string(),
+                    },
+                ),
+                (
+                    "en".to_string(),
+                    LanguageSpec {
+                        voice: String::new(),
+                        model: String::new(),
+                        lang: "--lang-code english".to_string(),
+                    },
+                ),
+            ]),
+        },
+    );
+
+    // MOSS-TTS-Nano 100M — the default Mandarin audiobook voice. It is small
+    // enough to stay resident beside the reader and, unlike the older tiny
+    // fixed-voice models, keeps prose cadence instead of flattening every
+    // sentence into an announcement.
+    //
+    // The preset reuses qwen3-tts's MLX Audio environment: both models are
+    // driven through mlx-audio, so a machine that already tried Qwen does not
+    // need a second Python stack. MOSS is resident-only in readio. `synth`
+    // names the installed launcher so availability and installation can find
+    // that environment; the shipped worker is the path that renders audio.
+    //
+    // Its speaker prompt is not a wav at runtime. The Spark audiobook sample
+    // was encoded once into 118 × 16 codec tokens and those few kilobytes travel
+    // inside the worker. Each request is therefore text-only.
+    out.insert(
+        "moss".to_string(),
+        EngineSpec {
+            synth: "qwen3-tts speak --text {text} --output {out} \
+                    --model-id {model} --no-autoplay --no-stream {extra}"
+                .to_string(),
+            serve: "{python} {worker} --model {model}".to_string(),
+            play: default_player(),
+            voice: "audiobook".to_string(),
+            model: "mlx-community/MOSS-TTS-Nano-100M".to_string(),
+            extra: String::new(),
+            stdin: false,
+            about: "MOSS-TTS-Nano 100M · Apache-2.0 · natural Mandarin audiobook · resident"
+                .to_string(),
+            pip: "qwen3-tts".to_string(),
+            system: String::new(),
+            python: "3.13".to_string(),
+            // The MLX model and its 42 MB audio codec download into the shared
+            // Hugging Face cache after the worker has checked free space.
+            fetch: Vec::new(),
+            docs: "https://huggingface.co/OpenMOSS-Team/MOSS-TTS-Nano-100M".to_string(),
+            languages: BTreeMap::from([(
+                "zh".to_string(),
+                LanguageSpec {
+                    voice: "audiobook".to_string(),
+                    model: String::new(),
+                    lang: String::new(),
+                },
+            )]),
         },
     );
 
@@ -445,6 +552,14 @@ const SUPERSEDED: &[(&str, &str)] = &[
         "supertonic",
         "supertonic --text {text} --out {out} --voice {voice}",
     ),
+    // Qwen's model originally lived only as a default inside the resident
+    // worker. The fallback and config therefore had no way to name the same
+    // model, so editing `model:` changed nothing in the path readers use.
+    (
+        "qwen",
+        "qwen3-tts speak --text {text} --output {out} --speaker {voice} \
+         {lang} --no-autoplay --no-stream {extra}",
+    ),
 ];
 
 /// Bring the engines in a saved config up to date with this binary.
@@ -463,7 +578,9 @@ const SUPERSEDED: &[(&str, &str)] = &[
 ///   readio's own superseded defaults — where "leaving it alone" means keeping
 ///   a command that cannot run.
 /// - **Which voice.** `voice`, `model` and `extra` are choices, and are never
-///   touched, not even while correcting a command line around them.
+///   touched, not even while correcting a command line around them. The one
+///   exception is the empty model from readio's first Qwen preset: that was an
+///   implicit Python default, not an empty choice, and is made visible once.
 ///
 /// Returns true when anything changed, so the caller can write the file back.
 pub fn reconcile(engines: &mut BTreeMap<String, EngineSpec>) -> bool {
@@ -487,11 +604,17 @@ pub fn reconcile(engines: &mut BTreeMap<String, EngineSpec>) -> bool {
             .any(|(engine, synth)| *engine == name && same_command(synth, &saved.synth));
         if superseded {
             saved.synth = preset.synth;
-            saved.serve = preset.serve;
+            saved.serve = preset.serve.clone();
             saved.play = preset.play;
             saved.stdin = preset.stdin;
             saved.fetch = preset.fetch;
             saved.languages = preset.languages;
+            // The old Qwen worker did have a model; it was merely hidden as a
+            // Python constant. Materialise that implicit readio default while
+            // leaving a model the reader wrote untouched.
+            if name == "qwen" && saved.model.trim().is_empty() {
+                saved.model = preset.model.clone();
+            }
         } else if same_command(&saved.synth, &preset.synth) {
             // Their line is readio's line, so the files it needs are readio's
             // to know about too. A line they wrote themselves gets no `fetch`:
@@ -508,7 +631,17 @@ pub fn reconcile(engines: &mut BTreeMap<String, EngineSpec>) -> bool {
             // would mean the reader who has been running readio longest is the
             // one still paying eight seconds a sentence.
             if saved.serve.trim().is_empty() {
-                saved.serve = preset.serve;
+                saved.serve = preset.serve.clone();
+            }
+        }
+        // The first Qwen serve line was readio's default too, independently of
+        // the CLI beside it. A reader may have edited that CLI while still
+        // relying on the shipped worker, so migrate the worker line by its own
+        // identity and retain any model they already named.
+        if name == "qwen" && same_command(&saved.serve, "{python} {worker}") {
+            saved.serve = preset.serve.clone();
+            if saved.model.trim().is_empty() {
+                saved.model = preset.model.clone();
             }
         }
 
@@ -566,6 +699,63 @@ mod tests {
         }
     }
 
+    /// Qwen's CLI fallback and its resident worker must load the same model.
+    ///
+    /// If the model only lives as a Python constant, editing `model:` in
+    /// config.yaml appears to work while the process that actually reads the
+    /// book silently keeps using the old one.
+    #[test]
+    fn qwen_has_one_configurable_model_for_both_drivers() {
+        let qwen = &presets()["qwen"];
+        assert_eq!(
+            qwen.model, "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16",
+            "the model belongs in the engine config, where a reader can change it"
+        );
+        assert!(
+            qwen.synth.split_whitespace().any(|arg| arg == "{model}"),
+            "the one-shot fallback must use that model: {}",
+            qwen.synth
+        );
+        assert!(
+            qwen.serve.split_whitespace().any(|arg| arg == "{model}"),
+            "the resident worker must use that same model: {}",
+            qwen.serve
+        );
+    }
+
+    /// A `serve:` line may only use placeholders that are substituted into it.
+    ///
+    /// This is a real bug caught late rather than a hypothetical. A resident
+    /// engine is started once for the whole session, so anything that varies per
+    /// sentence — the voice above all — cannot be baked into its command line;
+    /// `resident_for` substitutes startup values, not sentence values. A line
+    /// reading `--voice {voice}` therefore starts a worker whose speaker is
+    /// literally the five characters `{voice}`, and every utterance fails with
+    /// "Speaker '{voice}' not supported". The per-sentence values travel in the
+    /// JSON, where they belong.
+    #[test]
+    fn a_serve_line_only_asks_for_what_is_substituted_into_it() {
+        const SUBSTITUTED: [&str; 3] = ["{python}", "{worker}", "{model}"];
+        for (name, spec) in presets() {
+            if spec.serve.trim().is_empty() {
+                continue;
+            }
+            let mut rest = spec.serve.clone();
+            for known in SUBSTITUTED {
+                rest = rest.replace(known, "");
+            }
+            assert!(
+                !rest.contains('{'),
+                "{name}'s serve line carries a placeholder nothing fills: {}",
+                spec.serve
+            );
+            assert!(
+                spec.serve.contains("{python}"),
+                "{name}'s serve line needs the interpreter that has its package"
+            );
+        }
+    }
+
     #[test]
     fn the_presets_cover_the_shapes_engines_come_in() {
         let presets = presets();
@@ -599,22 +789,6 @@ mod tests {
         }
     }
 
-    /// The rule the table keys encode: one Han character in eight. A Chinese
-    /// sentence quoting an English term is still Chinese, and an English one
-    /// quoting a 字 is still English — read the other way round, either sounds
-    /// like a broken model.
-    #[test]
-    fn a_passage_is_named_by_what_it_is_mostly_written_in() {
-        assert_eq!(language_of("界面不是中立的。"), "zh");
-        assert_eq!(language_of("这是 API 的设计问题"), "zh");
-        assert_eq!(language_of("The interface is not neutral."), "en");
-        assert_eq!(
-            language_of("The character 道 appears twice in the opening chapter."),
-            "en"
-        );
-        assert_eq!(language_of(""), "en", "and nothing at all is not an error");
-    }
-
     /// Every language a preset offers has to actually change something, and an
     /// engine that has voices has to change those too: a Chinese voice under
     /// English phonemes is the failure this table exists to prevent. Engines
@@ -642,5 +816,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The first Qwen preset kept its model inside the worker. Once the model
+    /// became a visible setting, an untouched saved preset had to acquire that
+    /// value on upgrade; a model the reader named remains theirs.
+    #[test]
+    fn qwen_catches_up_from_an_implicit_model_without_overwriting_a_choice() {
+        let implicit = EngineSpec {
+            synth: "qwen3-tts speak --text {text} --output {out} --speaker {voice} \
+                    {lang} --no-autoplay --no-stream {extra}"
+                .to_string(),
+            serve: "{python} {worker}".to_string(),
+            model: String::new(),
+            ..EngineSpec::default()
+        };
+        let mut engines = BTreeMap::from([("qwen".to_string(), implicit)]);
+
+        assert!(reconcile(&mut engines), "the implicit model is stale");
+        assert_eq!(
+            engines["qwen"].model, "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16",
+            "the old Python default becomes the visible config default"
+        );
+
+        let chosen = EngineSpec {
+            synth: "qwen3-tts speak --text {text} --output {out} --speaker {voice} \
+                    {lang} --no-autoplay --no-stream {extra}"
+                .to_string(),
+            serve: "{python} {worker}".to_string(),
+            model: "local/qwen-for-my-mac".to_string(),
+            ..EngineSpec::default()
+        };
+        let mut engines = BTreeMap::from([("qwen".to_string(), chosen)]);
+        reconcile(&mut engines);
+        assert_eq!(
+            engines["qwen"].model, "local/qwen-for-my-mac",
+            "an explicit model is a reader choice"
+        );
     }
 }

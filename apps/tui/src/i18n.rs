@@ -105,7 +105,7 @@ fn leak_missing(key: &str) -> &'static str {
 /// `key`, Chinese, English.
 ///
 /// Grouped by area: `chrome.*` for the frame, `block.*` for scrollback blocks,
-/// `cmd.*` for command feedback, `lib.*` for the library, `tts.*` for speech,
+/// `cmd.*` for command feedback, `lib.*` for the library, `voice.*` for speech,
 /// `flow.*` for the reading narration, `cli.*` for the command line.
 #[rustfmt::skip]
 pub const TABLE: &[(&str, &str, &str)] = &[
@@ -122,8 +122,8 @@ pub const TABLE: &[(&str, &str, &str)] = &[
     ("chrome.empty_tail", "  ·  /sample 看示例  ·  /help 更多",
         "  ·  /sample for the sample  ·  /help for more"),
     ("chrome.continue", "⏎ 继续", "⏎ keep reading"),
-    ("chrome.idle_tail", "  ·  shift+tab 换模式  ·  /help 更多",
-        "  ·  shift+tab cycles modes  ·  /help for more"),
+    ("chrome.idle_tail", "  ·  shift+tab 切自动  ·  /help 更多",
+        "  ·  shift+tab toggles auto  ·  /help for more"),
     ("chrome.busy_tail", "  ·  esc 中断  ·  ↑↓ 滚动", "  ·  esc interrupts  ·  ↑↓ to scroll"),
     // Pausing wears the agent's own clothes: a stopped stream is a model
     // thinking, which is the one state a coding agent is always allowed to be in.
@@ -166,9 +166,10 @@ pub const TABLE: &[(&str, &str, &str)] = &[
         "Go back to “{0}”, about {1}% into the book"),
     ("menu.also", "也可写作", "also"),
 
-    // ── the three reading modes ──
-    // A coding agent shows its mode as a chip and cycles it with shift+tab; the
-    // chip has to stay narrow, so the explaining is done by the message.
+    // ── automatic continuation ──
+    // The mode chip answers only whether passages continue automatically.
+    // Voice is an independent switch: while it is on, its configured pace
+    // controls how the current passage's tokens are revealed.
     //
     // The chip says the same word as the mode wherever it fits. It used to say
     // 逐段 / step for manual, which is a description of what the mode does
@@ -177,10 +178,10 @@ pub const TABLE: &[(&str, &str, &str)] = &[
     // the question.
     ("mode.manual", "手动", "manual"),
     ("mode.auto", "自动滚动", "auto-scroll"),
-    ("mode.tts", "朗读", "read-aloud"),
+    ("mode.aloud", "朗读", "read-aloud"),
     ("mode.chip_manual", "手动", "manual"),
     ("mode.chip_auto", "自动", "auto"),
-    ("mode.chip_tts", "朗读", "aloud"),
+    ("mode.chip_aloud", "朗读", "aloud"),
 
     // ── reading pace, worn as reasoning effort ──
     // Higher effort is slower, which is exactly how the real thing behaves, so the
@@ -202,21 +203,16 @@ pub const TABLE: &[(&str, &str, &str)] = &[
         "Manual: nothing advances on its own. ⏎ loads the next passage, and so does ↓ at the bottom. shift+tab cycles modes"),
     ("mode.set_auto", "自动滚动：一段接一段，当前 {0}。/effort 或 ^r 调速，esc 中断，shift+tab 换模式",
         "Auto-scroll: passage after passage at {0}. /effort or ^r changes the pace, esc interrupts, shift+tab cycles modes"),
-    ("mode.set_tts", "朗读模式（自带滚动）：由人声定速，当前 {0}。/effort 或 ^r 调倍速，esc 中断，shift+tab 换模式",
-        "Read-aloud, which scrolls itself: the voice sets the pace, now {0}. /effort or ^r changes it, esc interrupts, shift+tab cycles modes"),
     ("mode.row_manual", "你说一段算一段", "nothing moves until you say so"),
     ("mode.row_auto", "一段接一段自己往下走", "passages follow one another by themselves"),
-    ("mode.row_tts", "念出来，滚动跟着人声", "read out loud, scrolling with the voice"),
     ("mode.row_auto_more", "自动滚动：读完一段接着下一段，速度按当前推理强度。esc 中断，回车接着读；shift+tab 也能切模式。",
         "Auto-scroll: each passage is followed by the next at the pace the current effort level sets. esc interrupts, ⏎ carries on, and shift+tab cycles the modes."),
-    ("mode.row_tts_more", "朗读模式：readio 调用你配置好的引擎念出来，文字跟着音频走，推理强度就是播放倍速。装不上引擎时会说明原因并跳过这个模式。",
-        "Read-aloud: readio drives the engine you configured, the text keeps pace with the audio, and the effort level is the playback multiplier. If no engine can start, it says why and skips the mode."),
-    ("mode.now", "当前是{0}模式（{1}）。shift+tab 循环切换，或 /mode manual|auto|tts",
-        "Mode: {0} ({1}). shift+tab cycles, or /mode manual|auto|tts"),
-    ("mode.usage", "用法：/mode manual | auto | tts；也可以 shift+tab 循环切换",
-        "Usage: /mode manual | auto | tts — or just press shift+tab"),
-    ("mode.tts_unavailable", "朗读起不来，先跳过朗读模式",
-        "Read-aloud could not start, so that mode is skipped"),
+    ("mode.now", "自动阅读：{0}（{1}）。shift+tab 切换，朗读由 ^s 单独控制。",
+        "Auto-reading: {0} ({1}). shift+tab toggles it; ^s controls Voice separately."),
+    ("mode.usage", "用法：/mode manual | auto；也可以 shift+tab 切换。朗读用 ^s。",
+        "Usage: /mode manual | auto — or press shift+tab. Voice uses ^s."),
+    ("mode.aloud_unavailable", "朗读起不来；手动/自动阅读设置没有改变",
+        "Voice could not start; manual/auto-reading is unchanged"),
     ("cmd.needs_slash", "命令以 / 开头，比如 /find。要检索全书就用 /find <词>",
         "Commands start with a slash — /find, say. To search the book: /find <term>"),
     ("chrome.scrolled", "{0} 已上滚 {1}%", "{0} scrolled up {1}%"),
@@ -365,85 +361,125 @@ The short forms -c / -l / -m work too."),
 
     // ── speech ──
     //
-    // No "on" and no "off" line: read-aloud is a reading mode, so `/mode` and the
-    // mode chip say whether it is running. What lives here is the voice — which
-    // engine, getting one, proving it works.
-    ("tts.row_test", "念一句，验证引擎接得通", "speak one line to prove the wiring"),
-    ("tts.row_config", "告诉我配置文件在哪", "print where the config file lives"),
-    ("tts.row_engine", "{0} · ⏎ 用它念", "{0} · ⏎ reads with it"),
-    ("tts.row_engine_more", "改用 {0} 引擎，它调用的是 {1}，⏎ 直接切过去开始念。音色用 /voice 换；朗读的开关是 shift+tab。",
-        "Switches to the {0} engine, which runs {1}, and starts reading aloud. /voice picks the voice; shift+tab is what turns read-aloud off again."),
-    ("tts.row_engine_missing", "{0} · ⏎ 装上它", "{0} · ⏎ installs it"),
-    ("tts.row_engine_missing_more", "{0} 还没装。⏎ 就用 {1} 装 {2}，连音色模型一起下，装完自动切过去开始念。每条命令跑之前都会先写出来；下多少东西取决于模型，通常几十兆到几百兆。",
-        "{0} is not installed. ⏎ installs {2} with {1}, voice model included, and starts reading with it when it lands. Every command is written out before it runs; how much it downloads depends on the model, usually tens to hundreds of megabytes."),
-    ("tts.row_engine_server", "服务端，装不了", "a server, nothing to install"),
-    ("tts.row_engine_server_more", "{0} 连的是你自己起的 OpenAI 兼容服务，readio 不负责装、也不负责起。看 {1}。",
+    // Voice is independent from manual/auto continuation.
+    ("voice.row_test", "念一句，验证引擎接得通", "speak one line to prove the wiring"),
+    ("voice.row_config", "告诉我配置文件在哪", "print where the config file lives"),
+    ("voice.row_engine", "{0} · 已下载", "{0} · downloaded"),
+    ("voice.row_engine_more", "{0} 已在本机可用。要使用它，请在 Voice 配置表单里选择作用范围并保存。",
+        "{0} is available locally. To use it, choose a scope in the Voice configuration form and save."),
+    ("voice.row_engine_missing", "{0} · 未下载", "{0} · not downloaded"),
+    ("voice.row_engine_missing_more", "{0} 还没下载。下载只增加本地模型，不会修改全局或单书 Voice 配置。",
+        "{0} is not downloaded. Downloading only adds a local model; it does not change global or per-book Voice configuration."),
+    ("voice.row_engine_server", "服务端，装不了", "a server, nothing to install"),
+    ("voice.row_engine_server_more", "{0} 连的是你自己起的 OpenAI 兼容服务，readio 不负责装、也不负责起。看 {1}。",
         "{0} talks to an OpenAI-compatible server you run yourself; readio neither installs nor starts it. See {1}."),
     // Same sentence for an engine the reader defined themselves, where there is
     // no link to give: "See ." is worse than not offering to point anywhere.
-    ("tts.row_engine_server_bare", "{0} 是你自己配的命令，readio 不负责装、也不负责起。",
+    ("voice.row_engine_server_bare", "{0} 是你自己配的命令，readio 不负责装、也不负责起。",
         "{0} is a command you configured yourself; readio neither installs nor starts it."),
-    ("tts.engine_set", "朗读引擎：{0}", "Speech engine: {0}"),
-    ("tts.voice_set", "朗读音色：{0}", "Speech voice: {0}"),
-    ("tts.voice_auto", "音色跟着文字走：中文段用中文音色，英文段用英文音色。",
-        "The voice now follows the page: Chinese passages in a Chinese voice, English in an English one."),
-    ("tts.voice_language_set", "整本都按 {0} 念，音色 {1}",
+    ("voice.engine_set", "朗读引擎：{0}", "Speech engine: {0}"),
+    ("voice.voice_set", "朗读音色：{0}", "Speech voice: {0}"),
+    ("voice.on", "朗读已开启：{0}。自动阅读设置未改变。",
+        "Voice on: {0}. Auto-reading is unchanged."),
+    ("voice.off", "朗读已关闭。自动阅读设置未改变。",
+        "Voice off. Auto-reading is unchanged."),
+    ("voice.auto_set", "已清除音色和语言覆盖，使用模型默认值。",
+        "Cleared voice and language overrides; using the model defaults."),
+    ("voice.language_set", "整本都按 {0} 念，音色 {1}",
         "Reading everything as {0}, in {1}"),
-    ("tts.row_voice_auto", "跟着每段文字的语种换音色",
-        "match each passage as it comes"),
-    ("tts.row_voice_auto_more",
-        "每句话自己判断语种，音色和发音规则一起换——中英混排的一章不用你动手。这是默认。",
-        "Each sentence is read in the language it is written in, voice and phonemes together, \
-         so a chapter that mixes the two needs nothing from you. This is the default."),
-    ("tts.row_voice_lang", "固定用这一种语言念，音色 {0}",
+    ("voice.row_auto", "使用模型默认音色和语言",
+        "use the model's default voice and language"),
+    ("voice.row_auto_more",
+        "清除音色和语言覆盖，整本书保持当前模型。不会根据句子自动切换模型或语言。",
+        "Clears voice and language overrides while keeping the configured model. \
+         It never switches model or language based on a sentence."),
+    ("voice.row_language", "固定用这一种语言念，音色 {0}",
         "pin this language, read by {0}"),
-    ("tts.row_voice_lang_more",
+    ("voice.row_language_more",
         "整本书都当作{0}来念，音色固定为 {1}。适合书本来就只有一种语言，不想让 readio 猜。",
         "Reads the whole book as {0}, in {1}. For a shelf that is all one language, \
          where a guess is one more thing that can be wrong."),
-    ("tts.row_voice_pinned", "你点名的音色", "the voice you named"),
-    ("tts.row_voice_pinned_more",
-        "这是你自己指定的音色，readio 不会覆盖它。readio 认识的音色会带上自己的语种。回到 auto 选第一行。",
+    ("voice.row_pinned", "你点名的音色", "the voice you named"),
+    ("voice.row_pinned_more",
+        "这是你自己指定的音色，readio 不会覆盖它。readio 认识的音色会带上自己的语种。第一行恢复模型默认值。",
         "A voice you named yourself, which readio will not overrule. One it recognises brings \
-         its language along. The first row goes back to automatic."),
-    ("tts.language_zh", "中文", "Chinese"),
-    ("tts.language_en", "英文", "English"),
-    ("tts.speed_set", "朗读倍速 {0}", "Read-aloud speed {0}"),
-    ("tts.speed_later", "朗读倍速 {0}，下次开启朗读时生效",
+         its language along. The first row restores the model defaults."),
+    ("voice.language_zh", "中文", "Chinese"),
+    ("voice.language_en", "英文", "English"),
+    ("voice.speed_set", "朗读倍速 {0}", "Read-aloud speed {0}"),
+    ("voice.speed_later", "朗读倍速 {0}，下次开启朗读时生效",
         "Read-aloud speed {0}; it takes effect when you turn speech on"),
-    ("tts.speed_now", "当前倍速 {0}  ·  可选 {1}  ·  ^r 循环切换",
+    ("voice.speed_now", "当前倍速 {0}  ·  可选 {1}  ·  ^r 循环切换",
         "Speed {0}   ladder: {1}   (^r cycles)"),
-    ("tts.unknown_engine", "没有这个引擎：{0}。可用：{1}", "No such engine: {0}. Available: {1}"),
+    ("voice.unknown_engine", "没有这个引擎：{0}。可用：{1}", "No such engine: {0}. Available: {1}"),
     // Short on purpose: this rides the status row, where it fades on its own
     // after a few seconds. It used to be a transcript line long enough to name
-    // the config file, which meant every failed `shift+tab` left another copy of
-    // the same sentence stacked in the reader's book. `/tts` lists the engines
+    // the config file, which meant every failed Voice attempt left another copy of
+    // the same sentence stacked in the reader's book. `/voice` lists the engines
     // that are actually installed, so the way out is one command away.
-    ("tts.missing_binary", "找不到 {0}，朗读没开成。/tts 里 ⏎ 一下就装上",
-        "{0} not found, so read-aloud is off. /tts and ⏎ installs one"),
-    ("tts.failed", "朗读失败：{0}", "Read-aloud failed: {0}"),
-    ("tts.stopped", "朗读失败，停在这里了：{0}。回车重试，或用 /mode 换个读法。",
-        "Read-aloud stopped here: {0}. Press enter to retry, or pick another mode with /mode."),
-    ("tts.engine_gone", "引擎「{0}」不在了", "the {0} engine is no longer there"),
-    ("tts.worker_start", "起不来 {0}：{1}", "cannot start {0}: {1}"),
-    ("tts.worker_gone", "常驻引擎中途退出了{0}", "the resident engine exited{0}"),
-    ("tts.worker_slow", "常驻引擎 {0} 秒还没就绪", "the resident engine did not come up within {0}s"),
-    ("tts.worker_no_command", "常驻引擎没有配置启动命令{0}",
+    ("voice.missing_binary", "找不到 {0}，朗读没开成。/voice 里 ⏎ 一下就装上",
+        "{0} not found, so read-aloud is off. /voice and ⏎ installs one"),
+    ("voice.failed", "朗读失败：{0}", "Read-aloud failed: {0}"),
+    ("voice.stopped", "朗读失败，停在这里了：{0}。自动阅读没有改变；修好后用 ^s 重新开启朗读。",
+        "Voice stopped here: {0}. Auto-reading is unchanged; fix it, then press ^s to turn Voice on again."),
+    ("voice.engine_gone", "引擎「{0}」不在了", "the {0} engine is no longer there"),
+    ("voice.worker_start", "起不来 {0}：{1}", "cannot start {0}: {1}"),
+    ("voice.worker_gone", "常驻引擎中途退出了{0}", "the resident engine exited{0}"),
+    ("voice.worker_slow", "常驻引擎 {0} 秒还没就绪", "the resident engine did not come up within {0}s"),
+    ("voice.worker_no_command", "常驻引擎没有配置启动命令{0}",
         "the resident engine has no command to run{0}"),
-    ("tts.config_at", "朗读配置：{0}", "Speech config: {0}"),
-    ("tts.usage", "用法：/tts [引擎 | install <引擎> | test | config]。开关朗读用 shift+tab。",
-        "Usage: /tts [engine | install <engine> | test | config]. shift+tab turns read-aloud on and off."),
-    // `/tts on` used to be a switch. It is not one any more, because read-aloud
-    // is a reading mode and a mode already has a key.
-    ("tts.no_switch", "朗读没有单独的开关——它是三种阅读模式之一。shift+tab 换模式，/mode 挑一个；/tts 只管用哪个引擎念。",
-        "Read-aloud has no separate switch: it is one of the three reading modes. shift+tab cycles them and /mode picks one. /tts only chooses which engine reads."),
-    ("tts.usage_rate", "用法：/rate <0.5-3.0>，改的是当前强度这一档的倍数",
+    ("voice.config_at", "朗读配置：{0}", "Speech config: {0}"),
+    ("voice.usage", "用法：/voice 打开 Voice 工作台。开关朗读用 ^s。",
+        "Usage: /voice opens the Voice workspace. ^s turns Voice on and off."),
+    ("voice.no_switch", "朗读和自动阅读相互独立。用 ^s 开关朗读，shift+tab 只切换手动/自动。",
+        "Voice and auto-reading are independent. ^s toggles Voice; shift+tab only toggles manual/auto."),
+    ("voice.usage_rate", "用法：/rate <0.5-3.0>，改的是当前强度这一档的倍数",
         "Usage: /rate <0.5-3.0> — it retunes the level you are on"),
-    ("tts.testing", "试念一句：{0}", "Test line: {0}"),
-    ("tts.test_line", "界面不是中立的，它替你决定了什么值得注意。",
+    ("voice.testing", "试念一句：{0}", "Test line: {0}"),
+    ("voice.test_line", "界面不是中立的，它替你决定了什么值得注意。",
         "An interface is never neutral: it decides for you what deserves attention."),
-    ("tts.engines", "可用引擎：{0}", "Engines: {0}"),
-    ("tts.speaking", "朗读中", "reading aloud"),
+    ("voice.engines", "可用引擎：{0}", "Engines: {0}"),
+    ("voice.speaking", "朗读中", "reading aloud"),
+
+    // ── who reads what ──
+    //
+    // Every change of voice says which books it changed. A reader who sets a
+    // voice while reading and finds their next book unchanged has been surprised
+    // by a rule nobody told them, and one clause is the whole fix.
+    ("voice.for_book", "{0}——只对《{1}》生效。/voice everywhere 可以让所有书都这样念。",
+        "{0} — for {1} alone. /voice everywhere makes it the default for every book."),
+    ("voice.for_every_book", "{0}——所有没单独设过的书都这样念。",
+        "{0} — for every book that has not asked for something else."),
+    ("voice.now_default", "以后所有书都用 {0} 念，这本书不再单独设置。",
+        "Every book is read by {0} now, and this one no longer has a setting of its own."),
+    ("voice.follows_default", "《{0}》跟回默认设置：{1}",
+        "{0} follows the default again: {1}"),
+    ("voice.was_default", "《{0}》本来就跟着默认设置。",
+        "{0} was already following the default."),
+    ("voice.already_default", "书架上改的就是默认设置——先打开一本书，才有“这一本”可说。",
+        "In the library there is only the default: open a book before asking for one book's voice."),
+    // An install is a fact about this machine, so it writes the default. A book
+    // that had asked for another engine keeps it, and is told so rather than
+    // quietly overruled.
+    ("voice.book_keeps_engine", "这本书仍然用 {0} 念；想跟上新装的引擎就 /voice default。",
+        "This book still reads with {0}. /voice default lets it follow the new one."),
+    ("voice.row_everywhere", "让所有书都这样念（{0}）",
+        "use this for every book ({0})"),
+    ("voice.row_everywhere_more",
+        "把《{0}》现在这套朗读设置升为默认，所有没单独设过的书都跟着变，这本书的单独设置随之删掉——同一个决定不该有两份记录。",
+        "Promotes what {0} is read with to the default, so every book without a \
+         setting of its own follows it, and removes this book's entry: one decision, one record."),
+    ("voice.row_default", "这本书跟回默认设置", "let this book follow the default"),
+    ("voice.row_default_more",
+        "删掉《{0}》自己的朗读设置，改回跟随上面的默认；默认以后再变，这本书也跟着变。",
+        "Deletes {0}'s own read-aloud setting and lets it follow the default again, \
+         including whatever the default becomes later."),
+    ("voice.workspace", "Voice 工作台", "Voice workspace"),
+    ("voice.workspace_row", "模型下载与配置在同一个 TUI 中分开进行",
+        "Download models and configure them separately in one TUI"),
+    ("voice.workspace_more",
+        "左边只管理本地模型，右边只保存全局或单书配置；下载绝不会自动启用模型。",
+        "The left manages local models; the right saves global or per-book configuration. A download never applies itself."),
 
     // ── installing an engine ──
     //
@@ -451,18 +487,21 @@ The short forms -c / -l / -m work too."),
     // has to install one. The whole point of these lines is that they name the
     // next keypress: an install that fails and leaves the reader reading a
     // stack trace has failed twice.
-    ("install.starting", "正在装 {0}，用的是 {1}。命令都写在下面，装完自动切过去。",
-        "Installing {0} with {1}. Every command is shown below, and readio switches to it when it lands."),
-    ("install.done", "{0} 装好了，用了 {1} 秒。朗读已开启：{2}",
-        "{0} is installed ({1}s). Read-aloud is on: {2}"),
+    ("install.starting", "正在下载 {0}，使用 {1}。完成后仍需在 Voice 配置中保存。",
+        "Downloading {0} with {1}. Save it in Voice configuration after it finishes."),
+    ("install.done", "{0} 下载完成，用了 {1} 秒。Voice 配置没有改变。",
+        "{0} downloaded after {1}s. Voice configuration was not changed."),
     // Ten columns of header, no more: the tool line has already spent its width
     // on the command. What went wrong is explained underneath.
     ("install.step_failed", "失败", "failed"),
     ("install.failed", "{0} 没装成。上面红色那条就是断掉的命令——照着它在终端里跑一遍，能看到完整报错。装法看 {1}",
         "{0} did not install. The command in red above is where it stopped; running it in a terminal shows the full error. Instructions: {1}"),
     ("install.busy", "{0} 还在装，等它装完。", "{0} is still installing; let it finish."),
-    ("install.already", "{0} 已经装好了，直接切过去。", "{0} is already installed, so switching to it."),
-    ("install.not_yet", "{0} 还没装。/tts 里 ⏎ 一下就装上", "{0} is not installed yet. /tts and ⏎ puts it there"),
+    ("install.no_space", "空间不足：当前可用 {0}，安全下载至少需要 {1}。",
+        "Not enough disk space: {0} available, at least {1} required for a safe download."),
+    ("install.already", "{0} 已经可用；Voice 配置没有改变。",
+        "{0} is already available; Voice configuration was not changed."),
+    ("install.not_yet", "{0} 还没装。/voice 里 ⏎ 一下就装上", "{0} is not installed yet. /voice and ⏎ puts it there"),
     ("install.no_recipe", "{0} 不是 readio 能装的东西——它是个你自己起的服务。怎么起看 {1}",
         "{0} is not something readio can install: it is a server you run yourself. See {1}"),
     ("install.no_recipe_bare", "{0} 不是 readio 能装的东西——那条命令是你自己写的，得你自己备齐",
@@ -512,8 +551,8 @@ The short forms -c / -l / -m work too."),
     ("dev.hint", "/device allow <序号或名字> 加进白名单 · /device deny <序号或名字> 移出 · /device any 清空限制 · /device refresh 重新检测",
         "/device allow <n|name> adds one · /device deny <n|name> removes it · /device any clears the list · /device refresh re-checks"),
     ("dev.probe_failed", "读不到音频设备列表：{0}", "Cannot list audio outputs: {0}"),
-    ("dev.probe_hint", "在 config.yaml 里 tts.output.query 写一条能打印设备名的命令即可。",
-        "Set tts.output.query in config.yaml to a command that prints the device name."),
+    ("dev.probe_hint", "在 config.yaml 里 voice.output.query 写一条能打印设备名的命令即可。",
+        "Set voice.output.query in config.yaml to a command that prints the device name."),
     ("dev.probe_muted", "白名单开着，认不出的设备一律不出声。/device any 解除限制。",
         "The whitelist is on and an output that cannot be identified counts as not allowed, so speech stays muted. /device any lifts the restriction."),
     ("dev.allowed_added", "已加入白名单：{0}", "Added to the whitelist: {0}"),

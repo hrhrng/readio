@@ -22,7 +22,7 @@
 //!
 //! Why two threads: synthesis is fast (13× realtime for kokoro on an M4) but
 //! not instant, and doing it between clips puts a hole of exactly that length
-//! into every sentence boundary. The renderer runs up to `tts.prefetch` clips
+//! into every sentence boundary. The renderer runs up to `voice.prefetch` clips
 //! ahead of the player, which is the same trick the web player uses with its
 //! prefetch window.
 
@@ -70,6 +70,23 @@ pub trait Synthesizer: Send + Sync {
 
     /// Play a clip, blocking until it finishes or `cancel` is set.
     fn play(&self, clip: &Clip, cancel: &AtomicBool) -> Result<()>;
+
+    /// Read at a different speed from now on.
+    ///
+    /// Speed is applied at synthesis rather than at playback — resampling would
+    /// change the voice along with the tempo — so it has to reach the engine
+    /// rather than the player. It is a live setting and not a constructor
+    /// argument because the alternative is rebuilding the engine to change it,
+    /// and for one that keeps a model in memory that means the reader waits out
+    /// a model load for having pressed `^r`.
+    ///
+    /// Only what has not been rendered yet is affected; the caller flushes.
+    fn set_rate(&self, _rate: f32) {}
+
+    /// The speed in force, as the renderer would use it right now.
+    fn rate(&self) -> f32 {
+        1.0
+    }
 
     /// Short human-readable name, shown in the status line.
     fn describe(&self) -> String;
@@ -170,7 +187,7 @@ struct Pipeline {
     ready: Condvar,
     /// A clip left the queue, or the era changed.
     room: Condvar,
-    /// How many clips may wait ahead of the one playing: `tts.prefetch`.
+    /// How many clips may wait ahead of the one playing: `voice.prefetch`.
     capacity: usize,
     era: AtomicU64,
     closed: AtomicBool,
@@ -372,7 +389,7 @@ impl Speaker {
     /// the clip is rendered into a slot of its own and handed over the instant
     /// the same sentence is spoken for real. It costs one render either way, so
     /// a wrong guess costs nothing but the work — and it does not eat into
-    /// `tts.prefetch`, which is about the sentences of a passage already begun.
+    /// `voice.prefetch`, which is about the sentences of a passage already begun.
     pub fn prerender(&self, text: &str) {
         if text.trim().is_empty() {
             return;
@@ -726,7 +743,7 @@ mod tests {
         done
     }
 
-    /// The point of `tts.prefetch`: sentence two is rendered while sentence one
+    /// The point of `voice.prefetch`: sentence two is rendered while sentence one
     /// is still playing. Before the pipeline existed, every sentence boundary
     /// held a gap exactly as long as synthesis took.
     #[test]

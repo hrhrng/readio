@@ -198,7 +198,7 @@ pub fn list(query: &str) -> Result<Vec<Device>> {
 
 /// Run the reader's own query command and take its first non-empty line.
 fn probe_command(query: &str) -> Result<Device> {
-    let args = crate::tts::command::split_args(query);
+    let args = crate::voice::command::split_args(query);
     let (program, rest) = args
         .split_first()
         .ok_or_else(|| anyhow!("output.query is empty"))?;
@@ -271,7 +271,7 @@ fn devices() -> Result<Vec<Device>> {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn devices() -> Result<Vec<Device>> {
     Err(anyhow!(
-        "no built-in way to read audio devices here; set tts.output.query"
+        "no built-in way to read audio devices here; set voice.output.query"
     ))
 }
 

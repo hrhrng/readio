@@ -307,7 +307,7 @@ impl Block {
         })
     }
 
-    /// A passage that is already complete, used by `/tts test`.
+    /// A passage that is already complete, used by `/voice test`.
     pub fn passage_text(text: &str) -> Self {
         Block::Passage {
             text: text.to_string(),

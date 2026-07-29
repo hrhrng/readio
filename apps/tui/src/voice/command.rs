@@ -8,12 +8,12 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 
-use super::config::{self, EngineSpec, LanguageSpec};
+use super::config::{EngineSpec, LanguageSpec};
 use super::resident;
 use super::{Clip, Synthesizer, wav};
 use crate::i18n::{t, tf};
@@ -24,33 +24,39 @@ pub struct CommandSynth {
     spec: EngineSpec,
     voice: String,
     language: String,
-    rate: f32,
+    /// The reading speed, as f32 bits, because it changes under the render
+    /// thread's feet: `^r` retunes a running engine rather than replacing it.
+    rate: AtomicU32,
     /// Set when the engine can stay running, which is how it stops being
     /// slower than the speech it produces.
     resident: Option<resident::Resident>,
 }
 
 impl CommandSynth {
-    /// `voice` is the reader's explicit choice; empty means "whatever suits the
-    /// passage", which the engine's `languages` table answers.
+    /// `voice` is the reader's explicit choice; empty means the model preset's
+    /// declared default. Sentence content never changes the selection.
     pub fn new(name: &str, spec: EngineSpec, voice: String, rate: f32) -> Self {
-        let resident = resident_for(&spec);
+        let resident = resident_for(name, &spec);
         Self {
             name: name.to_string(),
             spec,
             voice,
             language: String::new(),
-            rate,
+            rate: AtomicU32::new(rate.to_bits()),
             resident,
         }
     }
 
-    /// Pin the language, or leave it to the sentence.
+    /// The speed sentences are being rendered at.
+    fn speed(&self) -> f32 {
+        f32::from_bits(self.rate.load(Ordering::Relaxed))
+    }
+
+    /// Pin the language, or keep the model preset's declared default.
     ///
-    /// `auto` and the empty string both mean per-sentence detection; anything
-    /// else names an entry in the engine's `languages` table. A name with no
-    /// entry behind it falls back to detection rather than to silence: a typo
-    /// in a config file should not stop a book being read.
+    /// `auto` survives as an older config spelling, but no longer turns on
+    /// per-sentence routing. Anything else names an entry in the engine's
+    /// `languages` table.
     pub fn in_language(mut self, language: &str) -> Self {
         self.language = language.trim().to_string();
         self
@@ -92,7 +98,8 @@ impl Synthesizer for CommandSynth {
                     out,
                     voice: &voice,
                     lang: language_code(language),
-                    speed: self.rate,
+                    speed: self.speed(),
+                    params: &self.spec.extra,
                 })
                 .with_context(|| tf("synth.failed", &[&self.name]))?;
         } else {
@@ -160,24 +167,24 @@ impl Synthesizer for CommandSynth {
 }
 
 impl CommandSynth {
-    /// The language entry to read this sentence with.
+    /// The language entry to use for this configuration.
     ///
     /// In order: the one the reader pinned in `config.yaml`; the one the voice
     /// they pinned belongs to, since `zf_xiaoyi` under `en-us` is the exact
-    /// mismatch this table exists to prevent; otherwise the sentence's own.
-    ///
-    /// Detection is per sentence rather than per session because a shelf holds
-    /// books in more than one language, and so does the odd book — a quoted
-    /// English line inside a Chinese page is read as English without anyone
-    /// reaching for a setting.
-    fn language_for(&self, text: &str) -> Option<&LanguageSpec> {
+    /// mismatch this table exists to prevent; otherwise the entry belonging to
+    /// the model's declared default voice. The sentence itself never changes
+    /// this decision.
+    fn language_for(&self, _text: &str) -> Option<&LanguageSpec> {
         let named = match self.language.as_str() {
             "" | "auto" => None,
             name => self.spec.languages.get(name),
         };
-        named
-            .or_else(|| self.voice_family())
-            .or_else(|| self.spec.languages.get(config::language_of(text)))
+        named.or_else(|| self.voice_family()).or_else(|| {
+            self.spec
+                .languages
+                .values()
+                .find(|language| !self.spec.voice.is_empty() && language.voice == self.spec.voice)
+        })
     }
 
     /// The language entry a pinned voice belongs to, if readio ships one.
@@ -197,9 +204,8 @@ impl CommandSynth {
         })
     }
 
-    /// The voice this passage gets: the reader's explicit choice first, because
-    /// naming a voice is a decision and readio does not overrule those; then
-    /// the one that matches the language; then the engine's own default.
+    /// The configured voice: the reader's explicit choice first, then the voice
+    /// declared by the configured language, then the model preset's default.
     fn voice_for(&self, language: Option<&LanguageSpec>) -> String {
         if !self.voice.trim().is_empty() {
             return self.voice.clone();
@@ -224,7 +230,7 @@ impl CommandSynth {
             _ => &self.spec.model,
         };
         let lang = language.map(|s| s.lang.as_str()).unwrap_or_default();
-        let json = request_body(model, &voice, text, self.rate);
+        let json = request_body(model, &voice, text, self.speed());
         split_args(template)
             .into_iter()
             .flat_map(|arg| {
@@ -255,9 +261,9 @@ impl CommandSynth {
                             .unwrap_or_default(),
                     )
                     .replace("{voice}", &voice)
-                    .replace("{rate}", &format_rate(self.rate))
-                    .replace("{scale}", &format_rate(inverse(self.rate)))
-                    .replace("{words}", &words_per_minute(self.rate))
+                    .replace("{rate}", &format_rate(self.speed()))
+                    .replace("{scale}", &format_rate(inverse(self.speed())))
+                    .replace("{words}", &words_per_minute(self.speed()))
                     .replace("{model}", &expand_tilde(model))
                     .replace("{extra}", &self.spec.extra);
                 // Whole-argument substitutions last: their content is data.
@@ -309,19 +315,27 @@ fn words_per_minute(rate: f32) -> String {
 /// behind the engine cannot be found — an engine that is not installed has
 /// nothing to keep resident, and saying so through the ordinary
 /// "engine missing" path is clearer than a worker that fails to import.
-fn resident_for(spec: &EngineSpec) -> Option<resident::Resident> {
+fn resident_for(name: &str, spec: &EngineSpec) -> Option<resident::Resident> {
     if spec.serve.trim().is_empty() {
         return None;
     }
     let program = split_args(&spec.synth).into_iter().next()?;
     let python = resident::interpreter_behind(&program)?;
-    let worker = resident::worker_script(&crate::paths::engines_dir()).ok()?;
+    // The script readio ships for this engine. A `serve:` line that names no
+    // `{worker}` — someone driving their own daemon — needs none, so a missing
+    // one is only fatal if the template actually asks for it.
+    let worker = resident::worker_script(&crate::paths::engines_dir(), name).ok()?;
+    if worker.is_none() && spec.serve.contains("{worker}") {
+        return None;
+    }
+    let worker = worker.unwrap_or_default();
 
     let argv: Vec<String> = split_args(&spec.serve)
         .into_iter()
         .map(|arg| {
             arg.replace("{python}", &python.to_string_lossy())
                 .replace("{worker}", &worker.to_string_lossy())
+                .replace("{model}", &expand_tilde(&spec.model))
         })
         .map(|arg| expand_tilde(&arg))
         .collect();
@@ -706,7 +720,7 @@ mod tests {
     /// to `./`, which is exactly this trap.
     #[test]
     fn no_preset_depends_on_the_directory_readio_was_started_from() {
-        for (name, spec) in crate::tts::config::presets() {
+        for (name, spec) in crate::voice::config::presets() {
             for fetch in &spec.fetch {
                 let file = fetch.to.rsplit('/').next().unwrap_or_default();
                 // A sidecar is found by the engine itself: piper reads
@@ -723,13 +737,11 @@ mod tests {
         }
     }
 
-    /// Kokoro's `--lang` defaults to `en-us`, and pointed at Chinese it sounds
-    /// out 字 with English letter-to-sound rules: the same sentence took 13.6 s
-    /// that way against 4.1 s said properly. The voice has to move with it —
-    /// `zf_*` is Mandarin, `af_*` American English — so both are checked here.
+    /// An unset language means the model's declared default, not a detector that
+    /// changes configuration sentence by sentence.
     #[test]
-    fn each_language_is_read_with_its_own_voice_and_phonemes() {
-        let preset = crate::tts::config::presets()["kokoro"].clone();
+    fn an_unpinned_model_keeps_its_declared_voice_and_language() {
+        let preset = crate::voice::config::presets()["kokoro"].clone();
         let template = preset.synth.clone();
         let synth = CommandSynth::new("kokoro", preset, String::new(), 1.0);
 
@@ -749,13 +761,10 @@ mod tests {
             Path::new("/tmp/a.wav"),
             None,
         );
+        assert_eq!(window(&english, "--lang"), Some("cmn"), "{english:?}");
         assert!(
-            window(&english, "--lang") == Some("en-us"),
-            "and English as English: {english:?}"
-        );
-        assert!(
-            window(&english, "--voice").is_some_and(|v| v.starts_with("af_")),
-            "with an English voice: {english:?}"
+            window(&english, "--voice").is_some_and(|v| v.starts_with("zf_")),
+            "the text does not silently change the configured voice: {english:?}"
         );
     }
 
@@ -764,7 +773,7 @@ mod tests {
     /// Chinese voice is never handed English phonemes.
     #[test]
     fn a_voice_the_reader_named_outranks_the_language_it_belongs_to() {
-        let preset = crate::tts::config::presets()["kokoro"].clone();
+        let preset = crate::voice::config::presets()["kokoro"].clone();
         let template = preset.synth.clone();
         let synth = CommandSynth::new("kokoro", preset, "zf_xiaoyi".to_string(), 1.0);
         let args = synth.build(
@@ -789,7 +798,7 @@ mod tests {
     /// readio has no entry for — Japanese, say — writes it there and wins.
     #[test]
     fn a_language_written_by_hand_has_the_last_word() {
-        let mut preset = crate::tts::config::presets()["kokoro"].clone();
+        let mut preset = crate::voice::config::presets()["kokoro"].clone();
         preset.extra = "--lang ja".to_string();
         let template = preset.synth.clone();
         let synth = CommandSynth::new("kokoro", preset, String::new(), 1.0);
@@ -828,11 +837,10 @@ mod tests {
         );
     }
 
-    /// Detection is the default, not the only option: a reader whose shelf is
-    /// entirely in one language can say so and stop readio guessing.
+    /// A configured language reads every page the same way.
     #[test]
     fn a_pinned_language_reads_every_page_the_same_way() {
-        let preset = crate::tts::config::presets()["kokoro"].clone();
+        let preset = crate::voice::config::presets()["kokoro"].clone();
         let template = preset.synth.clone();
         let synth = CommandSynth::new("kokoro", preset, String::new(), 1.0).in_language("en");
         let args = synth.build(&template, "界面不是中立的。", Path::new("/tmp/a.wav"), None);
@@ -840,14 +848,66 @@ mod tests {
         assert_eq!(window(&args, "--voice"), Some("af_heart"), "{args:?}");
     }
 
-    /// A typo in a config file should cost a reader a guess, not a book.
+    /// A typo falls back to the model default rather than turning detection on.
     #[test]
-    fn a_language_nobody_has_an_entry_for_falls_back_to_the_sentence() {
-        let preset = crate::tts::config::presets()["kokoro"].clone();
+    fn a_language_nobody_has_an_entry_for_falls_back_to_the_model_default() {
+        let preset = crate::voice::config::presets()["kokoro"].clone();
         let template = preset.synth.clone();
         let synth = CommandSynth::new("kokoro", preset, String::new(), 1.0).in_language("zn");
         let args = synth.build(&template, "界面不是中立的。", Path::new("/tmp/a.wav"), None);
         assert_eq!(window(&args, "--lang"), Some("cmn"), "{args:?}");
+    }
+
+    /// A resident engine is started once, so its model is a startup argument
+    /// rather than part of each sentence. Leaving `{model}` literal here makes
+    /// config.yaml lie: the fallback uses the edit, while read-aloud does not.
+    #[test]
+    fn a_resident_engine_starts_with_the_model_from_its_config() {
+        let dir = std::env::temp_dir().join(format!(
+            "readio-resident-model-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let python = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|dir| dir.join("python3"))
+            .find(|path| path.is_file())
+            .expect("python3 is needed to exercise the worker protocol");
+        let launcher = dir.join("model-tts");
+        std::fs::write(&launcher, format!("#!{}\n", python.to_string_lossy())).expect("launcher");
+        let worker = dir.join("worker.py");
+        std::fs::write(
+            &worker,
+            r#"import argparse
+import json
+import sys
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--model", required=True)
+args = ap.parse_args()
+if args.model != "local/qwen-for-my-mac":
+    print(json.dumps({"ready": False, "error": f"wrong model: {args.model}"}), flush=True)
+    raise SystemExit(1)
+print(json.dumps({"ready": True}), flush=True)
+for line in sys.stdin:
+    print(json.dumps({"ok": True}), flush=True)
+"#,
+        )
+        .expect("worker");
+
+        let spec = EngineSpec {
+            synth: format!("{} {{text}} {{out}}", launcher.to_string_lossy()),
+            serve: format!("{{python}} {} --model {{model}}", worker.to_string_lossy()),
+            model: "local/qwen-for-my-mac".to_string(),
+            ..EngineSpec::default()
+        };
+
+        let resident = resident_for("custom", &spec).expect("resident command");
+        resident
+            .warm()
+            .expect("the configured model should reach the worker");
     }
 
     /// The value after a flag, for tests that care what an engine was told.
@@ -863,7 +923,7 @@ mod tests {
     /// runs the Windows tests.
     #[test]
     fn the_windows_player_template_survives_a_path_with_spaces() {
-        let template = crate::tts::config::presets()["kokoro"].play.clone();
+        let template = crate::voice::config::presets()["kokoro"].play.clone();
         let windows =
             "powershell -NoProfile -Command \"(New-Object Media.SoundPlayer '{file}').PlaySync()\"";
         let args = split_args(windows);

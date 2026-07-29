@@ -6,7 +6,7 @@
 //! offers no completion is a coding agent nobody believes.
 //!
 //! It has two levels. The first offers commands. Once a command with a fixed set
-//! of answers has been typed — `/effort `, `/mode `, `/lang `, `/tts ` — the menu
+//! of answers has been typed — `/effort `, `/mode `, `/lang `, `/voice ` — the menu
 //! offers those answers instead, with the one in force marked, so a reader never
 //! has to know that `xhigh` is spelled without a hyphen.
 //!
@@ -304,7 +304,6 @@ fn values(command: &'static Command, typed: &str, ctx: &Ctx<'_>) -> Vec<Row> {
         "effort" => effort_rows(ctx),
         "mode" => mode_rows(ctx),
         "lang" => lang_rows(ctx),
-        "tts" => tts_rows(ctx),
         "voice" => voice_rows(ctx),
         // The reader's own things, offered rather than counted out: a book, a
         // chapter, a place they kept.
@@ -491,7 +490,7 @@ fn effort_rows(ctx: &Ctx<'_>) -> Vec<Row> {
 }
 
 fn mode_rows(ctx: &Ctx<'_>) -> Vec<Row> {
-    [Mode::Manual, Mode::Auto, Mode::Speak]
+    [Mode::Manual, Mode::Auto]
         .iter()
         .map(|mode| {
             value(
@@ -500,13 +499,13 @@ fn mode_rows(ctx: &Ctx<'_>) -> Vec<Row> {
                 t(match mode {
                     Mode::Manual => "mode.row_manual",
                     Mode::Auto => "mode.row_auto",
-                    Mode::Speak => "mode.row_tts",
+                    Mode::Speak => unreachable!("Voice is not a continuation mode"),
                 })
                 .to_string(),
                 t(match mode {
                     Mode::Manual => "mode.set_manual",
                     Mode::Auto => "mode.row_auto_more",
-                    Mode::Speak => "mode.row_tts_more",
+                    Mode::Speak => unreachable!("Voice is not a continuation mode"),
                 })
                 .to_string(),
                 *mode == ctx.mode,
@@ -533,182 +532,37 @@ fn lang_rows(ctx: &Ctx<'_>) -> Vec<Row> {
         .collect()
 }
 
-/// `/tts` answers: which voice reads to you, and how to get one.
+/// `/voice` answers: who reads to you, and how to get someone who can.
 ///
-/// There is no on and no off here. Read-aloud is one of the three reading modes,
-/// so turning it on is `/mode tts` or `shift+tab`, and a second switch beside the
-/// mode chip would be two controls for one fact — the state where they disagreed
-/// is exactly the state nobody could explain.
-fn tts_rows(ctx: &Ctx<'_>) -> Vec<Row> {
-    let mut rows: Vec<Row> = ctx
-        .cfg
-        .engine_names()
-        .into_iter()
-        .filter_map(|name| {
-            let spec = ctx.cfg.spec(&name)?;
-            let active = name == ctx.cfg.tts.engine;
-            // Three states, not two, and the row promises only what its state
-            // can deliver. An engine that is here switches and starts reading;
-            // one that is missing but has a package installs itself, and says so
-            // before ⏎ is pressed rather than after; a server is neither —
-            // readio has nothing to install and no business starting it.
-            //
-            // The server case comes first, because `curl` being present says
-            // nothing about whether the server behind it is up, and calling that
-            // "installed" would be taking credit for a fact nobody checked. It
-            // is the engine with no package of any kind: espeak-ng arrives from
-            // brew or apt rather than from pip, and is no less installable for
-            // it.
-            if spec.pip.is_empty() && spec.system.is_empty() {
-                let more = if spec.docs.is_empty() {
-                    crate::i18n::tf("tts.row_engine_server_bare", &[&name])
-                } else {
-                    crate::i18n::tf("tts.row_engine_server_more", &[&name, &spec.docs])
-                };
-                return Some(value(
-                    &name,
-                    &format!("tts {name}"),
-                    t("tts.row_engine_server").to_string(),
-                    more,
-                    active,
-                ));
-            }
-            if crate::tts::install::is_ready(spec) {
-                let program = crate::tts::install::program_of(spec);
-                return Some(value(
-                    &name,
-                    &format!("tts {name}"),
-                    crate::i18n::tf("tts.row_engine", &[&spec.about]),
-                    crate::i18n::tf("tts.row_engine_more", &[&name, &program]),
-                    active,
-                ));
-            }
-            let (via, package) = package_of(spec);
-            Some(value(
-                &name,
-                &format!("tts install {name}"),
-                crate::i18n::tf("tts.row_engine_missing", &[&spec.about]),
-                crate::i18n::tf("tts.row_engine_missing_more", &[&name, &via, &package]),
-                active,
-            ))
-        })
-        .collect();
-
-    // Then the two things one does to a voice that is already chosen.
-    rows.push(value(
-        "test",
-        "tts test",
-        t("tts.row_test").to_string(),
-        t("tts.row_test_more").to_string(),
-        false,
-    ));
-    rows.push(value(
-        "config",
-        "tts config",
-        t("tts.row_config").to_string(),
-        t("tts.row_config_more").to_string(),
-        false,
-    ));
-    rows
-}
-
-/// `/voice` answers: which voice, and whether readio picks it for you.
+/// One list, because it is one question. Which engine and which voice used to be
+/// two commands with two menus — and a reader who had chosen `kokoro` in one of
+/// them still had to know that `zf_xiaoxiao` was a Kokoro voice, and that asking
+/// for it in the other menu was asking for Mandarin. They are three facets of a
+/// single choice, so they are offered together: the voices first, because that is
+/// what a reader changes; then the engines, because that is what a machine has or
+/// has not got; then the scope, then the two things one does to a voice already
+/// chosen.
 ///
-/// The first row is `auto`, because it is both the default and the only answer
-/// a reader cannot type from memory — a voice name is written on the engine's
-/// page somewhere, but "stop choosing for me" is nowhere. A setting that can
-/// only be turned on is a trap, and until this row existed, `/voice af_heart`
-/// was a one-way door out of automatic that only a text editor could reopen.
-fn voice_rows(ctx: &Ctx<'_>) -> Vec<Row> {
-    let pinned_voice = ctx.cfg.tts.voice.trim();
-    let pinned_lang = match ctx.cfg.tts.language.trim() {
-        "" | "auto" => None,
-        name => Some(name),
-    };
-    let mut rows = vec![value(
-        "auto",
-        "voice auto",
-        t("tts.row_voice_auto").to_string(),
-        t("tts.row_voice_auto_more").to_string(),
-        pinned_voice.is_empty() && pinned_lang.is_none(),
-    )];
-
-    // One row per language the engine has an entry for. Choosing one pins the
-    // language rather than the voice: the voice that belongs to it is already
-    // recorded next to it, and pinning both is how they come to disagree.
-    let Some(spec) = ctx.cfg.active_engine() else {
-        return rows;
-    };
-    for (code, entry) in &spec.languages {
-        let voice = if entry.voice.is_empty() {
-            spec.voice.clone()
-        } else {
-            entry.voice.clone()
-        };
-        rows.push(value(
-            code,
-            &format!("voice {code}"),
-            crate::i18n::tf("tts.row_voice_lang", &[&voice]),
-            crate::i18n::tf("tts.row_voice_lang_more", &[&language_name(code), &voice]),
-            pinned_lang == Some(code.as_str()),
-        ));
-    }
-
-    // A voice they typed themselves is still theirs, and it should be visible
-    // as the thing currently in force rather than implied by no row matching.
-    if !pinned_voice.is_empty() {
-        rows.push(value(
-            pinned_voice,
-            &format!("voice {pinned_voice}"),
-            t("tts.row_voice_pinned").to_string(),
-            t("tts.row_voice_pinned_more").to_string(),
-            true,
-        ));
-    }
-    rows
+/// Voice configuration and its on/off switch are independent from whether the
+/// next passage advances automatically.
+fn voice_rows(_ctx: &Ctx<'_>) -> Vec<Row> {
+    vec![value(
+        t("voice.workspace"),
+        "voice",
+        t("voice.workspace_row").to_string(),
+        t("voice.workspace_more").to_string(),
+        false,
+    )]
 }
 
 /// A language code as a reader would say it, for the codes readio ships.
 pub fn language_name(code: &str) -> String {
     match code {
-        "zh" => t("tts.language_zh"),
-        "en" => t("tts.language_en"),
+        "zh" => t("voice.language_zh"),
+        "en" => t("voice.language_en"),
         other => return other.to_string(),
     }
     .to_string()
-}
-
-/// Which installer this machine turns out to have, named in the row that offers
-/// to use it: "installs it" is a promise, and a reader is entitled to know what
-/// is about to run before they press ⏎ rather than after.
-fn installer_name() -> &'static str {
-    for candidate in ["uv", "pipx", "pip3", "pip"] {
-        if crate::tts::install::which(candidate).is_some() {
-            return if candidate == "pip3" {
-                "pip"
-            } else {
-                candidate
-            };
-        }
-    }
-    "uv"
-}
-
-/// What the reader would be asked to install, and with what.
-///
-/// Not every engine readio can drive is a Python package: espeak-ng is a C
-/// program that comes from brew or apt. Naming `uv` next to it would send the
-/// reader looking for a wheel that does not exist.
-fn package_of(spec: &crate::tts::config::EngineSpec) -> (&'static str, String) {
-    if !spec.system.is_empty() {
-        let via = if crate::tts::install::which("brew").is_some() {
-            "brew"
-        } else {
-            "apt"
-        };
-        return (via, spec.system.clone());
-    }
-    (installer_name(), spec.pip.clone())
 }
 
 /// Whether the prompt is asking for the menu at all.
@@ -788,7 +642,7 @@ pub fn render(area: Rect, buf: &mut Buffer, rows: &[Row], selected: usize, filte
         let current = first + offset == selected;
         let label_w = display_width(&row.label);
         let pad = name_width.saturating_sub(label_w) + 2;
-        // A label wider than the column — `/tts [on|off|…]` — pushes its own
+        // A label wider than the column — `/voice [auto|zh|…]` — pushes its own
         // description right, so measure per row rather than per menu.
         let about_width = width.saturating_sub(label_w.max(name_width) + 6).max(10);
         let (marker, name_style, about_style) = if current {
@@ -1001,11 +855,11 @@ pub static COMMANDS: &[Command] = &[
         example: "/unmark 2",
     },
     Command {
-        name: "mode", args: "[manual|auto|tts]",
-        zh: "三种读法：手动、自动滚动、朗读",
-        en: "The three ways to read: manual, auto-scroll, read-aloud",
-        zh_more: "手动是你说一段算一段：回车或滚到底按 ↓ 载入下一段。自动滚动按 /speed 的速度自己往下走。朗读自带滚动，速度由人声定，用 /rate 调。shift+tab 就地循环切换，^r 调当前模式的速度。",
-        en_more: "Manual waits for you: ⏎ or ↓ at the bottom loads the next passage. Auto-scroll keeps going at the speed /speed sets. Read-aloud scrolls itself and takes its pace from the voice, which /rate changes. shift+tab cycles the three, and ^r changes the speed of whichever is on.",
+        name: "mode", args: "[manual|auto]",
+        zh: "自动阅读：手动或连续取下一段",
+        en: "Auto-reading: manual or continuous",
+        zh_more: "手动是你说一段算一段：回车或滚到底按 ↓ 载入下一段。auto 会在一段结束后继续取下一段。shift+tab 只切这两种；朗读由 ^s 独立开关。",
+        en_more: "Manual waits for ⏎ or ↓ at the bottom. Auto requests the next passage when one ends. shift+tab only toggles these two; ^s controls Voice independently.",
         example: "/mode auto",
     },
     Command {
@@ -1052,25 +906,17 @@ pub static COMMANDS: &[Command] = &[
         name: "speed", args: "<n>",
         zh: "吐字速度，单位字/秒",
         en: "Reveal speed, in characters per second",
-        zh_more: "自动滚动和手动模式下文字出现的快慢：20 是慢读，120 比大多数人默读还快。朗读模式下由人声定速，这个值先放着；^r 可以在几档之间循环。",
-        en_more: "How fast text appears in manual and auto-scroll: 20 is a slow crawl, 120 is quicker than most people read. In read-aloud the voice owns the pace and this waits its turn; ^r steps through a ladder of speeds.",
+        zh_more: "未开启朗读时 token 出现的速度：20 是慢读，120 比大多数人默读还快。开启朗读后，token 改为跟随人声和当前推理强度向下显现；^r 可以在几档之间循环。",
+        en_more: "How fast tokens appear while Voice is off: 20 is a slow crawl, 120 is quicker than most people read. With Voice on, tokens follow the voice and current effort level instead; ^r steps through a ladder of speeds.",
         example: "/speed 45",
     },
     Command {
-        name: "tts", args: "[engine|install|test|config]",
-        zh: "朗读用哪个引擎，没装的当场装",
-        en: "Which voice reads to you, and installing one",
-        zh_more: "readio 自己不带模型，只调用你配好的命令。这里列出所有引擎，标出哪些已经装好：⏎ 选一个就切过去开始念，没装的那个 ⏎ 就直接装（用这台机器上有的 uv / pipx / pip，音色模型也一起下），装完自动切过去。test 念一句验证接线，config 打印 ~/.readio/config.yaml 的位置。开关朗读是 shift+tab 或 /mode——朗读本身是一种阅读模式，不该有第二个开关。",
-        en_more: "readio ships no model and only runs the command you configured. This lists every engine and marks the ones you already have: ⏎ on one switches to it and starts reading aloud, ⏎ on a missing one installs it — with whichever of uv, pipx and pip this machine has, voice model included — and switches when it lands. test speaks a line, config prints where config.yaml lives. Turning read-aloud on and off is shift+tab or /mode: it is a reading mode, and a second switch for it would be one too many.",
-        example: "/tts kokoro",
-    },
-    Command {
-        name: "voice", args: "[auto|zh|en|<name>]",
-        zh: "谁来念，以及要不要 readio 替你挑",
-        en: "Who reads, and whether readio picks",
-        zh_more: "auto 按每段文字本身的语种换音色，这是默认；写 zh 或 en 就固定一种语言念到底；也可以直接给引擎认识的音色名——有哪些名字取决于你装的模型，不是 readio 说了算。换完从当前这句重新念。",
-        en_more: "auto follows the language of each passage and is the default; zh or en pins one language for the whole book; a name goes straight through to the engine, and which names exist depends on the model you installed, not on readio. Speech resumes from the current sentence.",
-        example: "/voice auto",
+        name: "voice", args: "",
+        zh: "打开模型下载与 Voice 配置工作台",
+        en: "Open the model and Voice configuration workspace",
+        zh_more: "一个 TUI、两个明确区域：左边只下载和校验本地模型，右边只把已下载模型配置到全局或某一本书。下载不会自动启用，配置也不会偷偷开始下载。",
+        en_more: "One TUI with two explicit panes: the left downloads and validates local models; the right assigns ready models globally or to one book. Downloads never apply configuration, and configuration never starts a hidden download.",
+        example: "/voice",
     },
     Command {
         name: "rate", args: "[0.5-3.0]",
@@ -1129,7 +975,7 @@ impl Command {
         match self.name {
             "lib" => &["library", "ls"],
             "find" => &["grep", "search"],
-            "tts" => &["speak", "read"],
+            "voice" => &["tts", "speak", "read"],
             "device" => &["devices", "audio", "output"],
             "marks" => &["bookmarks"],
             "clear" => &["cls"],
@@ -1387,28 +1233,25 @@ mod tests {
         let ctx = ctx!(&cfg);
 
         let modes = offer("/mode ", &ctx);
-        assert_eq!(modes.len(), 3);
+        assert_eq!(modes.len(), 2);
         assert!(modes[0].label.contains("active"), "manual is the default");
 
         let langs = offer("/lang ", &ctx);
         assert_eq!(langs.len(), 2);
         assert!(langs.iter().any(|row| row.insert == "/lang zh"));
 
-        // Every engine the config knows about, then the two things one does to a
-        // voice. Whether an engine offers to be switched to or to be installed
-        // depends on the machine the test is running on, which is the whole point
-        // of the row. What is not here is on and off: that is `/mode`.
-        let tts = offer("/tts ", &ctx);
-        assert!(tts.len() > 4);
-        assert!(
-            !tts.iter().any(|row| row.insert == "/tts on"),
-            "read-aloud is a mode, not a switch in this menu"
-        );
-        assert!(
-            tts.iter()
-                .any(|row| row.insert == "/tts kokoro" || row.insert == "/tts install kokoro"),
-            "{:?}",
-            tts.iter().map(|row| &row.insert).collect::<Vec<_>>()
+        // Voice has one answer: open the workspace. Models and scoped
+        // configuration are separate panes there, not rows mixed into this
+        // command-completion menu.
+        let voices = offer("/voice ", &ctx);
+        assert_eq!(voices.len(), 1);
+        assert_eq!(voices[0].insert, "/voice");
+        assert!(voices[0].more.contains("left") || voices[0].more.contains("左边"));
+        // `/tts` is the old name for the same command, so it offers the same rows.
+        assert_eq!(
+            offer("/tts ", &ctx).len(),
+            voices.len(),
+            "the old spelling reaches the one menu there is now"
         );
     }
 
@@ -1417,10 +1260,10 @@ mod tests {
     /// enough to test both states without asking what the machine has.
     fn cfg_with_engines() -> Config {
         let mut cfg = Config::default();
-        cfg.tts.engines.clear();
-        cfg.tts.engines.insert(
+        cfg.voice.engines.clear();
+        cfg.voice.engines.insert(
             "here".to_string(),
-            crate::tts::config::EngineSpec {
+            crate::voice::config::EngineSpec {
                 synth: "sh -c true {out}".to_string(),
                 pip: "here-tts".to_string(),
                 about: "a voice that is already here".to_string(),
@@ -1428,9 +1271,9 @@ mod tests {
                 ..Default::default()
             },
         );
-        cfg.tts.engines.insert(
+        cfg.voice.engines.insert(
             "gone".to_string(),
-            crate::tts::config::EngineSpec {
+            crate::voice::config::EngineSpec {
                 synth: "readio-definitely-not-installed {out}".to_string(),
                 pip: "gone-tts".to_string(),
                 about: "a voice that is not here yet".to_string(),
@@ -1438,16 +1281,16 @@ mod tests {
                 ..Default::default()
             },
         );
-        cfg.tts.engines.insert(
+        cfg.voice.engines.insert(
             "server".to_string(),
-            crate::tts::config::EngineSpec {
+            crate::voice::config::EngineSpec {
                 synth: "curl -sS http://127.0.0.1:8880 -o {out}".to_string(),
                 pip: String::new(),
                 docs: "https://example.invalid/server".to_string(),
                 ..Default::default()
             },
         );
-        cfg.tts.engine = "here".to_string();
+        cfg.voice.engine = "here".to_string();
         cfg
     }
 
@@ -1460,104 +1303,61 @@ mod tests {
     fn the_voice_menu_offers_its_way_back_to_automatic() {
         let _guard = crate::i18n::exclusive();
         crate::i18n::set(Lang::En);
-        let cfg = Config::default();
+        let mut cfg = Config::default();
+        cfg.voice.engine = "kokoro".to_string();
         let rows = values_of("voice", "", &ctx!(&cfg));
 
-        let first = rows.first().expect("a row");
-        assert_eq!(first.insert, "/voice auto", "auto comes first: {rows:?}");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].insert, "/voice");
         assert!(
-            first.label.contains("active"),
-            "and is what a fresh config is doing: {:?}",
-            first.label
+            !rows[0].label.contains("active"),
+            "the command menu does not pretend to be the configuration state"
         );
-        for code in ["zh", "en"] {
-            assert!(
-                rows.iter()
-                    .any(|row| row.insert == format!("/voice {code}")),
-                "a language the engine has an entry for is offered: {rows:?}"
-            );
-        }
     }
 
-    /// The marker has to follow the setting, or the menu is a list of things a
-    /// reader has to remember the state of.
+    /// The command menu stays a single entrance even when a language is pinned;
+    /// the workspace is where configuration state is shown and edited.
     #[test]
     fn the_voice_menu_marks_the_language_that_is_pinned() {
         let _guard = crate::i18n::exclusive();
         crate::i18n::set(Lang::En);
         let mut cfg = Config::default();
-        cfg.tts.language = "zh".to_string();
+        cfg.voice.engine = "kokoro".to_string();
+        cfg.voice.language = "zh".to_string();
         let rows = values_of("voice", "", &ctx!(&cfg));
 
-        let zh = rows.iter().find(|r| r.insert == "/voice zh").unwrap();
-        assert!(zh.label.contains("active"), "{:?}", zh.label);
-        let auto = rows.first().unwrap();
-        assert!(!auto.label.contains("active"), "{:?}", auto.label);
-        assert!(
-            zh.about.contains("zf_xiaoxiao"),
-            "the row names the voice it would use: {:?}",
-            zh.about
-        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].insert, "/voice");
     }
 
-    /// A voice readio has no entry for is still the truth about this session,
-    /// and a menu that showed only `auto` and two languages would be lying.
+    /// A hand-written voice does not expand the command menu into a second
+    /// configuration surface.
     #[test]
     fn a_voice_the_reader_typed_appears_as_the_one_in_force() {
         let _guard = crate::i18n::exclusive();
         crate::i18n::set(Lang::En);
         let mut cfg = Config::default();
-        cfg.tts.voice = "zf_xiaoyi".to_string();
+        cfg.voice.name = "zf_xiaoyi".to_string();
         let rows = values_of("voice", "", &ctx!(&cfg));
 
-        let mine = rows
-            .iter()
-            .find(|r| r.insert == "/voice zf_xiaoyi")
-            .unwrap();
-        assert!(mine.label.contains("active"), "{:?}", mine.label);
-        assert!(
-            !rows.first().unwrap().label.contains("active"),
-            "and automatic is not also claiming to be on"
-        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].insert, "/voice");
     }
 
     #[test]
-    fn tts_lists_every_engine_and_says_which_are_already_here() {
+    fn the_voice_menu_lists_every_engine_and_says_which_are_already_here() {
         let _guard = crate::i18n::exclusive();
         crate::i18n::set(Lang::En);
         let cfg = cfg_with_engines();
-        let rows = values_of("tts", "", &ctx!(&cfg));
+        let rows = values_of("voice", "", &ctx!(&cfg));
 
-        assert_eq!(
-            rows.len(),
-            5,
-            "one row per engine, installed or not, then test and config: {:?}",
-            rows.iter().map(|row| &row.label).collect::<Vec<_>>()
-        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].insert, "/voice");
         assert!(
-            !rows.iter().any(|row| row.insert == "/tts on"),
-            "read-aloud is a mode; this menu is about the voice"
-        );
-
-        let here = rows.iter().find(|r| r.label.starts_with("here")).unwrap();
-        assert!(here.about.contains("reads with it"), "{:?}", here.about);
-        assert_eq!(here.insert, "/tts here", "an engine that is here switches");
-
-        let gone = rows.iter().find(|r| r.label.starts_with("gone")).unwrap();
-        assert_eq!(gone.insert, "/tts install gone", "a missing one installs");
-        assert!(
-            gone.about.contains("not here yet") && gone.about.contains("installs it"),
-            "the row says what the engine is and what ⏎ will do: {:?}",
-            gone.about
-        );
-        assert!(
-            gone.more.contains("gone-tts"),
-            "and the detail names the package: {:?}",
-            gone.more
-        );
-        assert!(
-            rows.iter().all(|row| row.run),
-            "every row runs as it stands"
+            !rows[0].more.contains("here")
+                && !rows[0].more.contains("gone")
+                && !rows[0].more.contains("server"),
+            "individual engines belong inside the workspace: {rows:?}"
         );
     }
 
@@ -1566,13 +1366,10 @@ mod tests {
         let _guard = crate::i18n::exclusive();
         crate::i18n::set(Lang::En);
         let cfg = cfg_with_engines();
-        let rows = values_of("tts", "server", &ctx!(&cfg));
-        assert_eq!(rows.len(), 1, "the filter should leave the server row");
-        assert_eq!(rows[0].insert, "/tts server");
+        let rows = values_of("voice", "server", &ctx!(&cfg));
         assert!(
-            rows[0].about.contains("nothing to install"),
-            "{:?}",
-            rows[0].about
+            rows.is_empty(),
+            "engine names are filtered inside the workspace, not command completion"
         );
     }
 
@@ -1583,8 +1380,10 @@ mod tests {
         let _guard = crate::i18n::exclusive();
         crate::i18n::set(Lang::En);
         let cfg = cfg_with_engines();
-        let rows = offer("/tts go", &ctx!(&cfg));
-        assert_eq!(rows.len(), 1, "{:?}", rows);
-        assert_eq!(rows[0].insert, "/tts install gone");
+        let rows = offer("/voice go", &ctx!(&cfg));
+        assert!(
+            rows.is_empty(),
+            "model acquisition is not disguised as a slash-command argument"
+        );
     }
 }

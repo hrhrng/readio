@@ -18,7 +18,7 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::Instant;
 
 use crate::app::expand_tilde;
-use crate::tts::config::EngineSpec;
+use crate::voice::config::EngineSpec;
 
 /// One command in an install, with the reason it was chosen.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +26,10 @@ pub struct Step {
     pub argv: Vec<String>,
     /// Where the output of a download goes, so the directory can be made first.
     pub creates: Option<PathBuf>,
+    /// Resolve the Python interpreter from this installed launcher before
+    /// running `argv`. Used for Hugging Face downloads that need the package
+    /// environment installed by the preceding step.
+    pub interpreter_for: Option<String>,
 }
 
 impl Step {
@@ -59,6 +63,90 @@ pub enum Blocked {
     NoRecipe { docs: String },
     /// There is a package, but nothing on this machine to install it with.
     NoInstaller,
+}
+
+/// Disk-space facts shown before a model download begins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Space {
+    pub download_bytes: u64,
+    pub required_bytes: u64,
+    pub available_bytes: u64,
+}
+
+impl Space {
+    pub fn enough(self) -> bool {
+        self.available_bytes >= self.required_bytes
+    }
+}
+
+/// Conservative footprints for the built-in local models.
+///
+/// `required` includes extraction/cache duplication and a working reserve, not
+/// just the bytes crossing the network. Unknown custom engines still receive a
+/// filesystem check, but have no size estimate to enforce.
+fn footprint(engine: &str) -> (u64, u64) {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    match engine {
+        // 276 MiB model + 42 MiB codec. The MOSS worker uses the same five-GiB
+        // reserve when Hugging Face materialises a cold cache.
+        "moss" => (318 * MIB, 5 * GIB + 636 * MIB),
+        "kokoro" => (350 * MIB, GIB),
+        "qwen" => (3560 * MIB, 8 * GIB),
+        "piper" => (30 * MIB, 128 * MIB),
+        "supertonic" => (400 * MIB, GIB),
+        _ => (0, 0),
+    }
+}
+
+/// Check the filesystem that holds readio's home before a download.
+///
+/// `df -Pk` is available on both supported host families (macOS and Linux) and
+/// reports bytes without adding another platform-specific native dependency.
+pub fn space(engine: &str) -> Option<Space> {
+    let home = crate::paths::home();
+    let probe = home
+        .ancestors()
+        .find(|path| path.exists())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let output = Command::new("df")
+        .args(["-Pk"])
+        .arg(probe)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let body = String::from_utf8_lossy(&output.stdout);
+    let available_kib = body
+        .lines()
+        .rfind(|line| !line.trim().is_empty())?
+        .split_whitespace()
+        .nth(3)?
+        .parse::<u64>()
+        .ok()?;
+    let (download_bytes, required_bytes) = footprint(engine);
+    Some(Space {
+        download_bytes,
+        required_bytes,
+        available_bytes: available_kib.saturating_mul(1024),
+    })
+}
+
+pub fn bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 /// Work out how to install `spec` on this machine.
@@ -128,10 +216,19 @@ pub fn plan(engine: &str, spec: &EngineSpec) -> Result<Plan, Blocked> {
         spec.system.clone()
     });
 
-    let mut steps = vec![Step {
-        argv,
-        creates: None,
-    }];
+    let runtime_ready = {
+        let program = program_of(spec);
+        !program.is_empty() && locate(&program).is_some()
+    };
+    let mut steps = if runtime_ready {
+        Vec::new()
+    } else {
+        vec![Step {
+            argv,
+            creates: None,
+            interpreter_for: None,
+        }]
+    };
 
     // Voice models the engine does not ship. `curl` is assumed rather than
     // checked: it is on every macOS and effectively every Linux, and a missing
@@ -148,6 +245,32 @@ pub fn plan(engine: &str, spec: &EngineSpec) -> Result<Plan, Blocked> {
                 fetch.url.clone(),
             ],
             creates: Some(to),
+            interpreter_for: None,
+        });
+    }
+
+    let hf_models: &[&str] = match engine {
+        "moss" => &[
+            "mlx-community/MOSS-TTS-Nano-100M",
+            "mlx-community/MOSS-Audio-Tokenizer-Nano",
+        ],
+        "qwen" => &["mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16"],
+        _ => &[],
+    };
+    if !hf_models.is_empty() {
+        let models = hf_models
+            .iter()
+            .map(|model| format!("{model:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let code = format!(
+            "from huggingface_hub import snapshot_download\n\
+             [snapshot_download(model_id=m) for m in [{models}]]"
+        );
+        steps.push(Step {
+            argv: vec!["python".into(), "-c".into(), code],
+            creates: None,
+            interpreter_for: Some(program_of(spec)),
         });
     }
 
@@ -166,7 +289,7 @@ fn have(program: &str) -> bool {
 /// The program an engine's command line starts with: the one thing that has to
 /// be on the machine for that engine to say anything.
 pub fn program_of(spec: &EngineSpec) -> String {
-    crate::tts::command::split_args(&spec.synth)
+    crate::voice::command::split_args(&spec.synth)
         .into_iter()
         .next()
         .unwrap_or_default()
@@ -186,6 +309,39 @@ pub fn is_ready(spec: &EngineSpec) -> bool {
     spec.fetch
         .iter()
         .all(|fetch| expand_tilde(&fetch.to).exists())
+}
+
+/// Whether both the runtime and the model weights are already local.
+pub fn model_is_ready(engine: &str, spec: &EngineSpec) -> bool {
+    if engine == "openai" {
+        // `curl` being installed says nothing about the server behind it. This
+        // preset is external configuration, not a downloaded local model.
+        return false;
+    }
+    if !is_ready(spec) {
+        return false;
+    }
+    match engine {
+        "moss" => {
+            hf_cached("mlx-community/MOSS-TTS-Nano-100M")
+                && hf_cached("mlx-community/MOSS-Audio-Tokenizer-Nano")
+        }
+        "qwen" => hf_cached("mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16"),
+        _ => true,
+    }
+}
+
+fn hf_cached(model: &str) -> bool {
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    let snapshots = home
+        .join(".cache/huggingface/hub")
+        .join(format!("models--{}", model.replace('/', "--")))
+        .join("snapshots");
+    std::fs::read_dir(snapshots)
+        .ok()
+        .is_some_and(|mut entries| entries.next().is_some())
 }
 
 /// Resolve a program against PATH, the way a shell would.
@@ -316,6 +472,19 @@ fn run_step(step: &Step, tx: &std::sync::mpsc::Sender<Progress>) -> bool {
     let Some((program, args)) = step.argv.split_first() else {
         return false;
     };
+    let resolved;
+    let program = if let Some(launcher) = step.interpreter_for.as_deref() {
+        let Some(python) = interpreter_for(launcher) else {
+            let _ = tx.send(Progress::Line(format!(
+                "cannot find the Python environment behind {launcher}"
+            )));
+            return false;
+        };
+        resolved = python.to_string_lossy().into_owned();
+        &resolved
+    } else {
+        program
+    };
     let child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
@@ -352,6 +521,14 @@ fn run_step(step: &Step, tx: &std::sync::mpsc::Sender<Progress>) -> bool {
         let _ = reader.join();
     }
     matches!(status, Ok(status) if status.success())
+}
+
+fn interpreter_for(launcher: &str) -> Option<PathBuf> {
+    let launcher = locate(launcher)?;
+    let head = std::fs::read_to_string(launcher).ok()?;
+    let first = head.lines().next()?.strip_prefix("#!")?.trim();
+    let path = PathBuf::from(first.split_whitespace().next()?);
+    (path.is_absolute() && path.exists() && !first.contains("env")).then_some(path)
 }
 
 /// Forward a subprocess's output, one screen line at a time.
@@ -435,7 +612,7 @@ enum Reader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tts::config::presets;
+    use crate::voice::config::presets;
 
     #[test]
     fn a_server_has_nothing_to_install() {
@@ -476,25 +653,31 @@ mod tests {
             return;
         };
         assert!(matches!(plan.via, "uv" | "pipx" | "pip"));
-        let first = plan.steps.first().expect("an install step");
+        let package = plan
+            .steps
+            .iter()
+            .find(|step| step.line().contains("piper-tts"));
         assert!(
-            first.line().contains("piper-tts"),
-            "the package, not the command name: {}",
-            first.line()
+            package.is_some() || locate(&program_of(&presets["piper"])).is_some(),
+            "the plan may skip only a runtime that is already installed: {:?}",
+            plan.lines()
         );
         assert_eq!(
             plan.steps.len(),
-            3,
+            if package.is_some() { 3 } else { 2 },
             "piper needs its voice fetched as well: {:?}",
             plan.lines()
         );
         assert!(
-            plan.steps[1].line().contains(".onnx"),
+            plan.steps.iter().any(|step| step.line().contains(".onnx")),
             "and the voice is the model itself: {}",
-            plan.steps[1].line()
+            plan.lines().join("\n")
         );
         assert!(
-            plan.steps[1].creates.is_some(),
+            plan.steps
+                .iter()
+                .find(|step| step.line().contains(".onnx"))
+                .is_some_and(|step| step.creates.is_some()),
             "a download has to say where it lands, or the directory is never made"
         );
     }
@@ -505,7 +688,18 @@ mod tests {
         let Ok(plan) = plan("kokoro", &presets["kokoro"]) else {
             return;
         };
-        let line = plan.steps[0].line();
+        let Some(line) = plan
+            .steps
+            .iter()
+            .find(|step| step.argv.last().is_some_and(|arg| arg == "kokoro-tts"))
+            .map(Step::line)
+        else {
+            assert!(
+                locate(&program_of(&presets["kokoro"])).is_some(),
+                "the install step may be absent only when the runtime is already here"
+            );
+            return;
+        };
         if plan.via == "pip" {
             return; // plain pip has no way to pick an interpreter.
         }
@@ -519,6 +713,24 @@ mod tests {
     fn which_finds_something_that_is_certainly_there() {
         assert!(which("sh").is_some(), "every unix has a shell");
         assert!(which("readio-definitely-not-installed").is_none());
+    }
+
+    #[test]
+    fn model_downloads_are_checked_against_working_space_not_just_archive_size() {
+        let (download, required) = footprint("moss");
+        assert!(download > 300 * 1024 * 1024);
+        assert!(
+            required > download * 2,
+            "cache materialisation and a reserve need more than the wire bytes"
+        );
+        assert!(
+            !Space {
+                download_bytes: download,
+                required_bytes: required,
+                available_bytes: required - 1,
+            }
+            .enough()
+        );
     }
 
     /// An installer's output lands in a terminal readio is drawing on, so what

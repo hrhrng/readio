@@ -29,8 +29,7 @@ pub struct Chrome<'a> {
     /// whitelist. Shown wherever the engine name would be, because a silent
     /// mute is indistinguishable from a broken engine.
     pub audio_muted: bool,
-    /// Which of the three reading modes is in force, shown as a chip the way a
-    /// coding agent shows the mode `shift+tab` cycles.
+    /// Manual/auto continuation, shown as the chip `shift+tab` toggles.
     pub mode: crate::mode::Mode,
     /// Reading pace, shown where a coding agent shows reasoning effort: beside the
     /// model name.
@@ -309,8 +308,8 @@ const HELP: &[(&str, &str, &str)] = &[
     ("esc", "中断这一轮，位置留在原处；回车接着读", "interrupt the turn, keeping your place; ⏎ carries on"),
     ("空格 space", "停下 / 接着读，跟播放器一个意思（输入框是空的时候）",
         "stop or carry on, the way it works in a player (when the line is empty)"),
-    ("shift+tab", "循环三种模式：手动 / 自动滚动 / 朗读",
-        "cycle the modes: manual / auto-scroll / read-aloud"),
+    ("shift+tab", "切换手动 / 自动阅读（不影响朗读）",
+        "toggle manual / auto-reading (Voice is unchanged)"),
     ("↑ ↓ / 滚轮 wheel", "滚动；手动模式下滚到底会载入下一段",
         "scroll; in manual mode, at the bottom it loads more"),
     ("pgup pgdn / home end", "翻页；到顶 / 到底", "by page; to the top / to the tail"),
@@ -335,8 +334,8 @@ const HELP: &[(&str, &str, &str)] = &[
     ("/next /prev", "下一章 / 上一章", "next / previous chapter"),
     ("/find <term>", "全书检索；输序号跳到那一处", "search the book; type a number to jump"),
     ("^g ^b", "下一处 / 上一处命中", "next / previous hit"),
-    ("/mode [manual|auto|tts]", "三种读法；shift+tab 也能切",
-        "the three reading modes; shift+tab cycles too"),
+    ("/mode [manual|auto]", "手动 / 自动阅读；shift+tab 也能切",
+        "manual / auto-reading; shift+tab toggles too"),
     ("/plan", "章节清单", "chapters as a plan"),
     ("/context", "阅读上下文", "context window readout"),
     ("/progress", "进度摘要", "one-line progress"),
@@ -347,9 +346,8 @@ const HELP: &[(&str, &str, &str)] = &[
     ("", "", ""),
     ("/effort [level]", "推理强度：minimal…max，越高读得越慢",
         "reasoning effort: minimal…max, higher reads slower"),
-    ("/tts [engine]", "用哪个引擎念；没装的当场装",
-        "which voice reads to you; installs one that is missing"),
-    ("/voice <name>", "换音色", "change voice"),
+    ("/voice [auto|zh|en|音色|引擎]", "谁来念：引擎、音色、语种；没装的当场装",
+        "who reads: engine, voice, language; installs one that is missing"),
     ("/rate <0.5-3>", "改当前强度这一档的倍数", "retune the current effort level"),
     ("/device", "音频输出白名单：只在指定设备上出声",
         "audio output whitelist: only speak on devices you name"),

@@ -14,7 +14,7 @@ use ratatui::style::Style;
 use ratatui::widgets::{Block as UiBlock, Widget};
 
 use crate::book::Book;
-use crate::config::Config;
+use crate::config::{self, Chosen, Config};
 use crate::effort::{self, Effort};
 use crate::i18n::{t, tf};
 use crate::library::{Library, Mode};
@@ -23,14 +23,15 @@ use crate::mode::Mode as ReadMode;
 use crate::paths;
 use crate::store::{Progress, Store, now_secs};
 use crate::theme::theme;
-use crate::tts::device::{self, Gate, Verdict};
-use crate::tts::sentence::Unit;
-use crate::tts::{Speaker, SpeechEvent, command::CommandSynth, install, sentence};
 use crate::ui::block::{Block, Event, Highlight, Tool, Verb};
 use crate::ui::chrome::{self, Chrome};
 use crate::ui::menu;
 use crate::ui::prompt::Prompt;
 use crate::ui::scrollback::Scrollback;
+use crate::ui::voice as voice_ui;
+use crate::voice::device::{self, Gate, Verdict};
+use crate::voice::sentence::Unit;
+use crate::voice::{Speaker, SpeechEvent, command::CommandSynth, install, sentence};
 
 use flow::Pos;
 use turn::{Effect, Step, Turn};
@@ -62,8 +63,10 @@ pub struct App {
     notice: Option<(String, Instant)>,
     /// The next reading turn should explain that it restored progress.
     resumed: bool,
-    /// Keep queueing turns until interrupted.
-    auto: bool,
+    /// Whether passages advance manually or automatically.
+    mode: ReadMode,
+    /// Whether passages are spoken. Orthogonal to `mode`.
+    speech: bool,
     /// How far into each library entry the reader is, for the book select.
     library_progress: Vec<f32>,
     /// Bookmarks of the open book, for the marks select.
@@ -114,6 +117,9 @@ pub struct App {
     /// whatever the reader was halfway through typing, and puts a command they
     /// never typed on the line under their cursor.
     select: Option<Select>,
+    /// A single Voice workspace: model acquisition on the left, scoped
+    /// configuration on the right.
+    voice_workspace: Option<voice_ui::Workspace>,
     /// Term to highlight in the next passage that contains it, set when a jump
     /// lands on a hit.
     marking: Option<String>,
@@ -233,6 +239,8 @@ impl App {
         let cps = cfg.reading.speed;
         // The pacer starts at the pace the effort level asks for, not the base.
         let paced = (cps * cfg.effort.multipliers.get(cfg.effort.level)).clamp(4.0, 4000.0);
+        let mode = cfg.reading.mode;
+        let speech = cfg.voice.enabled;
         let mut app = Self {
             sb: Scrollback::new(),
             prompt: Prompt::new(),
@@ -246,7 +254,8 @@ impl App {
             show_help: false,
             notice: None,
             resumed: false,
-            auto: false,
+            mode,
+            speech,
             library_progress: Vec::new(),
             marks: Vec::new(),
             base_cps: cps,
@@ -270,10 +279,11 @@ impl App {
             marking: None,
             menu_at: 0,
             select: None,
+            voice_workspace: None,
         };
 
-        if app.cfg.tts.output.is_active() {
-            app.gate = Some(Gate::new(app.cfg.tts.output.clone()));
+        if app.cfg.voice.output.is_active() {
+            app.gate = Some(Gate::new(app.cfg.voice.output.clone()));
         }
         app.turn.image_rows = app.cfg.images.max_rows;
         app.turn.images = app.cfg.images.enabled;
@@ -287,8 +297,21 @@ impl App {
             Some(book) => app.adopt(book),
             None => app.show_library(),
         }
-        app.warm_voice();
+        app.restore_speech();
         app
+    }
+
+    /// Restore Voice independently from the continuation mode.
+    fn restore_speech(&mut self) {
+        if !self.speech {
+            return;
+        }
+        if self.start_speaker() {
+            return;
+        }
+        self.speech = false;
+        self.cfg.voice.enabled = false;
+        let _ = self.cfg.save();
     }
 
     // ── book lifecycle ───────────────────────────────────────────────────────
@@ -303,6 +326,11 @@ impl App {
             .unwrap_or_default();
         let pos = flow::normalize(&book, pos);
 
+        // Who was reading a moment ago. A book may carry its own voice, so the
+        // engine running for the last one is not necessarily the engine this one
+        // asked for, and a resident engine outlives the book it was started for.
+        let was = self.voice();
+
         self.resumed = saved.is_some() && (pos.chapter > 0 || pos.para > 0);
         self.pos = pos;
         self.library.touch(&book.id);
@@ -311,7 +339,14 @@ impl App {
         // a fresh position to report.
         self.refresh_marks();
         self.refresh_library_progress();
-        self.auto = false;
+        // The mode is not touched. It is a setting the reader made, and opening
+        // a book is not them changing their mind about how they read — the old
+        // reset was auto-scroll being demoted while read-aloud sailed through,
+        // which is the sort of difference no one could have predicted.
+        if self.voice() != was {
+            self.silence();
+            self.speaker = None;
+        }
         self.resume = None;
         self.prompt.placeholder = t("prompt.reading").to_string();
 
@@ -325,6 +360,9 @@ impl App {
         // select above the composer: `/toc` raises it, and `/plan` still prints
         // the plan for anyone who asks for it by name.
         self.begin_session();
+        // A book of its own voice needs its engine up before the first sentence
+        // is due, the same way the first book of the session did.
+        self.warm_voice();
     }
 
     /// Offer the imported books in the select above the composer.
@@ -402,8 +440,7 @@ impl App {
         // Whether the next passage is going to be spoken, refreshed every frame
         // so it can never be stale: a passage held for a voice that is not
         // coming would simply never appear.
-        self.turn
-            .set_voiced(self.cfg.tts.enabled && self.audio_permitted());
+        self.turn.set_voiced(self.speech && self.audio_permitted());
         let effects = self.turn.pump(&mut self.sb, dt.min(200.0));
         if let Some((id, text)) = self.turn.take_spoken() {
             self.mark_match(id, &text);
@@ -428,7 +465,7 @@ impl App {
         // through a boundary that used to be dead air.
         if self.awaiting_voice && self.voice_runway() <= 1 {
             self.awaiting_voice = false;
-            if self.auto && !self.turn.busy() && !self.at_end() {
+            if self.mode.scrolls() && !self.turn.busy() && !self.at_end() {
                 self.read_more();
             }
         }
@@ -460,7 +497,7 @@ impl App {
                 chars,
             }));
         }
-        if self.auto && !self.at_end() {
+        if self.mode.scrolls() && !self.at_end() {
             // Normally the reveal ends with the last clip, so by the time a
             // turn finishes the voice is already done and the next paragraph
             // can be asked for straight away — its opening sentence has been
@@ -552,7 +589,7 @@ impl App {
             Verdict::Blocked { device } => vec![
                 tf(
                     "dev.muted_device",
-                    &[&device.label(), &self.cfg.tts.output.rules()],
+                    &[&device.label(), &self.cfg.voice.output.rules()],
                 ),
                 tf("dev.muted_fix", &[&quoted(&device.name)]),
             ],
@@ -585,7 +622,7 @@ impl App {
                 self.show_devices();
             }
             "any" | "off" | "clear" => {
-                self.cfg.tts.output.allow.clear();
+                self.cfg.voice.output.allow.clear();
                 let _ = self.cfg.save();
                 self.gate = None;
                 self.system(t("dev.any"));
@@ -595,19 +632,19 @@ impl App {
                     return;
                 };
                 if verb == "allow" {
-                    if self.cfg.tts.output.allow_device(&name) {
+                    if self.cfg.voice.output.allow_device(&name) {
                         self.system(&tf("dev.allowed_added", &[&name]));
                     } else {
                         self.system(&tf("dev.allowed_exists", &[&name]));
                     }
                 } else {
-                    let before = self.cfg.tts.output.allow.len();
+                    let before = self.cfg.voice.output.allow.len();
                     self.cfg
-                        .tts
+                        .voice
                         .output
                         .allow
                         .retain(|rule| !rule.eq_ignore_ascii_case(&name));
-                    if self.cfg.tts.output.allow.len() == before {
+                    if self.cfg.voice.output.allow.len() == before {
                         self.system(&tf("dev.deny_missing", &[&name]));
                         return;
                     }
@@ -630,7 +667,7 @@ impl App {
         let Ok(index) = value.parse::<usize>() else {
             return Some(value.to_string());
         };
-        match device::list(&self.cfg.tts.output.query) {
+        match device::list(&self.cfg.voice.output.query) {
             Ok(devices) => match devices.get(index.saturating_sub(1)) {
                 Some(device) => Some(device.name.clone()),
                 None => {
@@ -652,7 +689,7 @@ impl App {
     fn report_probe_failure(&mut self, err: &anyhow::Error) {
         self.system(&tf("dev.probe_failed", &[&format!("{err:#}")]));
         self.system(t("dev.probe_hint"));
-        if self.cfg.tts.output.is_active() {
+        if self.cfg.voice.output.is_active() {
             self.system(t("dev.probe_muted"));
         }
     }
@@ -660,14 +697,14 @@ impl App {
     /// Rebuild the gate after the whitelist changed, keeping the verdict fresh
     /// without waiting for the next poll.
     fn apply_whitelist(&mut self) {
-        if !self.cfg.tts.output.is_active() {
+        if !self.cfg.voice.output.is_active() {
             self.gate = None;
             return;
         }
         match self.gate.as_mut() {
-            Some(gate) => gate.set_allow(self.cfg.tts.output.allow.clone()),
+            Some(gate) => gate.set_allow(self.cfg.voice.output.allow.clone()),
             None => {
-                let mut gate = Gate::new(self.cfg.tts.output.clone());
+                let mut gate = Gate::new(self.cfg.voice.output.clone());
                 gate.refresh_blocking();
                 self.gate = Some(gate);
             }
@@ -676,14 +713,14 @@ impl App {
 
     /// The output list, with the current device and the whitelist marked.
     fn show_devices(&mut self) {
-        let devices = match device::list(&self.cfg.tts.output.query) {
+        let devices = match device::list(&self.cfg.voice.output.query) {
             Ok(devices) => devices,
             Err(err) => {
                 self.report_probe_failure(&err);
                 return;
             }
         };
-        let allow = self.cfg.tts.output.allow.clone();
+        let allow = self.cfg.voice.output.allow.clone();
         let mut lines = Vec::new();
         for (index, dev) in devices.iter().enumerate() {
             let mut line = format!("{:>2}. {}", index + 1, dev.label());
@@ -699,7 +736,7 @@ impl App {
         lines.push(if allow.is_empty() {
             t("dev.whitelist_empty").to_string()
         } else {
-            tf("dev.whitelist", &[&self.cfg.tts.output.rules()])
+            tf("dev.whitelist", &[&self.cfg.voice.output.rules()])
         });
         lines.push(t("dev.hint").to_string());
         self.sb.push(Block::Event(Event::Warning {
@@ -749,7 +786,7 @@ impl App {
             .cursor
             .as_ref()
             .map(|cursor| cursor.sentence.0)
-            .filter(|_| self.cfg.tts.enabled);
+            .filter(|_| self.speech);
         let voiced = self.voiced.clone();
         self.silence();
         self.speaker = None;
@@ -792,7 +829,7 @@ impl App {
     /// machine with no engine installed should say so when the reader actually
     /// asks to be read to, not the moment they open a book.
     fn warm_voice(&mut self) {
-        if !self.cfg.tts.enabled || self.speaker.is_some() {
+        if !self.speech || self.speaker.is_some() {
             return;
         }
         let kept = self.notice.take();
@@ -805,33 +842,42 @@ impl App {
         if self.speaker.is_some() {
             return true;
         }
-        let Some(spec) = self.cfg.active_engine().cloned() else {
+        // Who reads this book: its own entry if it has one, the default if not.
+        let chosen = self.voice();
+        let Some(mut spec) = self.cfg.spec(&chosen.engine).cloned() else {
             let names = self.cfg.engine_names().join(", ");
             // A notice, not a transcript line. Failing to start the voice is a
             // fact about this machine, not about the book, and it fades on its
             // own — four identical copies of it stacked in the reading history
             // is what happens when an interface writes down every attempt.
-            self.notice(&tf("tts.unknown_engine", &[&self.cfg.tts.engine, &names]));
+            self.notice(&tf("voice.unknown_engine", &[&chosen.engine, &names]));
             return false;
         };
+        if !install::model_is_ready(&chosen.engine, &spec) {
+            self.notice(&tf("install.not_yet", &[&chosen.engine, &chosen.engine]));
+            return false;
+        }
+        if !chosen.params.trim().is_empty() {
+            spec.extra = chosen.params.clone();
+        }
         let synth = CommandSynth::new(
-            &self.cfg.tts.engine,
+            &chosen.engine,
             spec,
-            // The explicit choice only: left empty, the engine picks the voice
-            // that matches whatever language the passage turns out to be in.
-            self.cfg.tts.voice.clone(),
+            // The explicit choice only: left empty, the configured model and
+            // language entry provide their declared default.
+            chosen.name.clone(),
             self.multiplier(),
         )
-        .in_language(&self.cfg.tts.language);
+        .in_language(&chosen.language);
         if !synth.is_available() {
             let program = synth.program().unwrap_or_default();
-            self.notice(&tf("tts.missing_binary", &[&program]));
+            self.notice(&tf("voice.missing_binary", &[&program]));
             return false;
         }
         self.speaker = Some(Speaker::spawn(
             Box::new(synth),
             paths::speech_dir(),
-            self.cfg.tts.prefetch,
+            self.cfg.voice.prefetch,
         ));
         true
     }
@@ -852,9 +898,15 @@ impl App {
     /// Used when the speed changes mid-passage: the sentences already spoken
     /// stay spoken, and the one in progress starts again at the new speed.
     fn enqueue_speech_from(&mut self, id: u64, text: &str, from: usize) -> bool {
-        if !self.cfg.tts.enabled {
-            return false;
-        }
+        // Only read-aloud reads aloud. The guard is here rather than at each
+        // caller because a passage queued in another mode would take the pace
+        // away from a reader who never asked for a voice.
+        self.speech && self.queue_speech(id, text, from)
+    }
+
+    /// Say this passage, whatever mode is in force. Used by `/voice test`,
+    /// which proves the wiring without turning the book into an audiobook.
+    fn queue_speech(&mut self, id: u64, text: &str, from: usize) -> bool {
         // Speech routed to a device the reader excluded is not read-aloud, and
         // carrying on regardless would be exactly the fallback this mode does
         // not have: pages turning towards headphones that are not there.
@@ -867,8 +919,8 @@ impl App {
             // The engine was there when the mode was entered and is not there
             // now. Stop on the spot rather than quietly becoming a mode the
             // reader did not ask for.
-            let engine = self.cfg.tts.engine.clone();
-            self.lose_the_voice(&tf("tts.engine_gone", &[&engine]));
+            let engine = self.voice().engine;
+            self.lose_the_voice(&tf("voice.engine_gone", &[&engine]));
             return false;
         }
         let Some(speaker) = self.speaker.as_mut() else {
@@ -925,7 +977,7 @@ impl App {
     /// Have the next paragraph's opening sentence rendered before this one ends.
     ///
     /// Inside a passage the pipeline covers the sentence boundaries: every
-    /// sentence is handed over at once and rendered `tts.prefetch` ahead of the
+    /// sentence is handed over at once and rendered `voice.prefetch` ahead of the
     /// one playing. The boundary it cannot cover is the one between paragraphs,
     /// because until the turn ends the next paragraph does not exist yet: the
     /// reader waits out a thinking line, a tool call, and only then a full
@@ -940,7 +992,7 @@ impl App {
     fn render_ahead(&mut self) {
         // One clip left, and nothing queued behind it in this turn: whatever
         // the voice says next has to come from the paragraph after this one.
-        if !self.auto || !self.speaks() || self.voice_runway() > 1 || self.turn.more_to_say() {
+        if !self.speech || self.voice_runway() > 1 || self.turn.more_to_say() {
             return;
         }
         let Some((chapter, para)) = self.turn.advancing_to() else {
@@ -970,16 +1022,16 @@ impl App {
 
     /// Read-aloud lost its voice: stop, and say so.
     ///
-    /// There is deliberately no fallback here. Read-aloud is a reading mode,
-    /// not a decoration on top of one, and the two are not interchangeable: a
-    /// reader listening with their eyes elsewhere is not served by a page that
-    /// silently carries on scrolling, and one watching the text is not served
-    /// by it either — they asked to be read to. So the reading stops where the
-    /// voice stopped, the mode stays what the reader chose, and enter picks it
-    /// up again once whatever broke is fixed. The engine handle is dropped so
-    /// that enter is a real retry rather than a request to the corpse.
+    /// There is deliberately no silent fallback here. Voice owns the token
+    /// reveal pace while it is enabled, independently of manual/auto
+    /// continuation. If it fails, the reveal stops where the voice stopped,
+    /// Voice turns off, and the continuation mode stays exactly as the reader
+    /// chose it. ^s explicitly retries Voice after the engine is fixed.
     fn lose_the_voice(&mut self, why: &str) {
-        self.notice(&tf("tts.stopped", &[&why]));
+        self.notice(&tf("voice.stopped", &[&why]));
+        self.speech = false;
+        self.cfg.voice.enabled = false;
+        let _ = self.cfg.save();
         self.stop_reading();
     }
 
@@ -1108,13 +1160,41 @@ impl App {
         self.cursor.is_some() || self.speaker.as_ref().is_some_and(Speaker::busy)
     }
 
-    /// Whether this reading is a read-aloud one.
-    ///
-    /// The mode, not the moment: true between clips and during the thinking
-    /// line, because the question it answers is who owns the pace, and in
-    /// read-aloud that is the voice from the moment the reader chooses it.
+    /// Whether Voice is enabled, including between clips.
     fn speaks(&self) -> bool {
-        self.cfg.tts.enabled
+        self.speech
+    }
+
+    // ── who is reading ───────────────────────────────────────────────────────
+
+    /// The book a choice would be written against.
+    ///
+    /// Owned rather than borrowed because the choice is written into the config
+    /// next to it, and a borrow of the book would still be alive when that
+    /// happened.
+    fn scoped(&self) -> Option<(String, String)> {
+        self.book
+            .as_ref()
+            .map(|book| (book.id.clone(), book.title.clone()))
+    }
+
+    /// Which voice is in force: the open book's, or the default in the library.
+    fn voice(&self) -> Chosen {
+        self.cfg
+            .voice_for(self.book.as_ref().map(|book| book.id.as_str()))
+    }
+
+    /// `engine · voice`, as shown when speech turns on.
+    fn speech_label(&self) -> String {
+        let chosen = self.voice();
+        let name = self
+            .cfg
+            .voice_name(self.book.as_ref().map(|book| book.id.as_str()));
+        if name.is_empty() {
+            chosen.engine
+        } else {
+            format!("{} · {name}", chosen.engine)
+        }
     }
 
     /// Speech stopped: clear the highlight and go back to timed reading.
@@ -1133,27 +1213,9 @@ impl App {
         }
     }
 
-    /// Ctrl+S and `/tts on|off`: step in and out of read-aloud.
-    ///
-    /// Leaving read-aloud lands in auto-scroll rather than manual: the text was
-    /// moving a moment ago, and silence is the only thing the reader asked to
-    /// change.
+    /// `^s`: toggle Voice without changing manual/auto continuation.
     fn toggle_speech(&mut self) {
-        if self.cfg.tts.enabled {
-            self.set_mode(ReadMode::Auto);
-        } else {
-            self.set_mode(ReadMode::Speak);
-        }
-    }
-
-    /// `engine · voice`, as shown when speech turns on.
-    fn speech_label(&self) -> String {
-        let voice = self.cfg.active_voice();
-        if voice.is_empty() {
-            self.cfg.tts.engine.clone()
-        } else {
-            format!("{} · {}", self.cfg.tts.engine, voice)
-        }
+        self.set_speech(!self.speech);
     }
 
     /// Stop the current clip and forget everything queued.
@@ -1177,7 +1239,11 @@ impl App {
             Some(book) => flow::normalize(book, self.pos),
             None => Pos::default(),
         };
-        let highlight = self.speaking_engine();
+        let highlight = if self.speech {
+            self.speaking_engine().or_else(|| Some(self.speech_label()))
+        } else {
+            None
+        };
         let chrome = Chrome {
             book: self
                 .book
@@ -1214,8 +1280,26 @@ impl App {
             library_count: self.library.len(),
             elapsed: self.started.elapsed(),
             speaking: highlight.as_deref(),
-            audio_muted: self.cfg.tts.enabled && !self.audio_permitted(),
+            audio_muted: self.speech && !self.audio_permitted(),
         };
+
+        if let Some(workspace) = self.voice_workspace.as_ref() {
+            let [header, body, status] = Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Min(6),
+                Constraint::Length(1),
+            ])
+            .areas(area);
+            let installing = self
+                .installing
+                .as_ref()
+                .map(|install| install.engine.as_str());
+            let buf = frame.buffer_mut();
+            chrome::render_header(header, buf, &chrome);
+            voice_ui::render(body, buf, workspace, &self.cfg, installing);
+            chrome::render_status(status, buf, &chrome);
+            return;
+        }
 
         let prompt_h = self.prompt.height(area.width);
         let rows = self.menu_rows();
@@ -1271,6 +1355,16 @@ impl App {
         // Any key other than Ctrl+C resets the quit confirmation.
         if !(ctrl && matches!(key.code, KeyCode::Char('c'))) {
             self.ctrl_c_at = None;
+        }
+
+        // The Voice workspace owns ordinary keys while it is open. Ctrl+C/D
+        // keep their process-wide meanings; everything else edits this surface,
+        // never the hidden composer behind it.
+        if self.voice_workspace.is_some()
+            && !(ctrl && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d')))
+        {
+            self.voice_workspace_key(key);
+            return;
         }
 
         match (key.code, ctrl) {
@@ -1340,7 +1434,7 @@ impl App {
             (KeyCode::Up, _) if self.menu_open() => self.menu_step(-1),
             (KeyCode::Down, _) if self.menu_open() => self.menu_step(1),
             (KeyCode::Tab, _) if self.menu_open() => self.menu_complete(),
-            // shift+tab cycles the reading mode. crossterm reports it as
+            // shift+tab toggles manual/auto continuation. crossterm reports it as
             // BackTab, but some terminals send a plain shifted tab instead.
             (KeyCode::BackTab, _) => self.cycle_mode(),
             (KeyCode::Tab, _) if key.modifiers.contains(KeyModifiers::SHIFT) => self.cycle_mode(),
@@ -1678,76 +1772,37 @@ impl App {
         self.turn.resume();
         let voiced = self.voiced.clone();
         let from = self.cursor.as_ref().map(|cursor| cursor.sentence.0);
-        if self.cfg.tts.enabled
+        if self.speech
             && let (Some(from), Some((id, text))) = (from, voiced)
         {
             self.enqueue_speech_from(id, &text, from);
         }
     }
 
-    // ── the three reading modes ──────────────────────────────────────────────
+    // ── continuation and Voice ───────────────────────────────────────────────
 
-    /// Which of the three modes the two underlying switches add up to.
+    /// Whether the next passage advances manually or automatically.
     pub fn mode(&self) -> ReadMode {
-        ReadMode::of(self.auto, self.cfg.tts.enabled)
+        self.mode
     }
 
-    /// `shift+tab`: the next mode, the way a coding agent cycles its own.
+    /// Whether Voice is independently enabled.
+    pub fn speech_enabled(&self) -> bool {
+        self.speech
+    }
+
+    /// `shift+tab`: toggle manual/auto continuation only.
     fn cycle_mode(&mut self) {
-        let want = self.mode().next();
-        if !self.set_mode(want) && want == ReadMode::Speak {
-            // No usable voice on this machine: skip the mode that cannot work
-            // rather than making the reader press the key twice for nothing.
-            self.set_mode(ReadMode::Manual);
-        }
+        self.set_mode(self.mode.next());
     }
 
-    /// Move to `want`, reconcile both switches, and say what it means.
-    ///
-    /// False when the mode could not be entered, which happens only for
-    /// read-aloud with no working engine — and `start_speaker` has already said
-    /// why by then.
+    /// Move to a continuation mode, leaving Voice untouched.
     fn set_mode(&mut self, want: ReadMode) -> bool {
-        if want.speaks() && !self.cfg.tts.enabled {
-            self.cfg.tts.enabled = true;
-            // A rush in progress belongs to the mode being left. Carried into
-            // read-aloud it would hold the pace at thousands of characters a
-            // second and lock the clip out of it for the rest of the turn.
-            self.rushing = false;
-            if !self.start_speaker() {
-                self.cfg.tts.enabled = false;
-                self.notice(t("mode.tts_unavailable"));
-                return false;
-            }
-            // Speech routed to a device the reader excluded is not read-aloud.
-            if !self.audio_permitted() {
-                self.report_audio_block();
-            }
-            // A paragraph already on its way out has to come under the voice
-            // too. Without this it finishes at reading speed in silence, which
-            // is the mode the reader has just left — and on a long paragraph
-            // that silence is most of a screen.
-            //
-            // The voice picks up at the sentence the reader has got to rather
-            // than at the top: what is on screen has been read, by eye if not
-            // aloud, and re-reading it would be the mode arguing with them.
-            if let Some((id, text, released)) = self.turn.passage_in_flight() {
-                let text = text.to_string();
-                let from = text
-                    .char_indices()
-                    .nth(released)
-                    .map_or(text.len(), |(at, _)| at);
-                self.turn.hold_reveal(Some(released));
-                if !self.enqueue_speech_from(id, &text, from) {
-                    self.turn.hold_reveal(None);
-                }
-            }
-        } else if !want.speaks() && self.cfg.tts.enabled {
-            self.cfg.tts.enabled = false;
-            self.silence();
+        if want == ReadMode::Speak {
+            return self.set_speech(true);
         }
-        self.auto = want.scrolls();
-        self.cfg.reading.auto = self.auto;
+        self.mode = want;
+        self.cfg.reading.mode = want;
         let _ = self.cfg.save();
 
         // A flash, not a paragraph: `/mode` opens a select whose detail panel
@@ -1760,9 +1815,7 @@ impl App {
                 want.name(),
                 crate::metrics::rate_label(self.reveal_cps())
             ),
-            ReadMode::Speak => {
-                format!("{}  ·  {}", want.name(), effort::times(self.multiplier()))
-            }
+            ReadMode::Speak => unreachable!("legacy mode is handled above"),
         };
         self.notice(&flash);
 
@@ -1771,6 +1824,47 @@ impl App {
             self.sb.to_bottom();
             self.read_more();
         }
+        true
+    }
+
+    /// Enable or disable Voice while preserving manual/auto continuation.
+    fn set_speech(&mut self, enabled: bool) -> bool {
+        if enabled == self.speech {
+            return true;
+        }
+        if !enabled {
+            self.speech = false;
+            self.cfg.voice.enabled = false;
+            self.silence();
+            let _ = self.cfg.save();
+            self.notice(t("voice.off"));
+            return true;
+        }
+
+        self.rushing = false;
+        self.speech = true;
+        if !self.start_speaker() {
+            self.speech = false;
+            self.notice(t("mode.aloud_unavailable"));
+            return false;
+        }
+        if !self.audio_permitted() {
+            self.report_audio_block();
+        }
+        if let Some((id, text, released)) = self.turn.passage_in_flight() {
+            let text = text.to_string();
+            let from = text
+                .char_indices()
+                .nth(released)
+                .map_or(text.len(), |(at, _)| at);
+            self.turn.hold_reveal(Some(released));
+            if !self.enqueue_speech_from(id, &text, from) {
+                self.turn.hold_reveal(None);
+            }
+        }
+        self.cfg.voice.enabled = true;
+        let _ = self.cfg.save();
+        self.notice(&tf("voice.on", &[&self.speech_label()]));
         true
     }
 
@@ -1990,7 +2084,7 @@ impl App {
                         session_chars: self.turn.session_chars,
                         cps: self.turn.cps(),
                         elapsed: self.started.elapsed(),
-                        engine: match (&self.speaker, self.cfg.tts.enabled) {
+                        engine: match (&self.speaker, self.speech) {
                             (Some(speaker), true) => Some(speaker.engine()),
                             _ => None,
                         },
@@ -2064,8 +2158,7 @@ impl App {
                     None => self.system(t("mode.usage")),
                 },
             },
-            // `/auto` predates the three modes and still means what it did: on
-            // and off, between auto-scroll and manual.
+            // `/auto` remains the continuation toggle: it never changes Voice.
             "auto" => {
                 let want = if self.mode() == ReadMode::Auto {
                     ReadMode::Manual
@@ -2103,12 +2196,17 @@ impl App {
             "marks" | "bookmarks" => self.marks_command(arg),
             "unmark" => self.unmark_command(arg),
             // ── read aloud ──
-            "tts" | "speak" | "read" => self.tts_command(arg),
-            // Installing lives under `/tts`, because the question it answers is
+            //
+            // One command for all of it. Which engine and which voice were never
+            // two questions — a voice belongs to an engine and brings a language
+            // with it — and `/tts` answering beside `/voice` only ever meant two
+            // menus to look in. The old name still works; it just no longer has
+            // a menu of its own.
+            "voice" | "tts" | "speak" | "read" | "aloud" => self.voice_command(arg),
+            // Installing lives under `/voice`, because the question it answers is
             // "which voice", and a top-level `/install` in a book reader is a
             // command whose subject nobody can guess.
-            "install" | "setup" => self.tts_command(&format!("install {arg}")),
-            "voice" => self.voice_command(arg),
+            "install" | "setup" => self.voice_command(&format!("install {arg}")),
             "rate" => self.rate_command(arg),
             "lang" | "language" => self.lang_command(arg),
             "device" | "devices" | "audio" | "output" => self.device_command(arg),
@@ -2117,93 +2215,309 @@ impl App {
         }
     }
 
-    /// `/tts [<engine> | install [engine] | test | config]`
+    /// `/voice [auto | zh | en | <voice> | <engine> | install [engine] | test |
+    /// config | everywhere | default]`
     ///
-    /// No `on` and no `off`. Read-aloud is one of the three reading modes, so
-    /// `shift+tab` and `/mode` own it; a switch here as well would be a second
-    /// control for the same fact, and the only interesting thing about two
-    /// controls for one fact is what happens when they disagree.
-    fn tts_command(&mut self, arg: &str) {
+    /// Everything about who reads is chosen with one command: an engine, voice,
+    /// language, parameters and scope. Voice on/off is independent from the
+    /// manual/auto continuation mode.
+    ///
+    /// While a book is open the choice is written against that book; in the
+    /// library, where there is no book to attach it to, it is the default for
+    /// every book that has not said otherwise.
+    fn voice_command(&mut self, arg: &str) {
         if let Some(rest) = arg.strip_prefix("install") {
             let name = rest.trim();
             // "Install what?" is a question with a list for an answer, and the
             // list already marks what is here and what is not.
             if name.is_empty() {
-                self.open_select("tts");
+                self.open_select("voice");
                 return;
             }
             self.install_engine(name);
             return;
         }
+        let known_language = self
+            .cfg
+            .engine_for(self.book.as_ref().map(|book| book.id.as_str()))
+            .is_some_and(|spec| spec.languages.contains_key(arg));
         match arg {
-            // The question "which voice" has a list for an answer, and a list of
-            // answers is a select.
-            "" => self.open_select("tts"),
+            // Downloading a model and deciding where it is used are separate
+            // operations in one workspace. The old argument forms remain
+            // accepted for config-file-era users, but the bare command is the
+            // primary interface.
+            "" => self.open_voice_workspace(),
             "config" => {
                 let path = paths::display(&paths::config_file());
-                self.system(&tf("tts.config_at", &[&path]));
-                self.system(&tf("tts.engines", &[&self.cfg.engine_names().join(", ")]));
+                self.system(&tf("voice.config_at", &[&path]));
+                self.system(&tf("voice.engines", &[&self.cfg.engine_names().join(", ")]));
             }
-            "test" => {
-                let line = t("tts.test_line");
-                self.system(&tf("tts.testing", &[&line]));
-                self.cfg.tts.enabled = true;
-                if self.start_speaker() {
-                    let id = self.sb.push(Block::passage_text(line));
-                    self.enqueue_speech(id, line);
-                } else {
-                    self.cfg.tts.enabled = false;
-                }
-            }
+            "test" => self.test_voice(),
             "list" | "engines" => {
-                self.system(&tf("tts.engines", &[&self.cfg.engine_names().join(", ")]));
+                self.system(&tf("voice.engines", &[&self.cfg.engine_names().join(", ")]));
             }
-            // The words the old switch used to answer to. They are not engines,
-            // and telling someone "no such engine: on" teaches them nothing —
+            // The words the old switch used to answer to. They are not voices,
+            // and telling someone "no such voice: on" teaches them nothing —
             // name the key that does what they were reaching for.
             "on" | "off" | "enable" | "disable" | "toggle" => {
-                self.system(t("tts.no_switch"));
+                self.system(t("voice.no_switch"));
             }
+            // The two ways to move a choice between the book and the default.
+            "everywhere" | "global" | "all" => self.adopt_voice_everywhere(),
+            "default" | "follow" | "reset" => self.follow_default_voice(),
+            "auto" => self.set_voice_auto(),
             name if self.cfg.spec(name).is_some() => self.use_engine(name),
+            code if known_language => self.pin_language(code),
             other if other.starts_with('-') || other.starts_with('/') => {
-                self.system(t("tts.usage"));
+                self.system(t("voice.usage"));
             }
-            other => {
-                let names = self.cfg.engine_names().join(", ");
-                self.system(&tf("tts.unknown_engine", &[&other, &names]));
+            name => self.pin_voice(name),
+        }
+    }
+
+    fn open_voice_workspace(&mut self) {
+        self.close_select();
+        self.prompt.clear();
+        self.voice_workspace = Some(voice_ui::Workspace::new(
+            &self.cfg,
+            &self.library,
+            self.book.as_ref(),
+        ));
+    }
+
+    fn voice_workspace_key(&mut self, key: KeyEvent) {
+        let installing = self
+            .installing
+            .as_ref()
+            .map(|install| install.engine.clone());
+        let action = {
+            let Some(workspace) = self.voice_workspace.as_mut() else {
+                return;
+            };
+            match key.code {
+                KeyCode::Tab | KeyCode::Left | KeyCode::Right => {
+                    workspace.tab();
+                    voice_ui::Action::None
+                }
+                KeyCode::Up => {
+                    workspace.step(-1, &self.cfg);
+                    voice_ui::Action::None
+                }
+                KeyCode::Down => {
+                    workspace.step(1, &self.cfg);
+                    voice_ui::Action::None
+                }
+                KeyCode::Enter => workspace.activate(&self.cfg, installing.as_deref()),
+                KeyCode::Char('d') if workspace.focus == voice_ui::Pane::Models => {
+                    workspace.activate(&self.cfg, installing.as_deref())
+                }
+                KeyCode::Char(ch) => {
+                    workspace.type_param(ch);
+                    voice_ui::Action::None
+                }
+                KeyCode::Backspace => {
+                    workspace.backspace();
+                    voice_ui::Action::None
+                }
+                KeyCode::Esc => workspace.escape(),
+                _ => voice_ui::Action::None,
+            }
+        };
+        self.apply_voice_workspace_action(action);
+    }
+
+    fn apply_voice_workspace_action(&mut self, action: voice_ui::Action) {
+        match action {
+            voice_ui::Action::None => {}
+            voice_ui::Action::Close => {
+                self.voice_workspace = None;
+            }
+            voice_ui::Action::Install(engine) => self.install_engine(&engine),
+            voice_ui::Action::Save => {
+                let Some(request) = self
+                    .voice_workspace
+                    .as_ref()
+                    .map(voice_ui::Workspace::save_request)
+                else {
+                    return;
+                };
+                match voice_ui::save(&mut self.cfg, &request) {
+                    Ok(message) => {
+                        let _ = self.cfg.save();
+                        self.restart_voice();
+                        self.notice(&message);
+                        if let Some(workspace) = self.voice_workspace.as_mut() {
+                            workspace.reload(&self.cfg);
+                        }
+                    }
+                    Err(message) => self.notice(message),
+                }
+            }
+            voice_ui::Action::FollowDefault { id, title } => {
+                if self.cfg.follow_default(&id) {
+                    let _ = self.cfg.save();
+                    self.restart_voice();
+                    self.notice(&tf(
+                        "voice.follows_default",
+                        &[&title, &self.speech_label()],
+                    ));
+                    if let Some(workspace) = self.voice_workspace.as_mut() {
+                        workspace.reload(&self.cfg);
+                    }
+                }
             }
         }
     }
 
-    // ── choosing and installing a voice ──────────────────────────────────────
+    // ── who reads, and where that is written down ────────────────────────────
+
+    /// Where a choice made right now belongs: this book, or every book.
+    ///
+    /// Borrowed from an owned pair the caller holds, because writing the choice
+    /// takes the config mutably and a scope borrowed from `self.book` would
+    /// still be alive at that point.
+    fn scope_of(target: &Option<(String, String)>) -> config::Scope<'_> {
+        match target {
+            Some((id, title)) => config::Scope::Book { id, title },
+            None => config::Scope::Default,
+        }
+    }
+
+    /// Say what was chosen, and for whom.
+    ///
+    /// The scope is never left to be inferred. A reader who sets a voice while
+    /// reading and finds their next book unchanged has been surprised by a rule
+    /// nobody told them, and one sentence is the whole fix.
+    fn say_voice(&mut self, said: &str) {
+        let line = match self.scoped() {
+            Some((_, title)) => tf("voice.for_book", &[&said, &title]),
+            None => tf("voice.for_every_book", &[&said]),
+        };
+        self.system(&line);
+    }
+
+    /// Everything queued was rendered by the engine that is being replaced.
+    fn restart_voice(&mut self) {
+        self.silence();
+        self.speaker = None;
+    }
+
+    /// Compatibility spelling for returning to the model preset's defaults.
+    ///
+    /// Both settings are cleared. This does not enable sentence-language
+    /// detection; the configured model remains fixed for the whole scope.
+    fn set_voice_auto(&mut self) {
+        let target = self.scoped();
+        let scope = Self::scope_of(&target);
+        self.cfg.set_voice_name(scope, "");
+        self.cfg.set_language(scope, "");
+        let _ = self.cfg.save();
+        self.restart_voice();
+        let said = t("voice.auto_set").to_string();
+        self.say_voice(&said);
+    }
+
+    /// A language readio has an entry for pins the language, not the voice: the
+    /// voice that belongs to it is recorded beside it, and settings that can be
+    /// made to disagree eventually are.
+    fn pin_language(&mut self, code: &str) {
+        let voice = self
+            .cfg
+            .engine_for(self.book.as_ref().map(|book| book.id.as_str()))
+            .and_then(|spec| spec.languages.get(code))
+            .map(|entry| entry.voice.clone())
+            .unwrap_or_default();
+        let target = self.scoped();
+        let scope = Self::scope_of(&target);
+        self.cfg.set_voice_name(scope, "");
+        self.cfg.set_language(scope, code);
+        let _ = self.cfg.save();
+        self.restart_voice();
+        let said = tf("voice.language_set", &[&menu::language_name(code), &voice]);
+        self.say_voice(&said);
+    }
+
+    /// A name readio does not recognise goes straight through to the engine:
+    /// which voices exist is the model's business, not readio's.
+    fn pin_voice(&mut self, name: &str) {
+        let target = self.scoped();
+        let scope = Self::scope_of(&target);
+        self.cfg.set_voice_name(scope, name);
+        let _ = self.cfg.save();
+        self.restart_voice();
+        let said = tf("voice.voice_set", &[&name]);
+        self.say_voice(&said);
+    }
+
+    /// `/voice everywhere`: what this book is read with becomes the default.
+    fn adopt_voice_everywhere(&mut self) {
+        let Some((id, _)) = self.scoped() else {
+            self.system(t("voice.already_default"));
+            return;
+        };
+        self.cfg.adopt_as_default(&id);
+        let _ = self.cfg.save();
+        let label = self.speech_label();
+        self.system(&tf("voice.now_default", &[&label]));
+    }
+
+    /// `/voice default`: this book stops having an opinion.
+    fn follow_default_voice(&mut self) {
+        let Some((id, title)) = self.scoped() else {
+            self.system(t("voice.already_default"));
+            return;
+        };
+        if !self.cfg.follow_default(&id) {
+            self.system(&tf("voice.was_default", &[&title]));
+            return;
+        }
+        let _ = self.cfg.save();
+        self.restart_voice();
+        let label = self.speech_label();
+        self.system(&tf("voice.follows_default", &[&title, &label]));
+    }
+
+    /// `/voice test`: prove the wiring without turning the book into an
+    /// audiobook. The mode is left exactly as it was — a test is a question
+    /// about this machine, not a decision about how to read.
+    fn test_voice(&mut self) {
+        let line = t("voice.test_line");
+        self.system(&tf("voice.testing", &[&line]));
+        if !self.start_speaker() {
+            return;
+        }
+        let id = self.sb.push(Block::passage_text(line));
+        self.queue_speech(id, line, 0);
+    }
 
     /// Read with this engine from now on.
     ///
     /// Choosing a voice means wanting to hear it, so this enters read-aloud
-    /// through `set_mode` rather than flipping the speech switch behind its
-    /// back: one way into the mode, one place that checks the engine starts and
-    /// that the sound is allowed out.
+    /// through `set_mode` rather than starting a speaker behind its back: one
+    /// way into the mode, one place that checks the engine starts and that the
+    /// sound is allowed out.
     fn use_engine(&mut self, name: &str) {
         // An engine nobody has installed cannot be switched to, and the reader is
         // one keypress from fixing that — so say which key.
         let Some(spec) = self.cfg.spec(name) else {
             return;
         };
-        if !install::is_ready(spec) && !spec.pip.is_empty() {
+        if !install::model_is_ready(name, spec) && !spec.pip.is_empty() {
             self.notice(&tf("install.not_yet", &[&name, &name]));
             return;
         }
-        self.silence();
-        self.speaker = None;
-        self.cfg.tts.engine = name.to_string();
+        self.restart_voice();
+        let target = self.scoped();
+        self.cfg.set_engine(Self::scope_of(&target), name);
         let _ = self.cfg.save();
-        if self.set_mode(ReadMode::Speak) {
+        if self.set_speech(true) {
             let engine = self.speech_label();
-            self.system(&tf("tts.engine_set", &[&engine]));
+            let said = tf("voice.engine_set", &[&engine]);
+            self.say_voice(&said);
         }
     }
 
-    /// Install the program behind one engine, then switch to it.
+    /// Install the program and model behind one engine.
     ///
     /// readio ships no model and is not about to become a package manager. What
     /// this does is the thing a reader would otherwise do by hand: find whichever
@@ -2218,9 +2532,26 @@ impl App {
         }
         let Some(spec) = self.cfg.spec(engine).cloned() else {
             let names = self.cfg.engine_names().join(", ");
-            self.notice(&tf("tts.unknown_engine", &[&engine, &names]));
+            self.notice(&tf("voice.unknown_engine", &[&engine, &names]));
             return;
         };
+        // Availability is model-library state, not Voice configuration.
+        if install::model_is_ready(engine, &spec) {
+            self.notice(&tf("install.already", &[&engine]));
+            return;
+        }
+        if let Some(space) = install::space(engine)
+            && !space.enough()
+        {
+            self.notice(&tf(
+                "install.no_space",
+                &[
+                    &install::bytes(space.available_bytes),
+                    &install::bytes(space.required_bytes),
+                ],
+            ));
+            return;
+        }
         // What readio can do about this engine at all comes first. A server is
         // not a package however healthy `curl` looks on this machine, and
         // answering "already installed" for one would be taking credit for a
@@ -2241,13 +2572,6 @@ impl App {
                 return;
             }
         };
-        // Already here: switching to it is what the reader meant.
-        if install::is_ready(&spec) {
-            self.notice(&tf("install.already", &[&engine]));
-            self.tts_command(engine);
-            return;
-        }
-
         self.sb.to_bottom();
         self.system(&tf("install.starting", &[&engine, &plan.via]));
         let block = self.begin_install_step(&plan, 0);
@@ -2301,7 +2625,7 @@ impl App {
                 }
                 install::Progress::Done { ok, ms } => {
                     if ok {
-                        self.adopt_engine(&install.engine, ms);
+                        self.finish_install(&install.engine, ms);
                     } else {
                         let docs = self
                             .cfg
@@ -2318,21 +2642,14 @@ impl App {
         }
     }
 
-    /// An engine that just landed becomes the engine in use: nobody installs a
-    /// voice in order to go on reading in silence.
-    fn adopt_engine(&mut self, engine: &str, ms: u64) {
+    /// Make a completed download visible without applying it to any scope.
+    fn finish_install(&mut self, engine: &str, ms: u64) {
         self.pin_program(engine);
-        self.silence();
-        self.speaker = None;
-        self.cfg.tts.engine = engine.to_string();
         let _ = self.cfg.save();
         let seconds = format!("{:.0}", ms as f64 / 1000.0);
-        // Through the mode, like every other way into read-aloud: an install
-        // that ended in speech nobody can hear because the output is muted is
-        // still worth saying out loud.
-        if self.set_mode(ReadMode::Speak) {
-            let label = self.speech_label();
-            self.system(&tf("install.done", &[&engine, &seconds, &label]));
+        self.notice(&tf("install.done", &[&engine, &seconds]));
+        if let Some(workspace) = self.voice_workspace.as_mut() {
+            workspace.reload(&self.cfg);
         }
     }
 
@@ -2363,57 +2680,9 @@ impl App {
         } else {
             path
         };
-        if let Some(spec) = self.cfg.tts.engines.get_mut(engine) {
+        if let Some(spec) = self.cfg.voice.engines.get_mut(engine) {
             spec.synth = spec.synth.replacen(&program, &path, 1);
         }
-    }
-
-    /// `/voice <name>` — engines name their voices differently, so this is free
-    /// text handed straight to the engine.
-    fn voice_command(&mut self, arg: &str) {
-        // "Which voice" is a question with a list for an answer, and the list is
-        // the only place `auto` is written down.
-        if arg.is_empty() {
-            self.open_select("voice");
-            return;
-        }
-        let known = self
-            .cfg
-            .active_engine()
-            .is_some_and(|spec| spec.languages.contains_key(arg));
-        let said = match arg {
-            // Back to letting the passage decide. Both settings are cleared,
-            // because a pinned voice would go on overruling the language.
-            "auto" => {
-                self.cfg.tts.voice.clear();
-                self.cfg.tts.language = "auto".to_string();
-                t("tts.voice_auto").to_string()
-            }
-            // A language readio has an entry for pins the language, not the
-            // voice: the voice that belongs to it is recorded beside it.
-            code if known => {
-                self.cfg.tts.voice.clear();
-                self.cfg.tts.language = code.to_string();
-                let voice = self
-                    .cfg
-                    .active_engine()
-                    .and_then(|spec| spec.languages.get(code))
-                    .map(|entry| entry.voice.clone())
-                    .unwrap_or_default();
-                tf(
-                    "tts.voice_language_set",
-                    &[&menu::language_name(code), &voice],
-                )
-            }
-            name => {
-                self.cfg.tts.voice = name.to_string();
-                tf("tts.voice_set", &[&name])
-            }
-        };
-        let _ = self.cfg.save();
-        self.silence();
-        self.speaker = None;
-        self.system(&said);
     }
 
     /// `/effort [minimal|low|medium|high|xhigh|max]`
@@ -2450,7 +2719,7 @@ impl App {
                 let times = effort::times(self.multiplier());
                 self.system(&tf("effort.tuned", &[&level.label(), &times]));
             }
-            _ => self.system(t("tts.usage_rate")),
+            _ => self.system(t("voice.usage_rate")),
         }
     }
 
@@ -2685,7 +2954,7 @@ impl App {
             .rev()
             .find(|i| text.is_char_boundary(*i))
             .unwrap_or(text.len());
-        let sentence = crate::tts::sentence::split(text)
+        let sentence = crate::voice::sentence::split(text)
             .into_iter()
             .map(|utterance| utterance.range)
             .find(|(from, to)| *from <= start && end <= *to)

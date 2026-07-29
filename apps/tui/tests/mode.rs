@@ -1,9 +1,7 @@
-//! The three reading modes: manual, auto-scroll and read-aloud.
+//! Auto-reading and Voice are independent TUI controls.
 //!
-//! Read-aloud cannot be entered here — there is no speech engine on a test
-//! machine, and readio ships none — so these tests cover the two modes that work
-//! without one, plus the promise that a mode is a setting rather than a
-//! side effect of pausing.
+//! These tests cover all four combinations and the promise that changing one
+//! never rewrites the other.
 
 mod common;
 
@@ -25,9 +23,18 @@ fn exclusive() -> std::sync::MutexGuard<'static, ()> {
 fn fixture() -> (App, Terminal<TestBackend>) {
     common::isolated_home();
     let mut config = readio::config::Config::load().0;
-    config.tts.enabled = false;
-    config.reading.auto = false;
+    config.reading.mode = Mode::Manual;
     config.reading.speed = 400.0;
+    config.voice.enabled = false;
+    config.voice.engine = "local".to_string();
+    config.voice.engines.insert(
+        "local".to_string(),
+        readio::voice::config::EngineSpec {
+            synth: "sh -c true".to_string(),
+            about: "test voice".to_string(),
+            ..Default::default()
+        },
+    );
     let _ = config.save();
     let book = Book::load(None).expect("sample book");
     let app = App::new(Library::ephemeral(), Store::ephemeral(), Some(book), None);
@@ -82,6 +89,66 @@ fn shift_tab(app: &mut App) {
         kind: KeyEventKind::Press,
         state: ratatui::crossterm::event::KeyEventState::NONE,
     });
+}
+
+fn ctrl_s(app: &mut App) {
+    app.on_key(KeyEvent {
+        code: KeyCode::Char('s'),
+        modifiers: KeyModifiers::CONTROL,
+        kind: KeyEventKind::Press,
+        state: ratatui::crossterm::event::KeyEventState::NONE,
+    });
+}
+
+#[test]
+fn starting_speech_does_not_leave_manual_reading() {
+    let _guard = exclusive();
+    let (mut app, mut terminal) = fixture();
+    settle(&mut app, &mut terminal);
+
+    ctrl_s(&mut app);
+
+    assert!(app.speech_enabled(), "Voice should be on");
+    assert_eq!(
+        app.mode(),
+        Mode::Manual,
+        "speech is independent from whether passages advance automatically"
+    );
+    let saved = readio::config::Config::load().0;
+    assert_eq!(saved.reading.mode, Mode::Manual);
+    assert!(saved.voice.enabled);
+}
+
+#[test]
+fn starting_and_stopping_speech_does_not_change_auto_reading() {
+    let _guard = exclusive();
+    let (mut app, mut terminal) = fixture();
+    settle(&mut app, &mut terminal);
+    type_line(&mut app, "/mode auto");
+
+    ctrl_s(&mut app);
+    assert!(app.speech_enabled());
+    assert_eq!(app.mode(), Mode::Auto);
+
+    ctrl_s(&mut app);
+    assert!(!app.speech_enabled());
+    assert_eq!(app.mode(), Mode::Auto);
+}
+
+#[test]
+fn changing_auto_reading_does_not_change_speech() {
+    let _guard = exclusive();
+    let (mut app, mut terminal) = fixture();
+    settle(&mut app, &mut terminal);
+    ctrl_s(&mut app);
+
+    shift_tab(&mut app);
+    assert_eq!(app.mode(), Mode::Auto);
+    assert!(app.speech_enabled());
+
+    shift_tab(&mut app);
+    assert_eq!(app.mode(), Mode::Manual);
+    assert!(app.speech_enabled());
 }
 
 #[test]
@@ -200,14 +267,60 @@ fn the_mode_survives_into_the_config_file() {
 
     type_line(&mut app, "/mode auto");
     draw(&mut app, &mut terminal, 3);
-    assert!(
-        readio::config::Config::load().0.reading.auto,
+    assert_eq!(
+        readio::config::Config::load().0.reading.mode,
+        Mode::Auto,
         "auto-scroll should still be on next time"
     );
 
     type_line(&mut app, "/mode manual");
     draw(&mut app, &mut terminal, 3);
-    assert!(!readio::config::Config::load().0.reading.auto);
+    assert_eq!(readio::config::Config::load().0.reading.mode, Mode::Manual);
+}
+
+/// The mode is a setting, so readio starts the way it was left. It used to be
+/// half a setting: read-aloud came back after a restart because `tts.enabled`
+/// was read on every frame, and auto-scroll did not, because nothing ever read
+/// `reading.auto` back — the same switch, remembered in one direction only.
+#[test]
+fn the_mode_comes_back_on_the_next_launch() {
+    let _guard = exclusive();
+    let (mut app, mut terminal) = fixture();
+    settle(&mut app, &mut terminal);
+
+    type_line(&mut app, "/mode auto");
+    draw(&mut app, &mut terminal, 3);
+
+    // A second launch against the same host directory, which is what restarting
+    // readio amounts to.
+    let book = Book::load(None).expect("sample book");
+    let restarted = App::new(Library::ephemeral(), Store::ephemeral(), Some(book), None);
+    assert_eq!(
+        restarted.mode(),
+        Mode::Auto,
+        "auto-scroll was a choice, not a mood"
+    );
+}
+
+/// Opening a book is not the reader changing their mind about how they read.
+/// This used to reset auto-scroll to manual while leaving read-aloud alone,
+/// because one lived on the app and the other in the config.
+#[test]
+fn opening_a_book_leaves_the_mode_alone() {
+    let _guard = exclusive();
+    let (mut app, mut terminal) = fixture();
+    settle(&mut app, &mut terminal);
+
+    type_line(&mut app, "/mode auto");
+    draw(&mut app, &mut terminal, 3);
+    type_line(&mut app, "/sample");
+    settle(&mut app, &mut terminal);
+
+    assert_eq!(
+        app.mode(),
+        Mode::Auto,
+        "the mode is not a property of a book"
+    );
 }
 
 #[test]
@@ -221,7 +334,7 @@ fn a_mode_nobody_can_spell_is_explained_not_ignored() {
 
     assert_eq!(app.mode(), Mode::Manual);
     assert!(
-        view.contains("/mode manual | auto | tts"),
+        view.contains("/mode manual | auto"),
         "expected the usage line:\n{view}"
     );
 }

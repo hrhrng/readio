@@ -100,7 +100,7 @@ pub fn duration_ms(path: &std::path::Path) -> Result<u64> {
     Ok(info(&bytes)?.ms())
 }
 
-/// Build a minimal WAV file of `ms` silence. Used by tests and `/tts test`
+/// Build a minimal WAV file of `ms` silence. Used by tests and `/voice test`
 /// fallbacks so playback paths can be exercised without a model.
 pub fn silence(ms: u64, sample_rate: u32) -> Vec<u8> {
     let frames = (sample_rate as u64 * ms / 1000) as u32;

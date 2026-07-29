@@ -4,3 +4,4 @@ pub mod image;
 pub mod menu;
 pub mod prompt;
 pub mod scrollback;
+pub mod voice;

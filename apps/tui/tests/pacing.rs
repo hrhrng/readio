@@ -28,7 +28,7 @@ use readio::app::App;
 use readio::book::Book;
 use readio::library::Library;
 use readio::store::Store;
-use readio::tts::config::EngineSpec;
+use readio::voice::config::EngineSpec;
 
 /// How long the stand-in engine pretends to spend synthesizing a sentence.
 ///
@@ -148,19 +148,17 @@ fn fixture(book_path: PathBuf) -> (App, Terminal<TestBackend>) {
 fn fixture_with(book_path: PathBuf, synth_ms: u64, clip_ms: u64) -> (App, Terminal<TestBackend>) {
     let home = common::isolated_home();
     let mut config = readio::config::Config::load().0;
-    // Read-aloud is entered below the way a reader enters it, with `/mode tts`,
-    // so the switch itself is part of what these tests cover.
-    config.tts.enabled = false;
-    config.tts.engine = "stand-in".to_string();
-    config.tts.voice.clear();
-    config.tts.prefetch = 2;
-    config.tts.output.allow.clear();
-    config.tts.engines.insert(
+    config.reading.mode = readio::mode::Mode::Manual;
+    config.voice.enabled = false;
+    config.voice.engine = "stand-in".to_string();
+    config.voice.name.clear();
+    config.voice.prefetch = 2;
+    config.voice.output.allow.clear();
+    config.voice.engines.insert(
         "stand-in".to_string(),
         stand_in_engine(home, synth_ms, clip_ms),
     );
     config.reading.speed = 46.0;
-    config.reading.auto = false;
     config.effort = readio::config::EffortConfig::default();
     let _ = config.save();
 
@@ -237,19 +235,17 @@ fn type_line(app: &mut App, line: &str) {
     app.on_key(KeyEvent::from(KeyCode::Enter));
 }
 
-/// Settle the opening turn, switch to read-aloud, and wait for book text to
-/// start streaming.
+/// Settle the opening turn, enable Voice without enabling auto-reading, ask for
+/// one passage, and wait for its text to start streaming.
 fn start_reading_aloud(app: &mut App, terminal: &mut Terminal<TestBackend>) {
     until(app, terminal, "the opening turn", |app| !app.turn.busy());
     type_line(app, "/mode tts");
+    assert_eq!(app.mode(), readio::mode::Mode::Manual);
+    assert!(app.speech_enabled(), "the stand-in voice should start");
+    app.on_key(KeyEvent::from(KeyCode::Enter));
     until(app, terminal, "the passage to start", |app| {
         shown(app).is_some()
     });
-    assert_eq!(
-        app.mode(),
-        readio::mode::Mode::Speak,
-        "the stand-in engine should have been good enough to switch"
-    );
 }
 
 /// Characters of the passage now on screen.
@@ -326,6 +322,7 @@ fn reading_carries_on_by_itself_when_the_voice_finishes_a_chapter() {
     let _guard = exclusive();
     let (mut app, mut terminal) = fixture(short_chapters(common::isolated_home()));
     start_reading_aloud(&mut app, &mut terminal);
+    type_line(&mut app, "/mode auto");
     let before = app.turn.session_chars;
 
     // A chapter is a heading and four sentences: five clips, thirty-four
@@ -340,6 +337,27 @@ fn reading_carries_on_by_itself_when_the_voice_finishes_a_chapter() {
         spoken > 36,
         "only {spoken} characters, which is the first chapter and no more: \
          reading stopped instead of carrying on into the next"
+    );
+}
+
+#[test]
+fn voice_alone_stops_after_the_requested_passage() {
+    let _guard = exclusive();
+    let (mut app, mut terminal) = fixture(short_chapters(common::isolated_home()));
+    start_reading_aloud(&mut app, &mut terminal);
+    let before = app.turn.session_chars;
+
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(8) {
+        tick(&mut app, &mut terminal);
+    }
+    let spoken = app.turn.session_chars - before;
+
+    assert_eq!(app.mode(), readio::mode::Mode::Manual);
+    assert!(app.speech_enabled());
+    assert!(
+        spoken <= 36,
+        "{spoken} characters crossed into another passage without auto-reading"
     );
 }
 
@@ -408,6 +426,7 @@ fn the_voice_does_not_fall_silent_between_turns() {
         LONG_CLIP_MS,
     );
     start_reading_aloud(&mut app, &mut terminal);
+    type_line(&mut app, "/mode auto");
     // The first clip of the session is the one nothing can cover; the question
     // here is about the boundaries after it.
     until(&mut app, &mut terminal, "the voice", |app| {
