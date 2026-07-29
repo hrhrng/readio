@@ -99,6 +99,58 @@ fn footprint(engine: &str) -> (u64, u64) {
     }
 }
 
+/// Human-facing catalog facts. These describe the model rather than its local
+/// state, so the Voice workspace can show them before anything is downloaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelProfile {
+    pub scale_zh: &'static str,
+    pub scale_en: &'static str,
+    pub language_zh: &'static str,
+    pub language_en: &'static str,
+    pub download_bytes: u64,
+}
+
+pub fn profile(engine: &str) -> Option<ModelProfile> {
+    let (download_bytes, _) = footprint(engine);
+    let (scale_zh, scale_en, language_zh, language_en) = match engine {
+        "moss" => ("120M 参数", "120M parameters", "中文", "Mandarin Chinese"),
+        "kokoro" => ("82M 参数", "82M parameters", "英语", "English"),
+        "qwen" => ("0.6B 参数", "0.6B parameters", "中文", "Mandarin Chinese"),
+        "piper" => (
+            "约 7–32M 参数",
+            "about 7–32M parameters",
+            "随音色（中文 / 英语）",
+            "voice-specific (Chinese / English)",
+        ),
+        "supertonic" => (
+            "99M 参数",
+            "99M parameters",
+            "多语言（偏英语）",
+            "multilingual (English strongest)",
+        ),
+        "espeak" => (
+            "非神经模型",
+            "non-neural",
+            "多语言（机械音）",
+            "multilingual (robotic)",
+        ),
+        "openai" | "server" => (
+            "远端服务",
+            "remote service",
+            "由服务配置",
+            "configured by the service",
+        ),
+        _ => return None,
+    };
+    Some(ModelProfile {
+        scale_zh,
+        scale_en,
+        language_zh,
+        language_en,
+        download_bytes,
+    })
+}
+
 /// Check the filesystem that holds readio's home before a download.
 ///
 /// `df -Pk` is available on both supported host families (macOS and Linux) and

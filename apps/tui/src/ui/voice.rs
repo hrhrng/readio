@@ -624,6 +624,42 @@ fn render_models(
             format!("  {detail}"),
             Style::default().fg(th.text_secondary),
         ));
+        if let Some(profile) = install::profile(name) {
+            lines.push(Line::styled(
+                format!(
+                    "  {} {}{}",
+                    tr("规模", "Scale"),
+                    tr(profile.scale_zh, profile.scale_en),
+                    if profile.download_bytes == 0 {
+                        String::new()
+                    } else {
+                        format!(
+                            " · {} {}",
+                            tr("下载约", "download about"),
+                            install::bytes(profile.download_bytes)
+                        )
+                    }
+                ),
+                Style::default().fg(th.text_secondary),
+            ));
+            lines.push(Line::styled(
+                format!(
+                    "  {} {}",
+                    tr("推荐语言", "Recommended language"),
+                    tr(profile.language_zh, profile.language_en)
+                ),
+                Style::default().fg(th.accent_model),
+            ));
+        } else {
+            lines.push(Line::styled(
+                format!(
+                    "  {} · {}",
+                    tr("规模 未声明", "Scale not declared"),
+                    tr("推荐语言 按配置", "Recommended language: configured")
+                ),
+                Style::default().fg(th.text_faint),
+            ));
+        }
         if workspace.confirm_install.as_deref() == Some(name.as_str()) {
             if let Some((_, space)) = workspace
                 .space_check

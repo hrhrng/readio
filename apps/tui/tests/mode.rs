@@ -1,7 +1,7 @@
-//! Auto-reading and Voice are independent TUI controls.
+//! Manual, auto-reading and read-aloud are three parallel TUI modes.
 //!
-//! These tests cover all four combinations and the promise that changing one
-//! never rewrites the other.
+//! Read-aloud is never an alias for auto: if its engine is slow or unavailable,
+//! tokens wait or the turn stops while the mode remains read-aloud.
 
 mod common;
 
@@ -35,6 +35,19 @@ fn fixture() -> (App, Terminal<TestBackend>) {
             ..Default::default()
         },
     );
+    let _ = config.save();
+    let book = Book::load(None).expect("sample book");
+    let app = App::new(Library::ephemeral(), Store::ephemeral(), Some(book), None);
+    let terminal = Terminal::new(TestBackend::new(96, 30)).expect("terminal");
+    (app, terminal)
+}
+
+fn fixture_without_voice() -> (App, Terminal<TestBackend>) {
+    common::isolated_home();
+    let mut config = readio::config::Config::load().0;
+    config.reading.mode = Mode::Manual;
+    config.voice.enabled = false;
+    config.voice.engine = "not-installed".to_string();
     let _ = config.save();
     let book = Book::load(None).expect("sample book");
     let app = App::new(Library::ephemeral(), Store::ephemeral(), Some(book), None);
@@ -101,7 +114,7 @@ fn ctrl_s(app: &mut App) {
 }
 
 #[test]
-fn starting_speech_does_not_leave_manual_reading() {
+fn ctrl_s_enters_read_aloud_and_returns_to_manual() {
     let _guard = exclusive();
     let (mut app, mut terminal) = fixture();
     settle(&mut app, &mut terminal);
@@ -109,18 +122,18 @@ fn starting_speech_does_not_leave_manual_reading() {
     ctrl_s(&mut app);
 
     assert!(app.speech_enabled(), "Voice should be on");
-    assert_eq!(
-        app.mode(),
-        Mode::Manual,
-        "speech is independent from whether passages advance automatically"
-    );
+    assert_eq!(app.mode(), Mode::Speak);
     let saved = readio::config::Config::load().0;
-    assert_eq!(saved.reading.mode, Mode::Manual);
+    assert_eq!(saved.reading.mode, Mode::Speak);
     assert!(saved.voice.enabled);
+
+    ctrl_s(&mut app);
+    assert_eq!(app.mode(), Mode::Manual);
+    assert!(!app.speech_enabled());
 }
 
 #[test]
-fn starting_and_stopping_speech_does_not_change_auto_reading() {
+fn ctrl_s_returns_to_auto_when_that_was_the_previous_mode() {
     let _guard = exclusive();
     let (mut app, mut terminal) = fixture();
     settle(&mut app, &mut terminal);
@@ -128,7 +141,7 @@ fn starting_and_stopping_speech_does_not_change_auto_reading() {
 
     ctrl_s(&mut app);
     assert!(app.speech_enabled());
-    assert_eq!(app.mode(), Mode::Auto);
+    assert_eq!(app.mode(), Mode::Speak);
 
     ctrl_s(&mut app);
     assert!(!app.speech_enabled());
@@ -136,19 +149,49 @@ fn starting_and_stopping_speech_does_not_change_auto_reading() {
 }
 
 #[test]
-fn changing_auto_reading_does_not_change_speech() {
+fn shift_tab_cycles_manual_auto_and_read_aloud() {
     let _guard = exclusive();
     let (mut app, mut terminal) = fixture();
     settle(&mut app, &mut terminal);
-    ctrl_s(&mut app);
-
     shift_tab(&mut app);
     assert_eq!(app.mode(), Mode::Auto);
+
+    shift_tab(&mut app);
+    assert_eq!(app.mode(), Mode::Speak);
     assert!(app.speech_enabled());
 
     shift_tab(&mut app);
     assert_eq!(app.mode(), Mode::Manual);
-    assert!(app.speech_enabled());
+    assert!(!app.speech_enabled());
+}
+
+#[test]
+fn unavailable_tts_stays_in_read_aloud_instead_of_falling_back() {
+    let _guard = exclusive();
+    let (mut app, mut terminal) = fixture_without_voice();
+    settle(&mut app, &mut terminal);
+
+    type_line(&mut app, "/mode aloud");
+    let view = draw(&mut app, &mut terminal, 2);
+
+    assert_eq!(
+        app.mode(),
+        Mode::Speak,
+        "an unavailable engine must stop read-aloud, never turn it into auto or manual"
+    );
+    assert!(
+        !app.turn.busy(),
+        "without a voice there is no clock allowed to release tokens"
+    );
+    assert!(
+        view.contains("朗读"),
+        "the mode chip should continue to say what the reader selected:\n{view}"
+    );
+    assert_eq!(
+        readio::config::Config::load().0.reading.mode,
+        Mode::Speak,
+        "the no-downgrade promise must survive restart"
+    );
 }
 
 #[test]
@@ -334,7 +377,7 @@ fn a_mode_nobody_can_spell_is_explained_not_ignored() {
 
     assert_eq!(app.mode(), Mode::Manual);
     assert!(
-        view.contains("/mode manual | auto"),
+        view.contains("/mode manual | auto | aloud"),
         "expected the usage line:\n{view}"
     );
 }
@@ -349,6 +392,10 @@ fn bare_mode_reports_where_things_stand() {
     let view = draw(&mut app, &mut terminal, 3);
 
     assert!(view.contains("手动"), "expected the mode named:\n{view}");
+    assert!(
+        view.contains("朗读"),
+        "the mode picker must keep read-aloud beside manual and auto:\n{view}"
+    );
     assert!(
         view.contains("shift+tab"),
         "expected the way to change it:\n{view}"

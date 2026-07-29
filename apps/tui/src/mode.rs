@@ -1,8 +1,9 @@
-//! The two ways readio advances through a book.
+//! The three parallel ways readio advances through a book.
 //!
-//! Manual/auto answers only whether the next passage arrives by itself.
-//! Read-aloud is an independent Voice switch: either continuation mode may be
-//! silent or spoken.
+//! Manual waits for the reader, auto reveals at the configured text pace, and
+//! read-aloud reveals at the voice's pace. Read-aloud is deliberately not an
+//! automatic fallback: if its TTS engine cannot keep up or cannot run, the text
+//! waits or stops in read-aloud rather than silently becoming auto.
 //!
 //! The costume matters too: a coding agent shows its mode as a chip near the
 //! prompt and cycles it with `shift+tab`, so readio does the same.
@@ -20,8 +21,8 @@ pub enum Mode {
     Manual,
     /// Passages keep coming at the configured reveal speed.
     Auto,
-    /// Legacy config spelling. Migrated to auto continuation plus Voice enabled
-    /// when the config loads; it is never a live TUI mode.
+    /// Read-aloud: the voice owns token pace and passages continue only while
+    /// that voice remains available.
     #[serde(rename = "aloud", alias = "tts", alias = "speak", alias = "voice")]
     Speak,
 }
@@ -31,14 +32,14 @@ impl Mode {
     pub fn next(self) -> Self {
         match self {
             Mode::Manual => Mode::Auto,
-            Mode::Auto => Mode::Manual,
+            Mode::Auto => Mode::Speak,
             Mode::Speak => Mode::Manual,
         }
     }
 
     /// Whether the text advances without being asked.
     pub fn scrolls(self) -> bool {
-        self == Mode::Auto
+        matches!(self, Mode::Auto | Mode::Speak)
     }
 
     /// Whether the voice is what sets the pace.
@@ -121,14 +122,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shift_tab_toggles_only_manual_and_auto() {
+    fn shift_tab_visits_all_three_parallel_modes() {
         let mut mode = Mode::Manual;
         let mut seen = vec![mode];
-        for _ in 0..2 {
+        for _ in 0..3 {
             mode = mode.next();
             seen.push(mode);
         }
-        assert_eq!(seen, vec![Mode::Manual, Mode::Auto, Mode::Manual]);
+        assert_eq!(
+            seen,
+            vec![Mode::Manual, Mode::Auto, Mode::Speak, Mode::Manual]
+        );
     }
 
     /// The mode is a value, not an arithmetic on two switches: whatever is
@@ -136,7 +140,7 @@ mod tests {
     /// older files used.
     #[test]
     fn a_mode_survives_the_round_trip_through_the_config_file() {
-        for mode in [Mode::Manual, Mode::Auto] {
+        for mode in [Mode::Manual, Mode::Auto, Mode::Speak] {
             let written = serde_yaml_ng::to_string(&mode).expect("write");
             let back: Mode = serde_yaml_ng::from_str(&written).expect("read");
             assert_eq!(back, mode, "wrote {written:?}");
@@ -174,7 +178,7 @@ mod tests {
         let before = crate::i18n::current();
         for lang in [crate::i18n::Lang::En, crate::i18n::Lang::Zh] {
             crate::i18n::set(lang);
-            for mode in [Mode::Manual, Mode::Auto] {
+            for mode in [Mode::Manual, Mode::Auto, Mode::Speak] {
                 let chip = chip(mode);
                 assert!(
                     crate::wrap::display_width(&chip) <= 12,

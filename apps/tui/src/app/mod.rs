@@ -63,10 +63,14 @@ pub struct App {
     notice: Option<(String, Instant)>,
     /// The next reading turn should explain that it restored progress.
     resumed: bool,
-    /// Whether passages advance manually or automatically.
+    /// Manual, automatic or read-aloud.
     mode: ReadMode,
-    /// Whether passages are spoken. Orthogonal to `mode`.
+    /// Whether the selected mode owns a live or retryable voice. This mirrors
+    /// `mode == Speak`; it remains true after an engine failure so no text can
+    /// escape on the automatic pacer.
     speech: bool,
+    /// Where the `^s` shortcut returns after leaving read-aloud.
+    spoke_from: ReadMode,
     /// How far into each library entry the reader is, for the book select.
     library_progress: Vec<f32>,
     /// Bookmarks of the open book, for the marks select.
@@ -240,7 +244,12 @@ impl App {
         // The pacer starts at the pace the effort level asks for, not the base.
         let paced = (cps * cfg.effort.multipliers.get(cfg.effort.level)).clamp(4.0, 4000.0);
         let mode = cfg.reading.mode;
-        let speech = cfg.voice.enabled;
+        let speech = mode.speaks();
+        let spoke_from = if mode == ReadMode::Speak {
+            ReadMode::Manual
+        } else {
+            mode
+        };
         let mut app = Self {
             sb: Scrollback::new(),
             prompt: Prompt::new(),
@@ -256,6 +265,7 @@ impl App {
             resumed: false,
             mode,
             speech,
+            spoke_from,
             library_progress: Vec::new(),
             marks: Vec::new(),
             base_cps: cps,
@@ -301,17 +311,20 @@ impl App {
         app
     }
 
-    /// Restore Voice independently from the continuation mode.
+    /// Restore read-aloud without ever replacing it with auto.
     fn restore_speech(&mut self) {
         if !self.speech {
             return;
         }
-        if self.start_speaker() {
+        if self.start_speaker() && self.audio_permitted() {
             return;
         }
-        self.speech = false;
-        self.cfg.voice.enabled = false;
-        let _ = self.cfg.save();
+        // The chosen mode remains visible and persisted. With no voice there is
+        // no clock allowed to reveal the text, so hold the turn where it is.
+        if !self.audio_permitted() {
+            self.report_audio_block();
+        }
+        self.stop_reading();
     }
 
     // ── book lifecycle ───────────────────────────────────────────────────────
@@ -437,6 +450,11 @@ impl App {
             self.notice = None;
         }
 
+        // Resolve an output-device change before the turn gets even one frame
+        // to advance. A blocked read-aloud turn must stop; pumping first would
+        // reveal tokens at the text clock and become a one-frame Auto fallback.
+        self.poll_audio_device();
+
         // Whether the next passage is going to be spoken, refreshed every frame
         // so it can never be stale: a passage held for a voice that is not
         // coming would simply never appear.
@@ -446,7 +464,6 @@ impl App {
             self.mark_match(id, &text);
             self.enqueue_speech(id, &text);
         }
-        self.poll_audio_device();
         self.pump_speech();
         self.pump_install();
         self.advance_cursor();
@@ -569,8 +586,14 @@ impl App {
                 }
             }
             Verdict::Blocked { .. } | Verdict::Unknown { .. } => {
-                self.silence();
-                self.report_audio_block();
+                if !self.audio_permitted() {
+                    self.report_audio_block();
+                    if self.speech {
+                        self.stop_reading();
+                    } else {
+                        self.silence();
+                    }
+                }
             }
             Verdict::Pending => {}
         }
@@ -709,6 +732,10 @@ impl App {
                 self.gate = Some(gate);
             }
         }
+        if self.speech && !self.audio_permitted() {
+            self.report_audio_block();
+            self.stop_reading();
+        }
     }
 
     /// The output list, with the current device and the whitelist marked.
@@ -782,18 +809,25 @@ impl App {
         let _ = self.cfg.save();
         self.apply_pace();
 
-        let resume = self
-            .cursor
-            .as_ref()
-            .map(|cursor| cursor.sentence.0)
-            .filter(|_| self.speech);
+        let resume = if self.speech {
+            self.cursor
+                .as_ref()
+                .map(|cursor| cursor.sentence.0)
+                .or_else(|| {
+                    self.turn
+                        .passage_in_flight()
+                        .map(|(_, text, released)| char_to_byte(text, released))
+                })
+        } else {
+            None
+        };
         let voiced = self.voiced.clone();
         self.silence();
         self.speaker = None;
         if let (Some(from), Some((id, text))) = (resume, voiced)
             && !self.enqueue_speech_from(id, &text, from)
         {
-            self.turn.hold_reveal(None);
+            self.stop_reading();
         }
 
         let times = effort::times(self.multiplier());
@@ -1022,16 +1056,12 @@ impl App {
 
     /// Read-aloud lost its voice: stop, and say so.
     ///
-    /// There is deliberately no silent fallback here. Voice owns the token
-    /// reveal pace while it is enabled, independently of manual/auto
-    /// continuation. If it fails, the reveal stops where the voice stopped,
-    /// Voice turns off, and the continuation mode stays exactly as the reader
-    /// chose it. ^s explicitly retries Voice after the engine is fixed.
+    /// There is deliberately no silent fallback here. Read-aloud owns the token
+    /// reveal pace. If the engine fails, the reveal stops where the voice
+    /// stopped and the mode remains read-aloud until the reader explicitly
+    /// changes it.
     fn lose_the_voice(&mut self, why: &str) {
         self.notice(&tf("voice.stopped", &[&why]));
-        self.speech = false;
-        self.cfg.voice.enabled = false;
-        let _ = self.cfg.save();
         self.stop_reading();
     }
 
@@ -1213,9 +1243,13 @@ impl App {
         }
     }
 
-    /// `^s`: toggle Voice without changing manual/auto continuation.
+    /// `^s`: a shortcut into read-aloud, then back to the previous mode.
     fn toggle_speech(&mut self) {
-        self.set_speech(!self.speech);
+        if self.mode == ReadMode::Speak {
+            self.set_mode(self.spoke_from);
+        } else {
+            self.set_mode(ReadMode::Speak);
+        }
     }
 
     /// Stop the current clip and forget everything queued.
@@ -1434,7 +1468,7 @@ impl App {
             (KeyCode::Up, _) if self.menu_open() => self.menu_step(-1),
             (KeyCode::Down, _) if self.menu_open() => self.menu_step(1),
             (KeyCode::Tab, _) if self.menu_open() => self.menu_complete(),
-            // shift+tab toggles manual/auto continuation. crossterm reports it as
+            // shift+tab cycles all three modes. crossterm reports it as
             // BackTab, but some terminals send a plain shifted tab instead.
             (KeyCode::BackTab, _) => self.cycle_mode(),
             (KeyCode::Tab, _) if key.modifiers.contains(KeyModifiers::SHIFT) => self.cycle_mode(),
@@ -1769,41 +1803,80 @@ impl App {
         if !self.turn.paused() {
             return;
         }
+        let passage = self
+            .turn
+            .passage_in_flight()
+            .map(|(id, text, released)| (id, text.to_string(), released));
         self.turn.resume();
-        let voiced = self.voiced.clone();
-        let from = self.cursor.as_ref().map(|cursor| cursor.sentence.0);
         if self.speech
-            && let (Some(from), Some((id, text))) = (from, voiced)
+            && let Some((id, text, released)) = passage
         {
-            self.enqueue_speech_from(id, &text, from);
+            let from = char_to_byte(&text, released);
+            self.turn.hold_reveal(Some(released));
+            if !self.enqueue_speech_from(id, &text, from) {
+                self.stop_reading();
+            }
         }
     }
 
-    // ── continuation and Voice ───────────────────────────────────────────────
+    // ── reading mode ─────────────────────────────────────────────────────────
 
-    /// Whether the next passage advances manually or automatically.
+    /// Manual, auto or read-aloud.
     pub fn mode(&self) -> ReadMode {
         self.mode
     }
 
-    /// Whether Voice is independently enabled.
+    /// Whether read-aloud is the selected mode.
     pub fn speech_enabled(&self) -> bool {
-        self.speech
+        self.mode == ReadMode::Speak
     }
 
-    /// `shift+tab`: toggle manual/auto continuation only.
+    /// `shift+tab`: cycle the three parallel modes.
     fn cycle_mode(&mut self) {
         self.set_mode(self.mode.next());
     }
 
-    /// Move to a continuation mode, leaving Voice untouched.
+    /// Move to one of the three modes.
+    ///
+    /// Entering read-aloud commits the mode before touching the engine. A
+    /// missing, slow or failed engine may stop progress, but it can never turn
+    /// the selection into auto and let tokens run ahead in silence.
     fn set_mode(&mut self, want: ReadMode) -> bool {
-        if want == ReadMode::Speak {
-            return self.set_speech(true);
+        let leaving_speech = self.mode == ReadMode::Speak && want != ReadMode::Speak;
+        if want == ReadMode::Speak && self.mode != ReadMode::Speak {
+            self.spoke_from = self.mode;
+        }
+        if leaving_speech {
+            self.speech = false;
+            self.silence();
         }
         self.mode = want;
+        self.speech = want.speaks();
         self.cfg.reading.mode = want;
+        self.cfg.voice.enabled = want.speaks();
         let _ = self.cfg.save();
+
+        if want == ReadMode::Speak {
+            self.rushing = false;
+            if !self.start_speaker() {
+                self.stop_reading();
+                return false;
+            }
+            if !self.audio_permitted() {
+                self.report_audio_block();
+                self.stop_reading();
+                return false;
+            }
+            if let Some((id, text, released)) = self.turn.passage_in_flight() {
+                let text = text.to_string();
+                let from = char_to_byte(&text, released);
+                self.turn.hold_reveal(Some(released));
+                if !self.enqueue_speech_from(id, &text, from) {
+                    self.stop_reading();
+                    return false;
+                }
+            }
+        }
 
         // A flash, not a paragraph: `/mode` opens a select whose detail panel
         // explains each mode in full, so the switch itself only has to say which
@@ -1815,7 +1888,7 @@ impl App {
                 want.name(),
                 crate::metrics::rate_label(self.reveal_cps())
             ),
-            ReadMode::Speak => unreachable!("legacy mode is handled above"),
+            ReadMode::Speak => format!("{}  ·  {}", want.name(), effort::times(self.multiplier())),
         };
         self.notice(&flash);
 
@@ -1827,45 +1900,16 @@ impl App {
         true
     }
 
-    /// Enable or disable Voice while preserving manual/auto continuation.
+    /// Compatibility entry point for commands that historically said Voice
+    /// on/off. The actual state is the read-aloud mode.
     fn set_speech(&mut self, enabled: bool) -> bool {
-        if enabled == self.speech {
-            return true;
+        if enabled {
+            self.set_mode(ReadMode::Speak)
+        } else if self.mode == ReadMode::Speak {
+            self.set_mode(self.spoke_from)
+        } else {
+            true
         }
-        if !enabled {
-            self.speech = false;
-            self.cfg.voice.enabled = false;
-            self.silence();
-            let _ = self.cfg.save();
-            self.notice(t("voice.off"));
-            return true;
-        }
-
-        self.rushing = false;
-        self.speech = true;
-        if !self.start_speaker() {
-            self.speech = false;
-            self.notice(t("mode.aloud_unavailable"));
-            return false;
-        }
-        if !self.audio_permitted() {
-            self.report_audio_block();
-        }
-        if let Some((id, text, released)) = self.turn.passage_in_flight() {
-            let text = text.to_string();
-            let from = text
-                .char_indices()
-                .nth(released)
-                .map_or(text.len(), |(at, _)| at);
-            self.turn.hold_reveal(Some(released));
-            if !self.enqueue_speech_from(id, &text, from) {
-                self.turn.hold_reveal(None);
-            }
-        }
-        self.cfg.voice.enabled = true;
-        let _ = self.cfg.save();
-        self.notice(&tf("voice.on", &[&self.speech_label()]));
-        true
     }
 
     /// `↓` and the wheel: scroll, unless the reader is already at the bottom in
@@ -2158,7 +2202,9 @@ impl App {
                     None => self.system(t("mode.usage")),
                 },
             },
-            // `/auto` remains the continuation toggle: it never changes Voice.
+            // `/auto` is the explicit Auto/Manual shortcut. From Read-aloud it
+            // deliberately chooses Auto; only failures are forbidden from
+            // making that decision on the reader's behalf.
             "auto" => {
                 let want = if self.mode() == ReadMode::Auto {
                     ReadMode::Manual
@@ -2219,8 +2265,8 @@ impl App {
     /// config | everywhere | default]`
     ///
     /// Everything about who reads is chosen with one command: an engine, voice,
-    /// language, parameters and scope. Voice on/off is independent from the
-    /// manual/auto continuation mode.
+    /// language, parameters and scope. Entering read-aloud is a separate mode
+    /// choice made with `/mode aloud`, shift+tab or ^s.
     ///
     /// While a book is open the choice is written against that book; in the
     /// library, where there is no book to attach it to, it is the default for
@@ -2398,8 +2444,15 @@ impl App {
 
     /// Everything queued was rendered by the engine that is being replaced.
     fn restart_voice(&mut self) {
-        self.silence();
-        self.speaker = None;
+        if self.speech && self.turn.busy() {
+            // Replacing the clock halfway through a passage cannot be allowed
+            // to expose that passage to the text pacer. Keep Read-aloud
+            // selected, stop here, and let Enter start with the new config.
+            self.stop_reading();
+        } else {
+            self.silence();
+            self.speaker = None;
+        }
     }
 
     /// Compatibility spelling for returning to the model preset's defaults.
@@ -3146,6 +3199,13 @@ fn quoted(name: &str) -> String {
     } else {
         name.to_string()
     }
+}
+
+/// Convert the turn's character count into the byte offset sentence ranges use.
+fn char_to_byte(text: &str, chars: usize) -> usize {
+    text.char_indices()
+        .nth(chars)
+        .map_or(text.len(), |(at, _)| at)
 }
 
 pub fn expand_tilde(path: &str) -> PathBuf {

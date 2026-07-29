@@ -39,8 +39,8 @@ download actions whose size or destination is disclosed only after they start.
 4. Prefer honest system state over optimistic labels.
 5. Make every persistent choice easy to inspect, replace, or return to default.
 6. Keep acquiring a model separate from configuring how and where it is used.
-7. Keep Voice independent from automatic continuation: Voice paces tokens;
-   auto-reading alone decides whether another passage is requested.
+7. Keep Read-aloud distinct from Auto: TTS is a hard token clock. Slow speech
+   makes tokens wait; unavailable or failed speech stops without falling back.
 
 ## Accessibility & Inclusion
 

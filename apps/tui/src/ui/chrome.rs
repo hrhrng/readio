@@ -29,7 +29,7 @@ pub struct Chrome<'a> {
     /// whitelist. Shown wherever the engine name would be, because a silent
     /// mute is indistinguishable from a broken engine.
     pub audio_muted: bool,
-    /// Manual/auto continuation, shown as the chip `shift+tab` toggles.
+    /// Manual, auto or read-aloud, shown as the chip `shift+tab` cycles.
     pub mode: crate::mode::Mode,
     /// Reading pace, shown where a coding agent shows reasoning effort: beside the
     /// model name.
@@ -308,15 +308,15 @@ const HELP: &[(&str, &str, &str)] = &[
     ("esc", "中断这一轮，位置留在原处；回车接着读", "interrupt the turn, keeping your place; ⏎ carries on"),
     ("空格 space", "停下 / 接着读，跟播放器一个意思（输入框是空的时候）",
         "stop or carry on, the way it works in a player (when the line is empty)"),
-    ("shift+tab", "切换手动 / 自动阅读（不影响朗读）",
-        "toggle manual / auto-reading (Voice is unchanged)"),
+    ("shift+tab", "循环手动 / 自动 / 朗读模式",
+        "cycle manual / auto / read-aloud"),
     ("↑ ↓ / 滚轮 wheel", "滚动；手动模式下滚到底会载入下一段",
         "scroll; in manual mode, at the bottom it loads more"),
     ("pgup pgdn / home end", "翻页；到顶 / 到底", "by page; to the top / to the tail"),
     ("^p ^n", "翻输入历史", "input history"),
     ("^t", "展开/折叠思考过程", "fold or unfold reasoning"),
     ("^o", "展开/折叠工具调用", "fold or unfold tool calls"),
-    ("^s", "开关朗读", "toggle read-aloud"),
+    ("^s", "进入朗读 / 返回之前模式", "enter read-aloud / return to the previous mode"),
     ("^r", "推理强度下一档，也就是读快一点/慢一点", "next reasoning effort: read faster or slower"),
     ("^l", "清屏", "clear the screen"),
     ("^c ^d", "退出；正在输出时 ^c 先把这一轮丢掉（esc 只是中断，还能接着读）",
@@ -334,8 +334,8 @@ const HELP: &[(&str, &str, &str)] = &[
     ("/next /prev", "下一章 / 上一章", "next / previous chapter"),
     ("/find <term>", "全书检索；输序号跳到那一处", "search the book; type a number to jump"),
     ("^g ^b", "下一处 / 上一处命中", "next / previous hit"),
-    ("/mode [manual|auto]", "手动 / 自动阅读；shift+tab 也能切",
-        "manual / auto-reading; shift+tab toggles too"),
+    ("/mode [manual|auto|aloud]", "手动 / 自动 / 朗读；shift+tab 循环",
+        "manual / auto / read-aloud; shift+tab cycles"),
     ("/plan", "章节清单", "chapters as a plan"),
     ("/context", "阅读上下文", "context window readout"),
     ("/progress", "进度摘要", "one-line progress"),

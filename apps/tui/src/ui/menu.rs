@@ -490,7 +490,7 @@ fn effort_rows(ctx: &Ctx<'_>) -> Vec<Row> {
 }
 
 fn mode_rows(ctx: &Ctx<'_>) -> Vec<Row> {
-    [Mode::Manual, Mode::Auto]
+    [Mode::Manual, Mode::Auto, Mode::Speak]
         .iter()
         .map(|mode| {
             value(
@@ -499,13 +499,13 @@ fn mode_rows(ctx: &Ctx<'_>) -> Vec<Row> {
                 t(match mode {
                     Mode::Manual => "mode.row_manual",
                     Mode::Auto => "mode.row_auto",
-                    Mode::Speak => unreachable!("Voice is not a continuation mode"),
+                    Mode::Speak => "mode.row_aloud",
                 })
                 .to_string(),
                 t(match mode {
                     Mode::Manual => "mode.set_manual",
                     Mode::Auto => "mode.row_auto_more",
-                    Mode::Speak => unreachable!("Voice is not a continuation mode"),
+                    Mode::Speak => "mode.row_aloud_more",
                 })
                 .to_string(),
                 *mode == ctx.mode,
@@ -543,8 +543,8 @@ fn lang_rows(ctx: &Ctx<'_>) -> Vec<Row> {
 /// has not got; then the scope, then the two things one does to a voice already
 /// chosen.
 ///
-/// Voice configuration and its on/off switch are independent from whether the
-/// next passage advances automatically.
+/// Voice configuration is separate from choosing read-aloud as the current
+/// reading mode.
 fn voice_rows(_ctx: &Ctx<'_>) -> Vec<Row> {
     vec![value(
         t("voice.workspace"),
@@ -855,12 +855,12 @@ pub static COMMANDS: &[Command] = &[
         example: "/unmark 2",
     },
     Command {
-        name: "mode", args: "[manual|auto]",
-        zh: "自动阅读：手动或连续取下一段",
-        en: "Auto-reading: manual or continuous",
-        zh_more: "手动是你说一段算一段：回车或滚到底按 ↓ 载入下一段。auto 会在一段结束后继续取下一段。shift+tab 只切这两种；朗读由 ^s 独立开关。",
-        en_more: "Manual waits for ⏎ or ↓ at the bottom. Auto requests the next passage when one ends. shift+tab only toggles these two; ^s controls Voice independently.",
-        example: "/mode auto",
+        name: "mode", args: "[manual|auto|aloud]",
+        zh: "阅读模式：手动、自动或朗读",
+        en: "Reading mode: manual, auto or read-aloud",
+        zh_more: "三个模式并列。手动等你载入下一段；自动按文字速度连续滚动；朗读由 TTS 定速，声音慢就等，声音不可用就停，绝不降级成自动。shift+tab 循环，^s 直达/退出朗读。",
+        en_more: "Three parallel modes. Manual waits, auto continues at text pace, and read-aloud follows TTS. A slow voice is waited for; an unavailable voice stops instead of falling back to auto. shift+tab cycles and ^s enters/leaves read-aloud.",
+        example: "/mode aloud",
     },
     Command {
         name: "auto", args: "",
@@ -1233,8 +1233,9 @@ mod tests {
         let ctx = ctx!(&cfg);
 
         let modes = offer("/mode ", &ctx);
-        assert_eq!(modes.len(), 2);
+        assert_eq!(modes.len(), 3);
         assert!(modes[0].label.contains("active"), "manual is the default");
+        assert!(modes.iter().any(|row| row.insert == "/mode aloud"));
 
         let langs = offer("/lang ", &ctx);
         assert_eq!(langs.len(), 2);

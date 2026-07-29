@@ -95,25 +95,25 @@ Progress is cumulative characters over the whole book, the model most readers us
 
 The cover, when a book declares one — EPUB 3's `properties="cover-image"` or EPUB 2's `<meta name="cover">` — is shown when the book is opened, not when it is resumed. A picture that reappears every time the reader presses enter on their history is furniture.
 
-## Continuation and Voice
+## Reading modes
 
-Two independent controls describe reading:
+Reading has three parallel, persistent modes:
 
-| Control | Values | What it decides |
+| Mode | Control | What it does |
 | --- | --- | --- |
-| Auto-reading | manual / auto | whether finishing one passage requests the next |
-| Voice | off / on | whether the current passage is spoken and its tokens follow the configured voice speed |
+| Manual | `shift+tab`, `/mode manual` | waits for the reader to request the next passage |
+| Auto | `shift+tab`, `/mode auto` | requests passages continuously and reveals them at the configured text pace |
+| Read-aloud | `shift+tab`, `/mode aloud`, `^s` | requests passages continuously, but makes TTS the token clock |
 
-`shift+tab` toggles manual/auto continuation; `^s` toggles Voice. Any combination
-is valid. Manual + Voice reads the requested passage and stops. Auto + Voice
-continues into the next passage. Changing either control never changes the other.
-Both survive a restart as `reading.mode` and `voice.enabled`.
+`shift+tab` cycles Manual → Auto → Read-aloud. `^s` is a shortcut into
+Read-aloud and returns to the previous mode when pressed again. The one mode is
+stored as `reading.mode`; Voice is not a second on/off state.
 
 Three smaller rules came out of using it:
 
 - **Continuation is a setting, not a consequence.** `esc` interrupts the turn and `⏎` picks it back up, but neither demotes auto-reading to manual. Opening a book does not demote it either.
 - **In manual mode the bottom of the page loads more.** `↓`, `pgdn` and the wheel scroll as usual until there is nothing below, and then they fetch the next passage, the way reaching the end of a list loads the next page.
-- **Voice owns token pace, not continuation.** While a clip is spoken, tokens cannot outrun it; when the passage ends, only auto-reading may request another.
+- **Read-aloud has no automatic fallback.** While a clip is spoken, tokens cannot outrun it. Slow synthesis makes the tokens wait. If TTS is missing or fails, reading stops in Read-aloud mode until the reader retries or explicitly chooses another mode; it never becomes Auto.
 
 ## Pace, as reasoning effort
 
@@ -178,7 +178,7 @@ They live in `state.json` beside the reading position, stored as character offse
 ## Read-aloud
 
 readio ships no model and selects no engine in a fresh config. `/voice` opens
-one workspace with two independent panes: the model library downloads and
+one workspace with two separate panes: the model library downloads and
 validates files; Voice configuration assigns an already available model,
 voice, language and supported parameters to either the global scope or one
 explicitly selected book. Downloading never changes configuration. The
@@ -189,15 +189,15 @@ The binary invokes an engine you installed through a command template, which
 is why it stays small and why a better model next month is a config edit rather
 than a release. The built-in presets are:
 
-| Engine | Size · licence | Why it is here |
+| Engine | Scale · licence | Recommended language · why it is here |
 | --- | --- | --- |
-| `moss` | 100M · Apache-2.0 | recommended Mandarin audiobook voice; Apple Silicon, resident |
-| `kokoro` | 82M · Apache-2.0 | recommended English voice (`af_heart`), resident |
-| `qwen` | 0.6B · Apache-2.0 | optional Mandarin alternative; larger and stiffer |
-| `espeak` | ~4M · GPL-3.0 | instant and robotic; one `brew`/`apt` package, no download |
-| `piper` | ~15M · GPL-3.0 | fastest neural voice to first sound; text on stdin |
-| `supertonic` | 99M · MIT | pure ONNX, no torch, 31 languages |
-| `openai` | — | any OpenAI-compatible `/v1/audio/speech` endpoint |
+| `moss` | 120M · Apache-2.0 | Mandarin Chinese; recommended audiobook voice, Apple Silicon, resident |
+| `kokoro` | 82M · Apache-2.0 | English; recommended `af_heart` voice, resident |
+| `qwen` | 0.6B · Apache-2.0 | Mandarin Chinese; optional alternative, larger and stiffer |
+| `espeak` | non-neural · GPL-3.0 | multilingual; instant and robotic, one system package |
+| `piper` | ~7–32M · GPL-3.0 | voice-specific Chinese or English; fastest neural voice to first sound |
+| `supertonic` | 99M · MIT | multilingual, English strongest; pure ONNX, no torch |
+| `openai` | remote service | configured by the service; any compatible `/v1/audio/speech` endpoint |
 
 MOSS-TTS-Nano is 100M parameters plus its 20M audio tokenizer: the MLX files
 occupy about 318 MB. On the development M-series machine it generated 9.68
@@ -269,9 +269,9 @@ list. Model availability and Voice configuration are two different decisions,
 but putting their panes beside each other makes the dependency visible without
 coupling their actions. `/tts` remains an alias for opening the same workspace.
 
-Voice on/off is independent from this workspace: `^s` toggles it without
-changing manual/auto continuation. The workspace decides which available model
-and parameters Voice uses:
+The workspace decides which available model and parameters Read-aloud uses; it
+does not change the reading mode. Use `shift+tab`, `/mode aloud`, or `^s` to
+enter Read-aloud:
 
 ```
  Voice
@@ -382,7 +382,7 @@ voice:
     on_mismatch: silence              # silence (default) | play, which reads on with a warning
 ```
 
-Muting is always explained, because silence without explanation is indistinguishable from a broken engine. The notice names the current device, names the allowlist, and offers the three ways out — `/device allow <name>` to add it, `/device any` to stop restricting, `/device` to list everything. Changes take effect at once and are written back to the config file; speech resumes by itself when an allowed device returns.
+Muting is always explained, because silence without explanation is indistinguishable from a broken engine. The notice names the current device, names the allowlist, and offers the three ways out — `/device allow <name>` to add it, `/device any` to stop restricting, `/device` to list everything. Changes take effect at once and are written back to the config file. A blocked device stops the turn without changing Read-aloud into Auto; when an allowed device returns, press enter to retry.
 
 Two rules are worth stating because they are easy to get backwards. A device that cannot be identified counts as not allowed: better silent than audible in the wrong room. And probing never happens on the UI thread — asking macOS for the current output device takes about 200 ms, six frames' worth, so it runs in the background and the interface reads a cache.
 
@@ -394,7 +394,7 @@ One file, `~/.readio/config.yaml`, written with bilingual comments on first run.
 language: en              # en or zh
 reading:
   speed: 46               # characters per second at effort high; the multiplier scales it
-  mode: manual            # manual | auto; shift+tab toggles continuation
+  mode: manual            # manual | auto | aloud; shift+tab cycles all three
 effort:
   level: high             # minimal | low | medium | high | xhigh | max
   multipliers:            # more effort reads more slowly; /rate retunes one
@@ -408,7 +408,6 @@ images:
   enabled: true
   max_rows: 16            # tallest an illustration may be drawn
 voice:
-  enabled: false          # ^s toggles Voice; independent from reading.mode
   engine: moss
   name: audiobook         # a voice the downloaded model knows
   language: zh            # explicit; text never switches it per sentence
@@ -447,18 +446,18 @@ The host directory:
 | `⏎` | load the next passage; in the library, open the last book |
 | `⏎` while streaming | rush this turn to its end |
 | `esc` | interrupt the turn, keeping your place; `⏎` carries on |
-| `shift+tab` | toggle manual / auto-reading |
+| `shift+tab` | cycle Manual → Auto → Read-aloud |
 | `/` | the command menu: `↑ ↓` to choose, `tab` completes, `⏎` runs |
 | `↑ ↓`, wheel, `pgup` `pgdn`, `home` `end` | scroll; at the bottom in manual mode, load more |
 | `^t` · `^o` | fold reasoning · tool calls |
-| `^s` · `^r` | Voice on or off · next reasoning effort |
+| `^s` · `^r` | enter Read-aloud / return to the previous mode · next reasoning effort |
 | `^g` · `^b` | next · previous search hit |
 | `^p` `^n` · `^l` · `^c` `^d` | input history · clear the screen · discard the turn, then quit |
 
 | Area | Commands |
 | --- | --- |
 | Library | `/lib` `/open <n>` `/import <path> [--copy\|--link\|--move]` `/forget <n>` `/sample` |
-| Reading | `/mode [manual\|auto]` `/effort [level]` `/toc` `/goto <n>` `/next` `/prev` `/find <term>` `/auto` `/plan` `/context` `/progress` `/speed <n>` |
+| Reading | `/mode [manual\|auto\|aloud]` `/effort [level]` `/toc` `/goto <n>` `/next` `/prev` `/find <term>` `/auto` `/plan` `/context` `/progress` `/speed <n>` |
 | Bookmarks | `/mark [note]` `/marks [n]` `/unmark <n>` |
 | Read-aloud | `/voice` `/rate <0.5-3.0>` `/device` |
 | Interface | `/lang en\|zh` `/help` `/quit` |
@@ -470,13 +469,13 @@ The host directory:
 ```sh
 cargo test          # wrapping, pacing, parsing, import modes, reading, whole frames,
                     # illustrations, read-aloud, the device allowlist, search and jumps,
-                    # chapter shape, emphasis, bookmarks, independent Voice/auto, effort levels
+                    # chapter shape, emphasis, bookmarks, three reading modes, effort levels
 ```
 
 - `tests/render.rs` draws a real `App` through ratatui's `TestBackend` and asserts on the screen, so "is the library offered", "did typing 2 open the second book", "does esc interrupt without discarding" and "does `^c` discard" all have regression cover.
 - `tests/select.rs` pins the two rules the select lives by: it keeps its narrowing text out of the composer, a `/` always escapes it into a command, a filter that would empty the list is refused, choosing a row records the result rather than the command, and a bare `/import` opens the filesystem at `~/` and walks into directories.
 - `tests/effort.rs` holds the pace honest: `^r` walks the ladder and the pacer slows with it, a level names what it is worth, `/rate` retunes only the level in force and writes it back, and `/speed` moves the base the multiplier scales.
-- `tests/mode.rs` verifies that `shift+tab` changes only manual/auto continuation and `^s` changes only Voice, including persistence of both independent settings.
+- `tests/mode.rs` verifies the three-mode `shift+tab` cycle, the `^s` shortcut back to the previous mode, persistence, and that unavailable TTS stops in Read-aloud without falling back to Auto.
 - `tests/find.rs` walks search → jump by number → the term deeply washed, asserts the counts are true counts, that `^g` says so when it wraps, and that `^g` with no search points back at `/find`.
 - `tests/library.rs` covers the filesystem consequences of each import mode, that a second import of the same book adds no second entry, and that `/forget` never deletes a file the reader owns.
 - `tests/audio_device.rs` runs the allowlist end to end — blocked, warned, `/device allow`, restored — while `src/voice/device.rs` simulates sleeping headphones through an injected probe and asserts the decision flips once rather than every frame.

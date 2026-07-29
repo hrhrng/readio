@@ -146,6 +146,15 @@ fn fixture(book_path: PathBuf) -> (App, Terminal<TestBackend>) {
 
 /// The same, with the engine's timing chosen: slow to render, or slow to speak.
 fn fixture_with(book_path: PathBuf, synth_ms: u64, clip_ms: u64) -> (App, Terminal<TestBackend>) {
+    fixture_with_query(book_path, synth_ms, clip_ms, "")
+}
+
+fn fixture_with_query(
+    book_path: PathBuf,
+    synth_ms: u64,
+    clip_ms: u64,
+    output_query: &str,
+) -> (App, Terminal<TestBackend>) {
     let home = common::isolated_home();
     let mut config = readio::config::Config::load().0;
     config.reading.mode = readio::mode::Mode::Manual;
@@ -154,6 +163,7 @@ fn fixture_with(book_path: PathBuf, synth_ms: u64, clip_ms: u64) -> (App, Termin
     config.voice.name.clear();
     config.voice.prefetch = 2;
     config.voice.output.allow.clear();
+    config.voice.output.query = output_query.to_string();
     config.voice.engines.insert(
         "stand-in".to_string(),
         stand_in_engine(home, synth_ms, clip_ms),
@@ -235,14 +245,13 @@ fn type_line(app: &mut App, line: &str) {
     app.on_key(KeyEvent::from(KeyCode::Enter));
 }
 
-/// Settle the opening turn, enable Voice without enabling auto-reading, ask for
-/// one passage, and wait for its text to start streaming.
+/// Settle the opening turn, enter read-aloud, and wait for its text to start
+/// streaming.
 fn start_reading_aloud(app: &mut App, terminal: &mut Terminal<TestBackend>) {
     until(app, terminal, "the opening turn", |app| !app.turn.busy());
     type_line(app, "/mode tts");
-    assert_eq!(app.mode(), readio::mode::Mode::Manual);
+    assert_eq!(app.mode(), readio::mode::Mode::Speak);
     assert!(app.speech_enabled(), "the stand-in voice should start");
-    app.on_key(KeyEvent::from(KeyCode::Enter));
     until(app, terminal, "the passage to start", |app| {
         shown(app).is_some()
     });
@@ -322,7 +331,6 @@ fn reading_carries_on_by_itself_when_the_voice_finishes_a_chapter() {
     let _guard = exclusive();
     let (mut app, mut terminal) = fixture(short_chapters(common::isolated_home()));
     start_reading_aloud(&mut app, &mut terminal);
-    type_line(&mut app, "/mode auto");
     let before = app.turn.session_chars;
 
     // A chapter is a heading and four sentences: five clips, thirty-four
@@ -341,7 +349,7 @@ fn reading_carries_on_by_itself_when_the_voice_finishes_a_chapter() {
 }
 
 #[test]
-fn voice_alone_stops_after_the_requested_passage() {
+fn read_aloud_continues_without_becoming_auto() {
     let _guard = exclusive();
     let (mut app, mut terminal) = fixture(short_chapters(common::isolated_home()));
     start_reading_aloud(&mut app, &mut terminal);
@@ -353,11 +361,71 @@ fn voice_alone_stops_after_the_requested_passage() {
     }
     let spoken = app.turn.session_chars - before;
 
-    assert_eq!(app.mode(), readio::mode::Mode::Manual);
+    assert_eq!(
+        app.mode(),
+        readio::mode::Mode::Speak,
+        "continuous read-aloud is its own mode, not auto with a speaker attached"
+    );
     assert!(app.speech_enabled());
     assert!(
-        spoken <= 36,
-        "{spoken} characters crossed into another passage without auto-reading"
+        spoken > 36,
+        "only {spoken} characters: read-aloud stopped after one passage while its voice was healthy"
+    );
+}
+
+#[test]
+fn losing_the_allowed_audio_device_stops_without_becoming_auto() {
+    let _guard = exclusive();
+    let home = common::isolated_home();
+    let source = long_chapters(home);
+    let query = home.join("current-output");
+    std::fs::write(&query, "#!/bin/sh\necho desk-speakers\n").expect("write output query");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&query, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod output query");
+    }
+    let (mut app, mut terminal) =
+        fixture_with_query(source, SYNTH_MS, CLIP_MS, &query.display().to_string());
+    start_reading_aloud(&mut app, &mut terminal);
+
+    type_line(&mut app, "/device allow headphones");
+    for _ in 0..8 {
+        tick(&mut app, &mut terminal);
+    }
+    let view = screen(&terminal);
+
+    assert_eq!(
+        app.mode(),
+        readio::mode::Mode::Speak,
+        "losing an allowed output must not rewrite read-aloud to auto"
+    );
+    assert!(
+        !app.turn.busy(),
+        "tokens must stop when the selected audio output is unavailable:\n{view}"
+    );
+    assert!(
+        !app.voice_sounding(),
+        "audio queued for the wrong output must be stopped"
+    );
+}
+
+#[test]
+fn resuming_read_aloud_restores_the_voice_clock_before_tokens_move() {
+    let _guard = exclusive();
+    let (mut app, mut terminal) = fixture(long_chapters(common::isolated_home()));
+    start_reading_aloud(&mut app, &mut terminal);
+
+    app.on_key(KeyEvent::from(KeyCode::Char(' ')));
+    assert!(app.turn.paused(), "space should pause the read-aloud turn");
+    app.on_key(KeyEvent::from(KeyCode::Char(' ')));
+
+    assert!(!app.turn.paused(), "space should resume the turn");
+    assert_eq!(app.mode(), readio::mode::Mode::Speak);
+    assert!(
+        app.turn.held() || app.voice_runway() > 0,
+        "resuming must restore a TTS clock before any more tokens can move"
     );
 }
 
@@ -426,7 +494,6 @@ fn the_voice_does_not_fall_silent_between_turns() {
         LONG_CLIP_MS,
     );
     start_reading_aloud(&mut app, &mut terminal);
-    type_line(&mut app, "/mode auto");
     // The first clip of the session is the one nothing can cover; the question
     // here is about the boundaries after it.
     until(&mut app, &mut terminal, "the voice", |app| {

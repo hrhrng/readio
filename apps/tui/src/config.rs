@@ -119,9 +119,9 @@ pub struct Voice {
     /// through to the settings above.
     pub books: BTreeMap<String, BookVoice>,
     pub engines: BTreeMap<String, EngineSpec>,
-    /// Whether text is spoken. Independent from `reading.mode`: manual/auto
-    /// controls continuation, while this controls audio.
-    #[serde(default)]
+    /// Older configs kept read-aloud as a separate switch. It is read once and
+    /// folded into `reading.mode: aloud`; new files do not write it.
+    #[serde(default, skip_serializing)]
     pub enabled: bool,
 }
 
@@ -263,17 +263,18 @@ impl Config {
         Ok((config, stale))
     }
 
-    /// Fold settings older readios wrote into the two independent controls.
+    /// Fold the older pair of booleans into the three parallel modes.
     fn migrate(&mut self) -> bool {
         let scrolled = self.reading.auto.take();
-        let legacy_aloud = self.reading.mode == Mode::Speak;
-        if legacy_aloud {
-            self.reading.mode = Mode::Auto;
+        let legacy_voice = self.voice.enabled && self.reading.mode != Mode::Speak;
+        if self.voice.enabled {
+            self.reading.mode = Mode::Speak;
+        } else if self.reading.mode == Mode::Speak {
             self.voice.enabled = true;
         } else if scrolled == Some(true) && self.reading.mode == Mode::Manual {
             self.reading.mode = Mode::Auto;
         }
-        legacy_aloud || scrolled.is_some()
+        legacy_voice || scrolled.is_some()
     }
 
     /// Write the file back, comments and all.
@@ -514,7 +515,6 @@ impl Config {
              \x20 name: \"{name}\"\n\
              \x20 language: {voice_lang}\n\
              \x20 params: \"{voice_params}\"\n\
-             \x20 enabled: {voice_enabled}\n\
              \x20 prefetch: {prefetch}\n\
              {OUTPUT_NOTE}\
              \x20 output:\n\
@@ -542,7 +542,6 @@ impl Config {
             name = self.voice.name,
             voice_lang = self.voice.language,
             voice_params = self.voice.params.replace('"', "\\\""),
-            voice_enabled = self.voice.enabled,
             prefetch = self.voice.prefetch,
             allow = if self.voice.output.allow.is_empty() {
                 " []".to_string()
@@ -614,10 +613,10 @@ const READING_NOTE: &str =
     "  # speed: characters per second at effort high; the effort multiplier scales it,
   #   and read-aloud takes the pace from the audio instead
   # speed: 强度 high 时每秒吐出多少字；其它档按倍数缩放，朗读时改为跟着音频走
-  # mode: manual | auto — whether the next passage arrives by itself.
-  #   shift+tab toggles it. Voice is a separate enabled switch below.
-  # mode: manual | auto，只决定读完后会不会自动取下一段；shift+tab 切换。
-  #   朗读由下面 Voice 的 enabled 单独控制。
+  # mode: manual | auto | aloud. In aloud, TTS owns the token clock; failure
+  #   stops in aloud and never falls back to auto. shift+tab cycles all three.
+  # mode: manual | auto | aloud。朗读时 TTS 是 token 时钟；声音失败就停在
+  #   朗读模式，绝不降级为自动。shift+tab 在三个模式间循环。
 ";
 
 const EFFORT_NOTE: &str = "  # Reading pace, shown as the reasoning effort of the model.
@@ -650,8 +649,6 @@ const VOICE_NOTE: &str =
   # name 留空使用模型默认音色；language 写 zh 或 en，不按句子自动切换。
   # params: model-specific arguments saved by the Voice form; empty is default.
   # params 是模型支持的独立参数；留空使用模型默认值。
-  # enabled: Voice on/off, independent from manual/auto continuation.
-  # enabled 单独开关朗读，不会改变上面的手动/自动阅读。
   # The playback speed is not here: it is the effort multiplier above, so one
   # ladder covers reading and listening / 倍速在上面的 effort，读和听共用一套。
   # prefetch: sentences rendered ahead of the one playing, so there is no gap
@@ -756,7 +753,7 @@ mod tests {
             ..Config::default()
         };
         config.reading.speed = 72.0;
-        config.reading.mode = Mode::Auto;
+        config.reading.mode = Mode::Speak;
         config.voice.enabled = true;
         config.voice.name = "zf_xiaoyi".to_string();
         config.set_voice_name(
@@ -786,7 +783,12 @@ mod tests {
             "whole numbers should stay whole:\n{body}"
         );
         assert!(
-            body.contains("mode: auto") && body.contains("enabled: true"),
+            body.contains("mode: aloud")
+                && serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&body)
+                    .ok()
+                    .and_then(|doc| doc.get("voice").cloned())
+                    .and_then(|voice| voice.get("enabled").cloned())
+                    .is_none(),
             "the mode is a setting, written where the reader can read it:\n{body}"
         );
         // A file full of content ids is unreadable without them.
@@ -821,17 +823,15 @@ mod tests {
         assert_eq!(config, Config::default());
     }
 
-    /// Old files already carried two independent switches. Migration keeps both
-    /// facts rather than collapsing Voice into continuation again.
+    /// Older switch spellings map onto the three parallel modes. A file that
+    /// explicitly names read-aloud must stay read-aloud: turning it into auto
+    /// is exactly the silent downgrade the mode exists to prevent.
     #[test]
-    fn the_old_pair_of_switches_remains_two_independent_settings() {
+    fn old_switches_map_to_modes_without_downgrading_read_aloud() {
         let (config, stale) = Config::parse("tts:\n  enabled: true\n").expect("parse");
-        assert_eq!(config.reading.mode, Mode::Manual);
+        assert_eq!(config.reading.mode, Mode::Speak);
         assert!(config.voice.enabled, "they were listening");
-        assert!(
-            !stale,
-            "the section alias already maps directly to independent Voice state"
-        );
+        assert!(stale);
 
         let (config, stale) = Config::parse("reading:\n  auto: true\n").expect("parse");
         assert_eq!(config.reading.mode, Mode::Auto);
@@ -840,25 +840,27 @@ mod tests {
 
         let (config, _) =
             Config::parse("reading:\n  auto: true\ntts:\n  enabled: true\n").expect("parse");
-        assert_eq!(config.reading.mode, Mode::Auto);
+        assert_eq!(config.reading.mode, Mode::Speak);
         assert!(config.voice.enabled);
 
-        // The short-lived three-state spelling maps to continuous read-aloud:
-        // auto continuation with Voice enabled.
         let (config, stale) = Config::parse("reading:\n  mode: aloud\n").expect("parse");
-        assert_eq!(config.reading.mode, Mode::Auto);
+        assert_eq!(config.reading.mode, Mode::Speak);
         assert!(config.voice.enabled);
-        assert!(stale);
+        assert!(!stale);
 
         let (config, _) = Config::parse("tts:\n  enabled: true\n").expect("parse");
         let body = config.render().expect("render");
-        let voice_section = body.split("\nvoice:\n").nth(1).expect("a voice section");
         assert!(
-            voice_section.contains("enabled: true"),
-            "Voice remains explicit and independent:\n{voice_section}"
+            body.contains("mode: aloud")
+                && serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&body)
+                    .ok()
+                    .and_then(|doc| doc.get("voice").cloned())
+                    .and_then(|voice| voice.get("enabled").cloned())
+                    .is_none(),
+            "the old switch should be folded into one canonical mode:\n{body}"
         );
         let (again, stale) = Config::parse(&body).expect("parse what we wrote");
-        assert_eq!(again.reading.mode, Mode::Manual);
+        assert_eq!(again.reading.mode, Mode::Speak);
         assert!(again.voice.enabled);
         assert!(!stale, "with nothing left to fold");
     }

@@ -311,6 +311,30 @@ fn voice_opens_one_workspace_for_models_and_configuration() {
 }
 
 #[test]
+fn model_library_shows_scale_and_recommended_language() {
+    let _guard = exclusive();
+    let (mut app, mut terminal) = fixture();
+    settle(&mut app, &mut terminal);
+
+    type_line(&mut app, "/voice");
+    // The configured local test engine is fourth in the model library; MOSS is
+    // first and has hand-checked catalog metadata.
+    for _ in 0..3 {
+        app.on_key(KeyEvent::from(KeyCode::Up));
+    }
+    let view = draw(&mut app, &mut terminal, 2);
+
+    assert!(
+        view.contains("规模") && view.contains("120M"),
+        "the selected model should state its parameter scale:\n{view}"
+    );
+    assert!(
+        view.contains("推荐语言") && view.contains("中文"),
+        "the selected model should state the language it is recommended for:\n{view}"
+    );
+}
+
+#[test]
 fn voice_workspace_uses_tabs_when_the_terminal_is_narrow() {
     let _guard = exclusive();
     let (mut app, _) = fixture();

@@ -122,8 +122,8 @@ pub const TABLE: &[(&str, &str, &str)] = &[
     ("chrome.empty_tail", "  ·  /sample 看示例  ·  /help 更多",
         "  ·  /sample for the sample  ·  /help for more"),
     ("chrome.continue", "⏎ 继续", "⏎ keep reading"),
-    ("chrome.idle_tail", "  ·  shift+tab 切自动  ·  /help 更多",
-        "  ·  shift+tab toggles auto  ·  /help for more"),
+    ("chrome.idle_tail", "  ·  shift+tab 换模式  ·  /help 更多",
+        "  ·  shift+tab cycles modes  ·  /help for more"),
     ("chrome.busy_tail", "  ·  esc 中断  ·  ↑↓ 滚动", "  ·  esc interrupts  ·  ↑↓ to scroll"),
     // Pausing wears the agent's own clothes: a stopped stream is a model
     // thinking, which is the one state a coding agent is always allowed to be in.
@@ -166,10 +166,8 @@ pub const TABLE: &[(&str, &str, &str)] = &[
         "Go back to “{0}”, about {1}% into the book"),
     ("menu.also", "也可写作", "also"),
 
-    // ── automatic continuation ──
-    // The mode chip answers only whether passages continue automatically.
-    // Voice is an independent switch: while it is on, its configured pace
-    // controls how the current passage's tokens are revealed.
+    // ── the three parallel reading modes ──
+    // Read-aloud owns token pace and never silently falls back to auto.
     //
     // The chip says the same word as the mode wherever it fits. It used to say
     // 逐段 / step for manual, which is a description of what the mode does
@@ -205,14 +203,17 @@ pub const TABLE: &[(&str, &str, &str)] = &[
         "Auto-scroll: passage after passage at {0}. /effort or ^r changes the pace, esc interrupts, shift+tab cycles modes"),
     ("mode.row_manual", "你说一段算一段", "nothing moves until you say so"),
     ("mode.row_auto", "一段接一段自己往下走", "passages follow one another by themselves"),
+    ("mode.row_aloud", "念出来，token 跟着人声", "spoken aloud, tokens follow the voice"),
     ("mode.row_auto_more", "自动滚动：读完一段接着下一段，速度按当前推理强度。esc 中断，回车接着读；shift+tab 也能切模式。",
         "Auto-scroll: each passage is followed by the next at the pace the current effort level sets. esc interrupts, ⏎ carries on, and shift+tab cycles the modes."),
-    ("mode.now", "自动阅读：{0}（{1}）。shift+tab 切换，朗读由 ^s 单独控制。",
-        "Auto-reading: {0} ({1}). shift+tab toggles it; ^s controls Voice separately."),
-    ("mode.usage", "用法：/mode manual | auto；也可以 shift+tab 切换。朗读用 ^s。",
-        "Usage: /mode manual | auto — or press shift+tab. Voice uses ^s."),
-    ("mode.aloud_unavailable", "朗读起不来；手动/自动阅读设置没有改变",
-        "Voice could not start; manual/auto-reading is unchanged"),
+    ("mode.row_aloud_more", "朗读模式：TTS 是 token 的时钟。声音慢就等，声音不可用就停在朗读模式，绝不退成自动滚动。",
+        "Read-aloud: TTS is the token clock. A slow voice is waited for; an unavailable voice stops in read-aloud and never falls back to auto."),
+    ("mode.now", "当前是{0}模式（{1}）。shift+tab 循环，或 /mode manual|auto|aloud",
+        "Mode: {0} ({1}). shift+tab cycles, or /mode manual|auto|aloud"),
+    ("mode.usage", "用法：/mode manual | auto | aloud；也可以 shift+tab 循环切换",
+        "Usage: /mode manual | auto | aloud — or press shift+tab to cycle"),
+    ("mode.aloud_unavailable", "TTS 不可用，已停在朗读模式；不会降级成自动滚动",
+        "TTS is unavailable. Stopped in read-aloud; auto fallback is disabled"),
     ("cmd.needs_slash", "命令以 / 开头，比如 /find。要检索全书就用 /find <词>",
         "Commands start with a slash — /find, say. To search the book: /find <term>"),
     ("chrome.scrolled", "{0} 已上滚 {1}%", "{0} scrolled up {1}%"),
@@ -361,7 +362,7 @@ The short forms -c / -l / -m work too."),
 
     // ── speech ──
     //
-    // Voice is independent from manual/auto continuation.
+    // Read-aloud is one of the three modes; ^s is its shortcut.
     ("voice.row_test", "念一句，验证引擎接得通", "speak one line to prove the wiring"),
     ("voice.row_config", "告诉我配置文件在哪", "print where the config file lives"),
     ("voice.row_engine", "{0} · 已下载", "{0} · downloaded"),
@@ -379,10 +380,8 @@ The short forms -c / -l / -m work too."),
         "{0} is a command you configured yourself; readio neither installs nor starts it."),
     ("voice.engine_set", "朗读引擎：{0}", "Speech engine: {0}"),
     ("voice.voice_set", "朗读音色：{0}", "Speech voice: {0}"),
-    ("voice.on", "朗读已开启：{0}。自动阅读设置未改变。",
-        "Voice on: {0}. Auto-reading is unchanged."),
-    ("voice.off", "朗读已关闭。自动阅读设置未改变。",
-        "Voice off. Auto-reading is unchanged."),
+    ("voice.on", "已进入朗读模式：{0}", "Read-aloud mode: {0}"),
+    ("voice.off", "已退出朗读模式", "Left read-aloud mode"),
     ("voice.auto_set", "已清除音色和语言覆盖，使用模型默认值。",
         "Cleared voice and language overrides; using the model defaults."),
     ("voice.language_set", "整本都按 {0} 念，音色 {1}",
@@ -420,8 +419,8 @@ The short forms -c / -l / -m work too."),
     ("voice.missing_binary", "找不到 {0}，朗读没开成。/voice 里 ⏎ 一下就装上",
         "{0} not found, so read-aloud is off. /voice and ⏎ installs one"),
     ("voice.failed", "朗读失败：{0}", "Read-aloud failed: {0}"),
-    ("voice.stopped", "朗读失败，停在这里了：{0}。自动阅读没有改变；修好后用 ^s 重新开启朗读。",
-        "Voice stopped here: {0}. Auto-reading is unchanged; fix it, then press ^s to turn Voice on again."),
+    ("voice.stopped", "朗读失败，停在朗读模式：{0}。修好后回车重试，或手动切换模式；不会自动降级。",
+        "Read-aloud stopped in place: {0}. Fix it and press Enter to retry, or change mode explicitly; there is no automatic fallback."),
     ("voice.engine_gone", "引擎「{0}」不在了", "the {0} engine is no longer there"),
     ("voice.worker_start", "起不来 {0}：{1}", "cannot start {0}: {1}"),
     ("voice.worker_gone", "常驻引擎中途退出了{0}", "the resident engine exited{0}"),
@@ -431,8 +430,8 @@ The short forms -c / -l / -m work too."),
     ("voice.config_at", "朗读配置：{0}", "Speech config: {0}"),
     ("voice.usage", "用法：/voice 打开 Voice 工作台。开关朗读用 ^s。",
         "Usage: /voice opens the Voice workspace. ^s turns Voice on and off."),
-    ("voice.no_switch", "朗读和自动阅读相互独立。用 ^s 开关朗读，shift+tab 只切换手动/自动。",
-        "Voice and auto-reading are independent. ^s toggles Voice; shift+tab only toggles manual/auto."),
+    ("voice.no_switch", "Voice 工作台只配置模型。用 /mode aloud 或 ^s 进入朗读模式。",
+        "The Voice workspace configures models. Use /mode aloud or ^s to enter read-aloud."),
     ("voice.usage_rate", "用法：/rate <0.5-3.0>，改的是当前强度这一档的倍数",
         "Usage: /rate <0.5-3.0> — it retunes the level you are on"),
     ("voice.testing", "试念一句：{0}", "Test line: {0}"),
@@ -540,7 +539,7 @@ The short forms -c / -l / -m work too."),
         "Options: /device allow {0} to add it · /device any to stop checking · /device to list everything"),
     ("dev.muted_fix_plain", "怎么办：/device 看全部设备并选一个 · /device any 不再限制",
         "Options: /device to list the outputs and pick one · /device any to stop checking"),
-    ("dev.resumed", "输出回到「{0}」，朗读继续。", "Back on {0}; read-aloud resumed."),
+    ("dev.resumed", "输出回到「{0}」。仍在朗读模式，回车重试。", "Back on {0}. Still in Read-aloud; press Enter to retry."),
     ("dev.muted_status", "静音（设备不在白名单）", "muted (output not allowed)"),
     ("dev.title", "音频输出设备", "Audio outputs"),
     ("dev.current", "   ← 当前", "   ← current"),
