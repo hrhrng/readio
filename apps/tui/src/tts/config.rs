@@ -18,6 +18,16 @@ pub struct EngineSpec {
     /// Command that writes audio. Placeholders: `{text}` `{out}` `{voice}`
     /// `{rate}` `{model}` `{lang}` `{extra}`.
     pub synth: String,
+    /// Command that stays running and renders sentence after sentence, spoken
+    /// to in lines of JSON. When this is set it replaces `synth`, which stays
+    /// as the way to find the engine and as the fallback for a reader who
+    /// deletes this line.
+    ///
+    /// `{python}` is the interpreter behind `synth`'s own program — the one the
+    /// engine's package was installed into — and `{worker}` is readio's worker
+    /// script, written out beside the config.
+    #[serde(default)]
+    pub serve: String,
     /// Command that plays a file, `{file}` being the clip. Empty means the
     /// synth command played it itself.
     #[serde(default)]
@@ -47,6 +57,16 @@ pub struct EngineSpec {
     /// because the answer differs per machine and changes over time.
     #[serde(default)]
     pub pip: String,
+    /// Package name for the operating system's package manager, for engines
+    /// that are not Python at all.
+    ///
+    /// espeak-ng is a C program: there is no wheel to install and no model to
+    /// download, only `brew install espeak-ng` or the same line with `apt`.
+    /// Kept separate from `pip` because the two are not alternatives — an
+    /// engine has one or the other, and which is available depends on the
+    /// machine rather than on the engine.
+    #[serde(default)]
+    pub system: String,
     /// Python the package insists on, when it is fussy. `kokoro-tts` declares
     /// `>=3.11,<3.13`, so installing it under a default 3.13 fails with a
     /// resolver error that says nothing about the version.
@@ -142,14 +162,65 @@ pub struct Fetch {
 pub fn presets() -> BTreeMap<String, EngineSpec> {
     let mut out = BTreeMap::new();
 
+    // espeak-ng — the one that needs nothing. A 26 MB C program, no model, no
+    // Python, no download: `brew install espeak-ng` and read-aloud works on the
+    // next keypress. It is a formant synthesiser from the 1990s lineage and it
+    // sounds like one, which is the trade being offered rather than a defect.
+    //
+    // Measured here: 30 ms to say a sentence that takes ten seconds to speak,
+    // in either language — about 300× realtime. That matters beyond
+    // impatience. An engine slower than speech can never be caught up with, so
+    // the reading stalls at every sentence boundary no matter how much is
+    // rendered ahead; one this fast is never the thing being waited for.
+    out.insert(
+        "espeak".to_string(),
+        EngineSpec {
+            synth: "espeak-ng {lang} -s {words} -w {out} {extra}".to_string(),
+            serve: String::new(),
+            play: default_player(),
+            voice: String::new(),
+            model: String::new(),
+            extra: String::new(),
+            stdin: true,
+            about: "espeak-ng · GPL-3.0 · instant, tiny, robotic — nothing to download".to_string(),
+            pip: String::new(),
+            system: "espeak-ng".to_string(),
+            python: String::new(),
+            fetch: Vec::new(),
+            docs: "https://github.com/espeak-ng/espeak-ng".to_string(),
+            // espeak-ng's own language codes: `cmn` is Mandarin, and without it
+            // Chinese comes out as a list of letter names.
+            languages: BTreeMap::from([
+                (
+                    "zh".to_string(),
+                    LanguageSpec {
+                        voice: String::new(),
+                        model: String::new(),
+                        lang: "-v cmn".to_string(),
+                    },
+                ),
+                (
+                    "en".to_string(),
+                    LanguageSpec {
+                        voice: String::new(),
+                        model: String::new(),
+                        lang: "-v en-us".to_string(),
+                    },
+                ),
+            ]),
+        },
+    );
+
     // Kokoro-82M — Apache-2.0, multilingual (including Chinese). The default:
     // best quality per megabyte for long-form reading.
     //
-    // Speed depends entirely on which Kokoro you drive. The 13.8× realtime in
-    // the benchmark is the PyTorch build on an M4's GPU; `kokoro-tts` is
-    // onnxruntime on the CPU, measured here at about 1.4× realtime — enough to
-    // stay ahead of a listener with `prefetch` sentences in hand, and not much
-    // more. Piper is the one to pick on a slow machine.
+    // Speed depends entirely on which Kokoro you drive, and the CLI is the slow
+    // way to drive it. Measured on an M-series CPU: 8.4 s to say a sentence
+    // worth 4.2 s of audio — half of real time, so it can never keep up. Almost
+    // none of that is the model. The inference is 1.5 s; the rest is a fresh
+    // Python for every sentence, importing librosa and scipy inside the
+    // synthesis call, plus two seconds of progress spinner. Hence `resident`
+    // below, which is the same model with the startup paid once.
     //
     // The CLI takes its input and output as positional arguments, `-` meaning
     // stdin, which is also how a sentence gets in without ever touching a shell.
@@ -169,13 +240,18 @@ pub fn presets() -> BTreeMap<String, EngineSpec> {
                     --model ~/.readio/voices/kokoro-v1.0.onnx \
                     --voices ~/.readio/voices/voices-v1.0.bin {extra}"
                 .to_string(),
+            serve: "{python} {worker} \
+                    --model ~/.readio/voices/kokoro-v1.0.onnx \
+                    --voices ~/.readio/voices/voices-v1.0.bin"
+                .to_string(),
             play: default_player(),
             voice: "zf_xiaoxiao".to_string(),
             model: String::new(),
             extra: String::new(),
             stdin: true,
-            about: "Kokoro-82M · Apache-2.0 · multilingual, best on long passages".to_string(),
+            about: "Kokoro-82M · Apache-2.0 · best voice here, and it stays loaded".to_string(),
             pip: "kokoro-tts".to_string(),
+            system: String::new(),
             // The package declares >=3.11,<3.13, and a machine whose default is
             // 3.13 otherwise fails with a resolver error that never mentions it.
             python: "3.12".to_string(),
@@ -234,6 +310,7 @@ pub fn presets() -> BTreeMap<String, EngineSpec> {
         EngineSpec {
             synth: "piper --model {model} --output-file {out} --length-scale {scale} {extra}"
                 .to_string(),
+            serve: String::new(),
             play: default_player(),
             voice: String::new(),
             model: "~/.readio/voices/zh_CN-huayan-medium.onnx".to_string(),
@@ -241,6 +318,7 @@ pub fn presets() -> BTreeMap<String, EngineSpec> {
             stdin: true,
             about: "Piper · GPL-3.0 · fastest to first sound, models are a few MB".to_string(),
             pip: "piper-tts".to_string(),
+            system: String::new(),
             python: String::new(),
             // Piper ships no voice. Fetching the model directly beats
             // `python3 -m piper.download_voices`, which only exists inside
@@ -276,6 +354,7 @@ pub fn presets() -> BTreeMap<String, EngineSpec> {
         EngineSpec {
             synth: "supertonic tts {text} --output {out} --voice {voice} --speed {rate} {extra}"
                 .to_string(),
+            serve: String::new(),
             play: default_player(),
             voice: "F1".to_string(),
             model: String::new(),
@@ -283,6 +362,7 @@ pub fn presets() -> BTreeMap<String, EngineSpec> {
             stdin: false,
             about: "Supertonic 99M · MIT · pure ONNX, no torch".to_string(),
             pip: "supertonic".to_string(),
+            system: String::new(),
             python: String::new(),
             // The model (~400 MB) downloads itself into ~/.cache on first use.
             fetch: Vec::new(),
@@ -302,6 +382,7 @@ pub fn presets() -> BTreeMap<String, EngineSpec> {
                     -H 'Content-Type: application/json' \
                     -d {json} -o {out}"
                 .to_string(),
+            serve: String::new(),
             play: default_player(),
             voice: "zf_xiaobei".to_string(),
             model: "kokoro".to_string(),
@@ -311,6 +392,7 @@ pub fn presets() -> BTreeMap<String, EngineSpec> {
             // Nothing to install: this one is a server the reader is already
             // running, and readio has no business starting it.
             pip: String::new(),
+            system: String::new(),
             python: String::new(),
             fetch: Vec::new(),
             docs: "https://github.com/remsky/Kokoro-FastAPI".to_string(),
@@ -397,6 +479,7 @@ pub fn reconcile(engines: &mut BTreeMap<String, EngineSpec>) -> bool {
         saved.about = preset.about;
         saved.docs = preset.docs;
         saved.pip = preset.pip;
+        saved.system = preset.system;
         saved.python = preset.python;
 
         let superseded = SUPERSEDED
@@ -404,6 +487,7 @@ pub fn reconcile(engines: &mut BTreeMap<String, EngineSpec>) -> bool {
             .any(|(engine, synth)| *engine == name && same_command(synth, &saved.synth));
         if superseded {
             saved.synth = preset.synth;
+            saved.serve = preset.serve;
             saved.play = preset.play;
             saved.stdin = preset.stdin;
             saved.fetch = preset.fetch;
@@ -418,6 +502,13 @@ pub fn reconcile(engines: &mut BTreeMap<String, EngineSpec>) -> bool {
             // not a reader who decided one language was enough.
             if saved.languages.is_empty() {
                 saved.languages = preset.languages;
+            }
+            // Likewise an absent `serve`: every config written before readio
+            // could keep an engine resident has none, and leaving those alone
+            // would mean the reader who has been running readio longest is the
+            // one still paying eight seconds a sentence.
+            if saved.serve.trim().is_empty() {
+                saved.serve = preset.serve;
             }
         }
 
@@ -524,14 +615,25 @@ mod tests {
         assert_eq!(language_of(""), "en", "and nothing at all is not an error");
     }
 
-    /// Every language a preset offers has to name both halves: a Chinese voice
-    /// under English phonemes is the failure this table exists to prevent.
+    /// Every language a preset offers has to actually change something, and an
+    /// engine that has voices has to change those too: a Chinese voice under
+    /// English phonemes is the failure this table exists to prevent. Engines
+    /// whose voice *is* the language — espeak picks both with `-v cmn` — have
+    /// nothing to disagree with themselves about.
     #[test]
     fn every_language_entry_names_a_voice_and_its_phonemes() {
         for (name, spec) in presets() {
+            let has_voices = spec
+                .languages
+                .values()
+                .any(|entry| !entry.voice.is_empty() || !entry.model.is_empty());
             for (language, entry) in &spec.languages {
                 assert!(
-                    !entry.voice.is_empty() || !entry.model.is_empty(),
+                    !entry.voice.is_empty() || !entry.model.is_empty() || !entry.lang.is_empty(),
+                    "{name}/{language} is an entry that changes nothing"
+                );
+                assert!(
+                    !has_voices || !entry.voice.is_empty() || !entry.model.is_empty(),
                     "{name}/{language} switches language without switching voice"
                 );
                 assert!(

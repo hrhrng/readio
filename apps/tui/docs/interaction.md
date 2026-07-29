@@ -69,7 +69,7 @@ Rules that follow from calling it a mode:
 - **A mode that cannot work is skipped, not entered.** No speech engine means `shift+tab` steps past read-aloud, having said why once.
 - **A mode explains itself the first time and flashes afterwards.** Cycling should not reprint a paragraph.
 - **The voice follows the page, not the session.** Which language a sentence is in is read off the sentence, and the engine is given the matching voice and phonemes; a bilingual chapter switches mid-page with nothing to set. A reader who wants one voice throughout pins `tts.language`.
-- **In read-aloud the voice is the clock.** The text may not go past the sentence being spoken, and the next passage is not fetched until the voice is finished with this one. See below.
+- **In read-aloud the voice is the clock.** The text may not go past the sentence being spoken, and the engine is kept a paragraph ahead so the voice is not waiting on it. See below.
 
 ## Pace, as reasoning effort
 
@@ -97,7 +97,8 @@ Speed alone is not enough because the two are not merely different, they drift. 
 So there are two rules, and neither is about speed:
 
 - **A passage shows nothing until its first clip exists,** and never goes further than the end of the sentence now playing. A wait for audio is a wait on screen too.
-- **The next passage is fetched when the voice finishes, not when the text does.** Otherwise the reasoning line and tool call belonging to the next turn arrive underneath a paragraph still being read, scrolling the highlighted sentence out of sight.
+- **The engine is always working on the next thing.** Inside a paragraph it renders two sentences ahead of the one playing. Across a paragraph boundary — where the next paragraph does not exist yet, and readio would otherwise spend a thinking line, a tool call and a full synthesis in silence — the turn is asked where it is going, and the opening sentence of what comes next is rendered underneath the last clip of what is on now. Nothing is shown early; only the engine's work moves.
+- **The next passage is fetched when the voice finishes, not when the text does.** Normally these are the same moment, because the reveal is paced to end with the last clip. When they are not — after a rush, or a speed change that re-queues a passage — the text waits, or the reasoning line and tool call belonging to the next turn arrive underneath a paragraph still being read, scrolling the highlighted sentence out of sight.
 
 Within a sentence the pace is still a pace: whatever is left to show, divided by however long the clip runs. Dividing by what is *left* rather than by the sentence's own length is what lets a reveal that fell behind during a wait catch up over the next sentence instead of trailing the voice for the rest of the chapter.
 

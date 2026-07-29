@@ -15,6 +15,12 @@ import time
 COLS, ROWS = int(sys.argv[1]), int(sys.argv[2])
 STEPS = sys.argv[3].split(",")
 ARGV = sys.argv[4:]
+# `--trace` prints a token-count-against-time curve at the end. Read-aloud is a
+# claim about timing, and a final screenshot cannot show a four-second silence
+# in the middle of a paragraph; this can.
+TRACE = "--trace" in ARGV
+if TRACE:
+    ARGV.remove("--trace")
 
 KEYS = {
     "enter": b"\r",
@@ -58,6 +64,10 @@ import termios
 fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
 
 captured = bytearray()
+# (byte offset just past a chunk, seconds since start) for every read, so any
+# offset in the stream can be dated afterwards.
+arrivals = []
+started = time.time()
 
 
 def drain(seconds):
@@ -72,6 +82,7 @@ def drain(seconds):
             if not chunk:
                 return
             captured.extend(chunk)
+            arrivals.append((len(captured), time.time() - started))
 
 
 def wait_for_raw_mode(timeout=10.0):
@@ -124,113 +135,137 @@ while time.time() < deadline:
 
 raw = bytes(captured[:cut])
 
-# Very small terminal emulator: absolute cursor moves plus printable text is
-# all ratatui needs to place a frame.
-grid = [[" "] * COLS for _ in range(ROWS)]
-# Background colour per cell, so highlight work can be checked from a real
-# terminal stream rather than from a unit test's idea of one.
-bg = [[None] * COLS for _ in range(ROWS)]
-# Italic per cell: emphasis in a book arrives as SGR 3, and the only way to know
-# it survived wrapping and streaming is to read it back off the wire.
-ital = [[False] * COLS for _ in range(ROWS)]
-# Foreground per cell: readio tints Latin words inside Chinese prose the way a
-# coding agent tints identifiers, and that only shows up as an SGR 38;2 run.
-fg = [[None] * COLS for _ in range(ROWS)]
-current_bg = None
-current_fg = None
-current_italic = False
-row = col = 0
-i = 0
 csi = re.compile(rb"\x1b\[([0-9;?]*)([A-Za-z])")
-while i < len(raw):
-    byte = raw[i : i + 1]
-    if byte == b"\x1b":
-        match = csi.match(raw, i)
-        if match:
-            params, cmd = match.group(1), match.group(2)
-            if params.startswith(b"?"):
-                # Private modes (alt screen, cursor visibility) need no state.
+
+
+def emulate(stream, stops=()):
+    """Replay `stream` through a very small terminal emulator.
+
+    Absolute cursor moves plus printable text is all ratatui needs to place a
+    frame. `stops` is a list of `(byte offset, seconds)`; at each one the screen
+    as it stood at that moment is handed to the caller, which is the only way to
+    see *when* something appeared. ratatui writes only the cells that changed,
+    so a word that stays put — "tok" in the status bar — is on the wire once and
+    then never again; nothing short of replaying the stream can date the number
+    beside it.
+    """
+    grid = [[" "] * COLS for _ in range(ROWS)]
+    # Background colour per cell, so highlight work can be checked from a real
+    # terminal stream rather than from a unit test's idea of one.
+    bg = [[None] * COLS for _ in range(ROWS)]
+    # Italic per cell: emphasis in a book arrives as SGR 3, and the only way to
+    # know it survived wrapping and streaming is to read it back off the wire.
+    ital = [[False] * COLS for _ in range(ROWS)]
+    # Foreground per cell: readio tints Latin words inside Chinese prose the way
+    # a coding agent tints identifiers, and that only shows as an SGR 38;2 run.
+    fg = [[None] * COLS for _ in range(ROWS)]
+    current_bg = None
+    current_fg = None
+    current_italic = False
+    row = col = 0
+    i = 0
+    stops = list(stops)
+    next_stop = 0
+    frames = []
+    while i < len(stream):
+        while next_stop < len(stops) and stops[next_stop][0] <= i:
+            frames.append((stops[next_stop][1], [r[:] for r in grid]))
+            next_stop += 1
+        byte = stream[i : i + 1]
+        if byte == b"\x1b":
+            match = csi.match(stream, i)
+            if match:
+                params, cmd = match.group(1), match.group(2)
+                if params.startswith(b"?"):
+                    # Private modes (alt screen, cursor visibility) need no state.
+                    i = match.end()
+                    continue
+                nums = [int(p) if p else 0 for p in params.split(b";")] or [0]
+                if cmd == b"H":
+                    row = (nums[0] - 1) if nums and nums[0] else 0
+                    col = (nums[1] - 1) if len(nums) > 1 and nums[1] else 0
+                elif cmd == b"J":
+                    grid = [[" "] * COLS for _ in range(ROWS)]
+                    bg = [[None] * COLS for _ in range(ROWS)]
+                    ital = [[False] * COLS for _ in range(ROWS)]
+                    fg = [[None] * COLS for _ in range(ROWS)]
+                    row = col = 0
+                elif cmd == b"K":
+                    for x in range(col, COLS):
+                        grid[row][x] = " "
+                        bg[row][x] = None
+                        ital[row][x] = False
+                        fg[row][x] = None
+                elif cmd == b"m":
+                    # Only truecolour backgrounds and resets matter here.
+                    j = 0
+                    while j < len(nums):
+                        if nums[j] == 0:
+                            current_bg = None
+                            current_fg = None
+                            current_italic = False
+                        elif nums[j] == 3:
+                            current_italic = True
+                        elif nums[j] == 23:
+                            current_italic = False
+                        elif nums[j] == 49:
+                            current_bg = None
+                        elif nums[j] == 48 and j + 4 < len(nums) and nums[j + 1] == 2:
+                            current_bg = (nums[j + 2], nums[j + 3], nums[j + 4])
+                            j += 4
+                        elif nums[j] == 38 and j + 4 < len(nums) and nums[j + 1] == 2:
+                            current_fg = (nums[j + 2], nums[j + 3], nums[j + 4])
+                            j += 4
+                        elif nums[j] == 39:
+                            current_fg = None
+                        j += 1
                 i = match.end()
                 continue
-            nums = [int(p) if p else 0 for p in params.split(b";")] or [0]
-            if cmd == b"H":
-                row = (nums[0] - 1) if nums and nums[0] else 0
-                col = (nums[1] - 1) if len(nums) > 1 and nums[1] else 0
-            elif cmd == b"J":
-                grid = [[" "] * COLS for _ in range(ROWS)]
-                bg = [[None] * COLS for _ in range(ROWS)]
-                ital = [[False] * COLS for _ in range(ROWS)]
-                fg = [[None] * COLS for _ in range(ROWS)]
-                row = col = 0
-            elif cmd == b"K":
-                for x in range(col, COLS):
-                    grid[row][x] = " "
-                    bg[row][x] = None
-                    ital[row][x] = False
-                    fg[row][x] = None
-            elif cmd == b"m":
-                # Only truecolour backgrounds and resets matter here.
-                j = 0
-                while j < len(nums):
-                    if nums[j] == 0:
-                        current_bg = None
-                        current_fg = None
-                        current_italic = False
-                    elif nums[j] == 3:
-                        current_italic = True
-                    elif nums[j] == 23:
-                        current_italic = False
-                    elif nums[j] == 49:
-                        current_bg = None
-                    elif nums[j] == 48 and j + 4 < len(nums) and nums[j + 1] == 2:
-                        current_bg = (nums[j + 2], nums[j + 3], nums[j + 4])
-                        j += 4
-                    elif nums[j] == 38 and j + 4 < len(nums) and nums[j + 1] == 2:
-                        current_fg = (nums[j + 2], nums[j + 3], nums[j + 4])
-                        j += 4
-                    elif nums[j] == 39:
-                        current_fg = None
-                    j += 1
-            i = match.end()
+            # OSC or other escape: skip to terminator.
+            j = stream.find(b"\x07", i)
+            k = stream.find(b"\x1b\\", i)
+            end = min(x for x in (j, k, i + 2) if x > i)
+            i = end + 1
             continue
-        # OSC or other escape: skip to terminator.
-        j = raw.find(b"\x07", i)
-        k = raw.find(b"\x1b\\", i)
-        end = min(x for x in (j, k, i + 2) if x > i)
-        i = end + 1
-        continue
-    if byte == b"\r":
-        col = 0
-        i += 1
-        continue
-    if byte == b"\n":
-        row = min(row + 1, ROWS - 1)
-        i += 1
-        continue
-    # Decode one UTF-8 character.
-    length = 1
-    first = raw[i]
-    if first >= 0xF0:
-        length = 4
-    elif first >= 0xE0:
-        length = 3
-    elif first >= 0xC0:
-        length = 2
-    try:
-        char = raw[i : i + length].decode("utf-8")
-    except UnicodeDecodeError:
-        char = "?"
-    if char.isprintable() and 0 <= row < ROWS and 0 <= col < COLS:
-        grid[row][col] = char
-        bg[row][col] = current_bg
-        fg[row][col] = current_fg
-        ital[row][col] = current_italic
-        width = 2 if ord(char) > 0x2E7F else 1
-        # A double-width glyph physically covers the next cell.
-        if width == 2 and col + 1 < COLS:
-            grid[row][col + 1] = ""
-        col += width
-    i += length
+        if byte == b"\r":
+            col = 0
+            i += 1
+            continue
+        if byte == b"\n":
+            row = min(row + 1, ROWS - 1)
+            i += 1
+            continue
+        # Decode one UTF-8 character.
+        length = 1
+        first = stream[i]
+        if first >= 0xF0:
+            length = 4
+        elif first >= 0xE0:
+            length = 3
+        elif first >= 0xC0:
+            length = 2
+        try:
+            char = stream[i : i + length].decode("utf-8")
+        except UnicodeDecodeError:
+            char = "?"
+        if char.isprintable() and 0 <= row < ROWS and 0 <= col < COLS:
+            grid[row][col] = char
+            bg[row][col] = current_bg
+            fg[row][col] = current_fg
+            ital[row][col] = current_italic
+            width = 2 if ord(char) > 0x2E7F else 1
+            # A double-width glyph physically covers the next cell.
+            if width == 2 and col + 1 < COLS:
+                grid[row][col + 1] = ""
+            col += width
+        i += length
+    while next_stop < len(stops):
+        frames.append((stops[next_stop][1], [r[:] for r in grid]))
+        next_stop += 1
+    return grid, bg, ital, fg, frames
+
+
+grid, bg, ital, fg, _ = emulate(raw)
 
 print("\n".join("".join(r).rstrip() for r in grid))
 
@@ -273,3 +308,56 @@ if any(fg[y][x] == LATIN for y in range(ROWS) for x in range(COLS)):
             print(f"  {y:>3}:  {run.strip()}")
 
 print(f"\n[exit: {exited}]  [alt-screen restored: {restored}]  [bytes: {len(raw)}]")
+
+if TRACE:
+    # The status bar carries the running token count, so replaying the stream
+    # with a stop at every read gives a timestamped record of how fast text
+    # actually reached the reader — and, more to the point, where it stopped.
+    _, _, _, _, frames = emulate(bytes(captured), arrivals)
+    curve = {}
+    for when, snapshot in frames:
+        text = "\n".join("".join(r) for r in snapshot)
+        found = re.search(r"([0-9][0-9,]*) tok", text)
+        if found:
+            curve.setdefault(int(found.group(1).replace(",", "")), when)
+    if len(curve) > 1:
+        print("\n[trace]  seconds → tokens on screen  (gaps are silences)")
+        line, last = [], None
+        for count in sorted(curve):
+            when = curve[count]
+            gap = "" if last is None else f"+{when - last:.1f}"
+            line.append(f"{when:5.1f}s {count:>5}tok {gap:>6}")
+            last = when
+        for n in range(0, len(line), 3):
+            print("  " + " | ".join(line[n : n + 3]))
+        span = max(curve.values()) - min(curve.values())
+        grew = max(curve) - min(curve)
+        if span > 0:
+            print(f"  overall: {grew} tok in {span:.1f}s = {grew / span:.1f} tok/s")
+        stalls = []
+        prev = None
+        for count in sorted(curve):
+            if prev is not None and curve[count] - prev > 1.5:
+                stalls.append(f"{prev:.1f}s→{curve[count]:.1f}s")
+            prev = curve[count]
+        print(f"  stalls over 1.5s: {', '.join(stalls) if stalls else 'none'}")
+        print("\n[trace]  seconds → tokens on screen  (gaps are silences)")
+        line, last = [], None
+        for count in sorted(curve):
+            when = curve[count]
+            gap = "" if last is None else f"+{when - last:.1f}"
+            line.append(f"{when:5.1f}s {count:>5}tok {gap:>6}")
+            last = when
+        for n in range(0, len(line), 3):
+            print("  " + " | ".join(line[n : n + 3]))
+        span = max(curve.values()) - min(curve.values())
+        grew = max(curve) - min(curve)
+        if span > 0:
+            print(f"  overall: {grew} tok in {span:.1f}s = {grew / span:.1f} tok/s")
+        stalls = []
+        prev = None
+        for count in sorted(curve):
+            if prev is not None and curve[count] - prev > 1.5:
+                stalls.append(f"{prev:.1f}s→{curve[count]:.1f}s")
+            prev = curve[count]
+        print(f"  stalls over 1.5s: {', '.join(stalls) if stalls else 'none'}")

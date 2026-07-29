@@ -14,6 +14,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 
 use super::config::{self, EngineSpec, LanguageSpec};
+use super::resident;
 use super::{Clip, Synthesizer, wav};
 use crate::i18n::{t, tf};
 
@@ -24,18 +25,23 @@ pub struct CommandSynth {
     voice: String,
     language: String,
     rate: f32,
+    /// Set when the engine can stay running, which is how it stops being
+    /// slower than the speech it produces.
+    resident: Option<resident::Resident>,
 }
 
 impl CommandSynth {
     /// `voice` is the reader's explicit choice; empty means "whatever suits the
     /// passage", which the engine's `languages` table answers.
     pub fn new(name: &str, spec: EngineSpec, voice: String, rate: f32) -> Self {
+        let resident = resident_for(&spec);
         Self {
             name: name.to_string(),
             spec,
             voice,
             language: String::new(),
             rate,
+            resident,
         }
     }
 
@@ -65,11 +71,36 @@ impl CommandSynth {
 }
 
 impl Synthesizer for CommandSynth {
+    /// Load the model before the reader needs it.
+    ///
+    /// Only the resident path has anything to warm; for a per-sentence CLI
+    /// there is nothing that survives to be warm.
+    fn warm(&self) -> Result<()> {
+        match self.resident.as_ref() {
+            Some(resident) => resident.warm(),
+            None => Ok(()),
+        }
+    }
+
     fn synthesize(&self, text: &str, out: &Path) -> Result<Clip> {
-        let args = self.build(&self.spec.synth, text, out, None);
-        let stdin = self.spec.stdin.then_some(text);
-        run(&args, stdin, Duration::from_secs(120))
-            .with_context(|| tf("synth.failed", &[&self.name]))?;
+        if let Some(engine) = self.resident.as_ref() {
+            let language = self.language_for(text);
+            let voice = self.voice_for(language);
+            engine
+                .render(resident::Request {
+                    text,
+                    out,
+                    voice: &voice,
+                    lang: language_code(language),
+                    speed: self.rate,
+                })
+                .with_context(|| tf("synth.failed", &[&self.name]))?;
+        } else {
+            let args = self.build(&self.spec.synth, text, out, None);
+            let stdin = self.spec.stdin.then_some(text);
+            run(&args, stdin, Duration::from_secs(120))
+                .with_context(|| tf("synth.failed", &[&self.name]))?;
+        }
 
         if !out.exists() {
             return Err(anyhow!("{}", tf("synth.no_audio", &[&self.name])));
@@ -226,6 +257,7 @@ impl CommandSynth {
                     .replace("{voice}", &voice)
                     .replace("{rate}", &format_rate(self.rate))
                     .replace("{scale}", &format_rate(inverse(self.rate)))
+                    .replace("{words}", &words_per_minute(self.rate))
                     .replace("{model}", &expand_tilde(model))
                     .replace("{extra}", &self.spec.extra);
                 // Whole-argument substitutions last: their content is data.
@@ -259,6 +291,54 @@ fn inverse(rate: f32) -> f32 {
     } else {
         1.0 / rate
     }
+}
+
+/// Speed as words per minute, for engines whose knob is a reading rate.
+///
+/// espeak-ng's `-s` is words per minute and its own default is 175. Expressing
+/// the multiplier against that default keeps one meaning of "1.5×" across every
+/// engine: half again as fast as this engine normally reads.
+fn words_per_minute(rate: f32) -> String {
+    let wpm = (175.0 * rate).round().clamp(80.0, 450.0);
+    format!("{wpm:.0}")
+}
+
+/// Build the resident engine for a spec that has one.
+///
+/// Returns `None` when the spec names no `serve` line, or when the interpreter
+/// behind the engine cannot be found — an engine that is not installed has
+/// nothing to keep resident, and saying so through the ordinary
+/// "engine missing" path is clearer than a worker that fails to import.
+fn resident_for(spec: &EngineSpec) -> Option<resident::Resident> {
+    if spec.serve.trim().is_empty() {
+        return None;
+    }
+    let program = split_args(&spec.synth).into_iter().next()?;
+    let python = resident::interpreter_behind(&program)?;
+    let worker = resident::worker_script(&crate::paths::engines_dir()).ok()?;
+
+    let argv: Vec<String> = split_args(&spec.serve)
+        .into_iter()
+        .map(|arg| {
+            arg.replace("{python}", &python.to_string_lossy())
+                .replace("{worker}", &worker.to_string_lossy())
+        })
+        .map(|arg| expand_tilde(&arg))
+        .collect();
+    (!argv.is_empty()).then(|| resident::Resident::new(argv))
+}
+
+/// The language on its own, without the flag it is usually spelled with.
+///
+/// The table stores `--lang cmn` because engines disagree about how to write
+/// the flag and readio would otherwise have to know each spelling. A worker
+/// talking JSON wants only the value, which is the last word either way —
+/// `--lang cmn`, `-v cmn`, `--language zh` all end in the part that matters.
+fn language_code(language: Option<&LanguageSpec>) -> &str {
+    language
+        .map(|spec| spec.lang.as_str())
+        .and_then(|lang| lang.split_whitespace().next_back())
+        .unwrap_or_default()
 }
 
 /// Body for an OpenAI-compatible `/v1/audio/speech` call.

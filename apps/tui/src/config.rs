@@ -379,7 +379,16 @@ const ENGINES_NOTE: &str = "  # placeholders / 占位符:
   #   {text} the sentence · {out} the wav to write · {voice} · {rate}
   #   {model} model path · {json} OpenAI-compatible body · {file} clip to play
   #   {lang} the language entry below, spliced whole: flag and value
+  #   {words} the rate as words per minute, for engines that count them that way
   # stdin: true feeds the sentence on stdin instead of as an argument (piper)
+  #
+  # serve: a command that stays running and renders sentence after sentence,
+  # spoken to in lines of JSON. Starting a model for every sentence costs more
+  # than saying the sentence does, and an engine slower than speech can never be
+  # caught up with. Kept resident, kokoro goes from half of real time to three
+  # times it. {python} is the interpreter the engine was installed into and
+  # {worker} is the script readio writes into ~/.readio/engines.
+  # serve: 常驻进程，逐句用 JSON 交互；模型只加载一次。
   #
   # languages: what changes when the page changes language. `lang` holds the
   # flag *and* its value, so an engine that spells it another way still works,

@@ -40,6 +40,17 @@ const SYNTH_MS: u64 = 900;
 /// How long every clip it produces plays for.
 const CLIP_MS: u64 = 300;
 
+/// The other engine worth modelling: one whose clips are worth waiting for.
+///
+/// A resident Kokoro renders a sentence in about a second and speaks it for
+/// three or four. Nothing about a *sentence* boundary is hard at that rate —
+/// the pipeline covers it. What is left is the boundary between paragraphs,
+/// where the next one does not exist yet and so nothing was being rendered:
+/// that second landed in silence instead of underneath a clip.
+const SLOW_SYNTH_MS: u64 = 2_000;
+/// A clip long enough to render the next paragraph's opening sentence inside.
+const LONG_CLIP_MS: u64 = 2_000;
+
 /// These tests share one `config.yaml`, so they take turns.
 fn exclusive() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -74,15 +85,15 @@ fn silence(ms: u64) -> Vec<u8> {
 /// `play` is left empty in the spec, which means "the synth command played it
 /// itself" — so playback is exactly the clip's own duration, with none of a
 /// real player's start-up in the way.
-fn stand_in_engine(home: &Path) -> EngineSpec {
-    let clip = home.join("clip.wav");
-    std::fs::write(&clip, silence(CLIP_MS)).expect("write clip");
-    let script = home.join("stand-in-voice");
+fn stand_in_engine(home: &Path, synth_ms: u64, clip_ms: u64) -> EngineSpec {
+    let clip = home.join(format!("clip-{clip_ms}.wav"));
+    std::fs::write(&clip, silence(clip_ms)).expect("write clip");
+    let script = home.join(format!("stand-in-voice-{synth_ms}-{clip_ms}"));
     std::fs::write(
         &script,
         format!(
             "#!/bin/sh\nsleep {}\ncp '{}' \"$1\"\n",
-            SYNTH_MS as f64 / 1000.0,
+            synth_ms as f64 / 1000.0,
             clip.display()
         ),
     )
@@ -130,6 +141,11 @@ fn book(home: &Path, name: &str, chapters: usize, per_chapter: usize) -> PathBuf
 }
 
 fn fixture(book_path: PathBuf) -> (App, Terminal<TestBackend>) {
+    fixture_with(book_path, SYNTH_MS, CLIP_MS)
+}
+
+/// The same, with the engine's timing chosen: slow to render, or slow to speak.
+fn fixture_with(book_path: PathBuf, synth_ms: u64, clip_ms: u64) -> (App, Terminal<TestBackend>) {
     let home = common::isolated_home();
     let mut config = readio::config::Config::load().0;
     // Read-aloud is entered below the way a reader enters it, with `/mode tts`,
@@ -139,10 +155,10 @@ fn fixture(book_path: PathBuf) -> (App, Terminal<TestBackend>) {
     config.tts.voice.clear();
     config.tts.prefetch = 2;
     config.tts.output.allow.clear();
-    config
-        .tts
-        .engines
-        .insert("stand-in".to_string(), stand_in_engine(home));
+    config.tts.engines.insert(
+        "stand-in".to_string(),
+        stand_in_engine(home, synth_ms, clip_ms),
+    );
     config.reading.speed = 46.0;
     config.reading.auto = false;
     config.effort = readio::config::EffortConfig::default();
@@ -163,6 +179,11 @@ fn long_chapters(home: &Path) -> PathBuf {
 /// Short chapters, so the turn boundary comes round inside the window.
 fn short_chapters(home: &Path) -> PathBuf {
     book(home, "pacing-short", 10, 4)
+}
+
+/// A chapter per sentence: nothing but turn boundaries, one every few seconds.
+fn tiny_chapters(home: &Path) -> PathBuf {
+    book(home, "pacing-tiny", 12, 1)
 }
 
 fn tick(app: &mut App, terminal: &mut Terminal<TestBackend>) {
@@ -319,5 +340,115 @@ fn reading_carries_on_by_itself_when_the_voice_finishes_a_chapter() {
         spoken > 36,
         "only {spoken} characters, which is the first chapter and no more: \
          reading stopped instead of carrying on into the next"
+    );
+}
+
+/// Enter must not take the pace away from the voice.
+///
+/// `⏎` during a turn means "get on with it", and it did that by setting the
+/// reveal to two and a half thousand characters a second — and by claiming the
+/// pace for the rest of the turn, so every clip that started afterwards was
+/// ignored. In read-aloud that is a paragraph landing whole while the voice is
+/// still on its first line: the mode stops being itself because of one
+/// keypress, silently, which is the one thing read-aloud is not allowed to do.
+///
+/// Stated as the invariant rather than as a character count, because the
+/// character count depends on how long the clips happen to be: in read-aloud
+/// the pace belongs to the clip, whatever the reader presses.
+#[test]
+fn enter_does_not_take_the_pace_away_from_the_clip() {
+    let _guard = exclusive();
+    let (mut app, mut terminal) = fixture(long_chapters(common::isolated_home()));
+    start_reading_aloud(&mut app, &mut terminal);
+    until(&mut app, &mut terminal, "a clip to set the pace", |app| {
+        app.turn.cps() < 100.0
+    });
+
+    // The reader hurries readio along, the way they would in any other mode.
+    app.on_key(KeyEvent::from(KeyCode::Enter));
+    for _ in 0..30 {
+        tick(&mut app, &mut terminal);
+    }
+
+    assert!(
+        app.turn.cps() < 100.0,
+        "the reveal is running at {:.0} characters a second, which is nobody's \
+         reading voice: the keypress took the pace away from the clip\n{}",
+        app.turn.cps(),
+        screen(&terminal)
+    );
+}
+
+/// Rendering ahead across a paragraph boundary: the seam that was dead air.
+///
+/// Within a paragraph the pipeline covers the sentence boundaries — every
+/// sentence is handed over at once and rendered `tts.prefetch` ahead of the one
+/// playing. Between one paragraph and the next there was nothing to render: the
+/// following paragraph does not exist until the turn that carries it starts, so
+/// the reader waited out a thinking line, a tool call and then a whole
+/// synthesis in silence, every few hundred characters. That is what a listener
+/// hears as "it keeps stopping".
+///
+/// Now the turn is asked where it is going while it is still running, and the
+/// opening sentence of the paragraph after this one is rendered underneath the
+/// last clip of this one. Measured as silence, because silence is what the
+/// reader experiences: not "is anything queued" but "is anything playing".
+///
+/// A chapter per sentence, so the window is almost nothing but boundaries, and
+/// an engine that takes two seconds a sentence, so a boundary it fails to cover
+/// is unmistakable. On the build that fixed this: 18% of frames silent, longest
+/// gap 1.3s — the thinking line and the tool call, which are meant to be there.
+/// On the behaviour it replaced: 43%, longest gap 3.3s.
+#[test]
+fn the_voice_does_not_fall_silent_between_turns() {
+    let _guard = exclusive();
+    let (mut app, mut terminal) = fixture_with(
+        tiny_chapters(common::isolated_home()),
+        SLOW_SYNTH_MS,
+        LONG_CLIP_MS,
+    );
+    start_reading_aloud(&mut app, &mut terminal);
+    // The first clip of the session is the one nothing can cover; the question
+    // here is about the boundaries after it.
+    until(&mut app, &mut terminal, "the voice", |app| {
+        app.voice_sounding()
+    });
+
+    let mut quiet = 0usize;
+    let mut frames = 0usize;
+    let mut run = Duration::ZERO;
+    let mut longest = Duration::ZERO;
+    let mut fell_silent = Instant::now();
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(14) {
+        tick(&mut app, &mut terminal);
+        frames += 1;
+        if app.voice_sounding() {
+            run = Duration::ZERO;
+        } else {
+            if run.is_zero() {
+                fell_silent = Instant::now();
+            }
+            quiet += 1;
+            run = fell_silent.elapsed();
+            longest = longest.max(run);
+        }
+    }
+
+    assert!(frames > 100, "only {frames} frames: the clock is wrong");
+    assert!(
+        quiet * 10 < frames * 3,
+        "the voice had nothing to say in {quiet} of {frames} frames: \
+         the next paragraph is not being rendered until the silence has \
+         already started\n{}",
+        screen(&terminal)
+    );
+    // The share can be spread thin by a slow machine; a single gap this long is
+    // a boundary that nothing was rendering into.
+    assert!(
+        longest < Duration::from_millis(2_200),
+        "{:.1}s of unbroken silence: a paragraph boundary went uncovered\n{}",
+        longest.as_secs_f64(),
+        screen(&terminal)
     );
 }

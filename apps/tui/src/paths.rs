@@ -69,6 +69,14 @@ pub fn speech_dir() -> PathBuf {
     home().join("speech")
 }
 
+/// Where readio writes the helper scripts it carries.
+///
+/// Beside the config rather than in a cache: it is a file the reader is allowed
+/// to open and, if they like, change — the same bargain the config file offers.
+pub fn engines_dir() -> PathBuf {
+    home().join("engines")
+}
+
 /// Create the host directory tree if it does not exist yet.
 pub fn ensure_dirs() -> Result<()> {
     let books = books_dir();

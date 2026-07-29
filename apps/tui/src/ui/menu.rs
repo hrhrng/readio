@@ -540,7 +540,6 @@ fn lang_rows(ctx: &Ctx<'_>) -> Vec<Row> {
 /// mode chip would be two controls for one fact — the state where they disagreed
 /// is exactly the state nobody could explain.
 fn tts_rows(ctx: &Ctx<'_>) -> Vec<Row> {
-    let via = installer_name();
     let mut rows: Vec<Row> = ctx
         .cfg
         .engine_names()
@@ -556,8 +555,11 @@ fn tts_rows(ctx: &Ctx<'_>) -> Vec<Row> {
             //
             // The server case comes first, because `curl` being present says
             // nothing about whether the server behind it is up, and calling that
-            // "installed" would be taking credit for a fact nobody checked.
-            if spec.pip.is_empty() {
+            // "installed" would be taking credit for a fact nobody checked. It
+            // is the engine with no package of any kind: espeak-ng arrives from
+            // brew or apt rather than from pip, and is no less installable for
+            // it.
+            if spec.pip.is_empty() && spec.system.is_empty() {
                 let more = if spec.docs.is_empty() {
                     crate::i18n::tf("tts.row_engine_server_bare", &[&name])
                 } else {
@@ -581,11 +583,12 @@ fn tts_rows(ctx: &Ctx<'_>) -> Vec<Row> {
                     active,
                 ));
             }
+            let (via, package) = package_of(spec);
             Some(value(
                 &name,
                 &format!("tts install {name}"),
                 crate::i18n::tf("tts.row_engine_missing", &[&spec.about]),
-                crate::i18n::tf("tts.row_engine_missing_more", &[&name, &via, &spec.pip]),
+                crate::i18n::tf("tts.row_engine_missing_more", &[&name, &via, &package]),
                 active,
             ))
         })
@@ -689,6 +692,23 @@ fn installer_name() -> &'static str {
         }
     }
     "uv"
+}
+
+/// What the reader would be asked to install, and with what.
+///
+/// Not every engine readio can drive is a Python package: espeak-ng is a C
+/// program that comes from brew or apt. Naming `uv` next to it would send the
+/// reader looking for a wheel that does not exist.
+fn package_of(spec: &crate::tts::config::EngineSpec) -> (&'static str, String) {
+    if !spec.system.is_empty() {
+        let via = if crate::tts::install::which("brew").is_some() {
+            "brew"
+        } else {
+            "apt"
+        };
+        return (via, spec.system.clone());
+    }
+    (installer_name(), spec.pip.clone())
 }
 
 /// Whether the prompt is asking for the menu at all.

@@ -81,6 +81,10 @@ enum Active {
         /// Characters of this stream already on screen, counted the way the
         /// speech ranges count them — newlines included — so the two agree.
         released: usize,
+        /// The passage as it was handed over, kept whole. The queue holds only
+        /// what is left, and read-aloud entered mid-passage needs the original
+        /// to work out which sentence the reader has got to.
+        source: String,
     },
     Tool {
         id: u64,
@@ -235,8 +239,52 @@ impl Turn {
         }
     }
 
+    /// The passage on its way out, whole, with how much of it has been shown.
+    ///
+    /// Read-aloud can be entered in the middle of a paragraph, and that
+    /// paragraph has to come under the voice with everything else — otherwise
+    /// the reader watches the rest of it scroll past in the silence of the mode
+    /// they just left.
+    pub fn passage_in_flight(&self) -> Option<(u64, &str, usize)> {
+        match &self.active {
+            Some(Active::Stream {
+                id,
+                kind: StreamKind::Passage,
+                released,
+                source,
+                ..
+            }) => Some((*id, source.as_str(), *released)),
+            _ => None,
+        }
+    }
+
     pub fn busy(&self) -> bool {
         self.active.is_some() || !self.steps.is_empty()
+    }
+
+    /// Whether any speech is still to be handed over in this turn.
+    ///
+    /// A passage goes to the voice whole, at the moment it starts streaming, so
+    /// once the queue holds no more of them the voice has everything this turn
+    /// is ever going to give it — and whatever it says next has to come from
+    /// somewhere else.
+    pub fn more_to_say(&self) -> bool {
+        self.steps
+            .iter()
+            .any(|step| matches!(step, Step::Say { .. }))
+    }
+
+    /// Where this turn will leave the reader, while it is still running.
+    ///
+    /// The `Advance` step sits at the back of the queue for the whole turn,
+    /// which makes it the honest answer to "what comes after this" — and that
+    /// is what read-aloud needs in order to have the next paragraph's opening
+    /// sentence rendered before the current one runs out of sound.
+    pub fn advancing_to(&self) -> Option<(usize, usize)> {
+        self.steps.iter().rev().find_map(|step| match step {
+            Step::Advance { chapter, para } => Some((*chapter, *para)),
+            _ => None,
+        })
     }
 
     pub fn enqueue(&mut self, steps: Vec<Step>) {
@@ -285,6 +333,7 @@ impl Turn {
                     queue,
                     started,
                     released,
+                    ..
                 }) => {
                     let pacer = match kind {
                         StreamKind::Thinking => &mut self.thinking,
@@ -344,6 +393,9 @@ impl Turn {
                         queue: split_phrases(&text),
                         started: Instant::now(),
                         released: 0,
+                        // Nobody speaks readio's own reasoning, so there is
+                        // nothing here to line a voice up against.
+                        source: String::new(),
                     });
                     break;
                 }
@@ -360,6 +412,7 @@ impl Turn {
                         queue: split_phrases(&text),
                         started: Instant::now(),
                         released: 0,
+                        source: text,
                     });
                     break;
                 }

@@ -33,7 +33,7 @@ use crate::ui::prompt::Prompt;
 use crate::ui::scrollback::Scrollback;
 
 use flow::Pos;
-use turn::{Effect, Turn};
+use turn::{Effect, Step, Turn};
 
 /// How long a status-line notice stays up.
 ///
@@ -87,6 +87,8 @@ pub struct App {
     speech_cps: Option<f32>,
     /// The next passage is waiting for the voice to finish this one.
     awaiting_voice: bool,
+    /// Opening sentence of the next paragraph, already sent to be rendered.
+    warmed: Option<String>,
     /// Scrollback entry currently highlighted as spoken.
     lit: Option<u64>,
     /// Passage handed to the speech worker, kept so a `Started` event can be
@@ -258,6 +260,7 @@ impl App {
             installing: None,
             speech_cps: None,
             awaiting_voice: false,
+            warmed: None,
             lit: None,
             voiced: None,
             cursor: None,
@@ -284,6 +287,7 @@ impl App {
             Some(book) => app.adopt(book),
             None => app.show_library(),
         }
+        app.warm_voice();
         app
     }
 
@@ -414,11 +418,15 @@ impl App {
         if self.turn.held() && !self.speaking() {
             self.turn.hold_reveal(None);
         }
-        // The next passage waits on the voice rather than on the text. Checked
+        // The next turn waits on the voice rather than on the text. Checked
         // here, once, rather than on the idle event: a voice also stops by being
         // stopped — a speed change re-renders the queue — and every one of those
         // endings has to release the reader just the same.
-        if self.awaiting_voice && !self.speaking() {
+        //
+        // The threshold is one clip, not none: asking for the next turn while
+        // the last sentence is still playing is what keeps the engine rendering
+        // through a boundary that used to be dead air.
+        if self.awaiting_voice && self.voice_runway() <= 1 {
             self.awaiting_voice = false;
             if self.auto && !self.turn.busy() && !self.at_end() {
                 self.read_more();
@@ -453,16 +461,40 @@ impl App {
             }));
         }
         if self.auto && !self.at_end() {
-            // A turn ends when the last character is on screen, which in
-            // read-aloud is a beat before the last clip stops playing. Asking
-            // for the next passage then puts the reader a paragraph ahead of
-            // the voice — and by the end of a chapter, a chapter ahead.
-            if self.speaking() {
+            // Normally the reveal ends with the last clip, so by the time a
+            // turn finishes the voice is already done and the next paragraph
+            // can be asked for straight away — its opening sentence has been
+            // rendering under that last clip since `render_ahead` saw it
+            // coming.
+            //
+            // What this guards is the other case: audio outlasting its text,
+            // which happens after a rush, or after a speed change re-queues a
+            // passage. Starting the next turn then would pile paragraphs up in
+            // front of a voice still working through this one, so it waits —
+            // the text may not overtake the sound.
+            if self.voice_runway() > 1 {
                 self.awaiting_voice = true;
             } else {
                 self.read_more();
             }
         }
+    }
+
+    /// Clips the voice still has to get through, the one playing included.
+    ///
+    /// This is what the fetch-ahead decisions are made on: more than one means
+    /// there is a whole clip behind the one on the air, and the next passage can
+    /// be asked for without any risk of the text overtaking the sound.
+    pub fn voice_runway(&self) -> usize {
+        self.speaker.as_ref().map_or(0, Speaker::runway)
+    }
+
+    /// Whether the reader can hear something this instant.
+    ///
+    /// The measure of prefetch as a listener experiences it: not "is anything
+    /// queued" but "is anything playing". The pacing tests count frames on it.
+    pub fn voice_sounding(&self) -> bool {
+        self.speaker.as_ref().is_some_and(Speaker::sounding)
     }
 
     /// Path for the opt-in input trace, straight from the config file.
@@ -748,6 +780,26 @@ impl App {
         }
     }
 
+    /// Bring the engine up before anyone has asked it for a sentence.
+    ///
+    /// The first sentence of a session is the expensive one: a resident engine
+    /// loads its model, a command-line one pays for a Python interpreter, and
+    /// either way that bill lands on the paragraph the reader is waiting for.
+    /// Starting when readio starts moves it to where nobody is listening — the
+    /// seconds spent choosing a book.
+    ///
+    /// Nothing is reported. Warming is readio's idea, not the reader's, so a
+    /// machine with no engine installed should say so when the reader actually
+    /// asks to be read to, not the moment they open a book.
+    fn warm_voice(&mut self) {
+        if !self.cfg.tts.enabled || self.speaker.is_some() {
+            return;
+        }
+        let kept = self.notice.take();
+        let _ = self.start_speaker();
+        self.notice = kept;
+    }
+
     /// Bring up the speech worker, or explain why it cannot start.
     fn start_speaker(&mut self) -> bool {
         if self.speaker.is_some() {
@@ -800,11 +852,23 @@ impl App {
     /// Used when the speed changes mid-passage: the sentences already spoken
     /// stay spoken, and the one in progress starts again at the new speed.
     fn enqueue_speech_from(&mut self, id: u64, text: &str, from: usize) -> bool {
-        if !self.cfg.tts.enabled || !self.audio_permitted() {
+        if !self.cfg.tts.enabled {
+            return false;
+        }
+        // Speech routed to a device the reader excluded is not read-aloud, and
+        // carrying on regardless would be exactly the fallback this mode does
+        // not have: pages turning towards headphones that are not there.
+        if !self.audio_permitted() {
+            self.report_audio_block();
+            self.stop_reading();
             return false;
         }
         if !self.start_speaker() {
-            self.cfg.tts.enabled = false;
+            // The engine was there when the mode was entered and is not there
+            // now. Stop on the spot rather than quietly becoming a mode the
+            // reader did not ask for.
+            let engine = self.cfg.tts.engine.clone();
+            self.lose_the_voice(&tf("tts.engine_gone", &[&engine]));
             return false;
         }
         let Some(speaker) = self.speaker.as_mut() else {
@@ -852,21 +916,81 @@ impl App {
                     }
                 }
                 SpeechEvent::Idle => self.idle = true,
-                SpeechEvent::Failed { message } => {
-                    self.system(&tf("tts.failed", &[&message]));
-                    self.system(t("tts.fallback"));
-                    self.cfg.tts.enabled = false;
-                    self.speaker = None;
-                    self.speech_done();
-                    // Leave through the mode machinery rather than by dropping a
-                    // flag: read-aloud is a reading mode, so an engine that dies
-                    // has to hand the session to another mode. Otherwise the
-                    // status line keeps flashing "read-aloud" beside a chip that
-                    // already says something else.
-                    self.set_mode(ReadMode::Auto);
-                }
+                SpeechEvent::Failed { message } => self.lose_the_voice(&message),
             }
         }
+        self.render_ahead();
+    }
+
+    /// Have the next paragraph's opening sentence rendered before this one ends.
+    ///
+    /// Inside a passage the pipeline covers the sentence boundaries: every
+    /// sentence is handed over at once and rendered `tts.prefetch` ahead of the
+    /// one playing. The boundary it cannot cover is the one between paragraphs,
+    /// because until the turn ends the next paragraph does not exist yet: the
+    /// reader waits out a thinking line, a tool call, and only then a full
+    /// synthesis, all of it in silence, every few hundred characters.
+    ///
+    /// The turn already knows where it is going — the `Advance` step is sitting
+    /// in its queue — so the text can be worked out early and rendered under
+    /// the last clip of the paragraph before it. The turn structure is
+    /// untouched: nothing is displayed early, and no step runs out of order.
+    /// The only thing that moves is the engine's work, into the time when the
+    /// engine has nothing else to do.
+    fn render_ahead(&mut self) {
+        // One clip left, and nothing queued behind it in this turn: whatever
+        // the voice says next has to come from the paragraph after this one.
+        if !self.auto || !self.speaks() || self.voice_runway() > 1 || self.turn.more_to_say() {
+            return;
+        }
+        let Some((chapter, para)) = self.turn.advancing_to() else {
+            return;
+        };
+        let Some(book) = self.book.as_ref() else {
+            return;
+        };
+        let pos = Pos { chapter, para };
+        let (steps, _) = flow::continue_reading(book, pos, false);
+        let opening = steps.iter().find_map(|step| match step {
+            Step::Say { text, .. } => sentence::split(text).into_iter().next(),
+            _ => None,
+        });
+        let Some(opening) = opening else {
+            return;
+        };
+        // Asked for once per boundary, not once per frame.
+        if self.warmed.as_deref() == Some(opening.text.as_str()) {
+            return;
+        }
+        self.warmed = Some(opening.text.clone());
+        if let Some(speaker) = self.speaker.as_ref() {
+            speaker.prerender(&opening.text);
+        }
+    }
+
+    /// Read-aloud lost its voice: stop, and say so.
+    ///
+    /// There is deliberately no fallback here. Read-aloud is a reading mode,
+    /// not a decoration on top of one, and the two are not interchangeable: a
+    /// reader listening with their eyes elsewhere is not served by a page that
+    /// silently carries on scrolling, and one watching the text is not served
+    /// by it either — they asked to be read to. So the reading stops where the
+    /// voice stopped, the mode stays what the reader chose, and enter picks it
+    /// up again once whatever broke is fixed. The engine handle is dropped so
+    /// that enter is a real retry rather than a request to the corpse.
+    fn lose_the_voice(&mut self, why: &str) {
+        self.notice(&tf("tts.stopped", &[&why]));
+        self.stop_reading();
+    }
+
+    /// Put the reading down where it stands, leaving the mode alone.
+    ///
+    /// The engine handle goes with it, so that enter is a real retry rather
+    /// than a request to the corpse.
+    fn stop_reading(&mut self) {
+        self.speaker = None;
+        self.speech_done();
+        self.interrupt();
     }
 
     /// Let the text out as far as the sentence now being spoken, at the speed
@@ -982,6 +1106,15 @@ impl App {
     /// Whether audio is still owed: queued, rendering, or playing out.
     fn speaking(&self) -> bool {
         self.cursor.is_some() || self.speaker.as_ref().is_some_and(Speaker::busy)
+    }
+
+    /// Whether this reading is a read-aloud one.
+    ///
+    /// The mode, not the moment: true between clips and during the thinking
+    /// line, because the question it answers is who owns the pace, and in
+    /// read-aloud that is the voice from the moment the reader chooses it.
+    fn speaks(&self) -> bool {
+        self.cfg.tts.enabled
     }
 
     /// Speech stopped: clear the highlight and go back to timed reading.
@@ -1577,6 +1710,10 @@ impl App {
     fn set_mode(&mut self, want: ReadMode) -> bool {
         if want.speaks() && !self.cfg.tts.enabled {
             self.cfg.tts.enabled = true;
+            // A rush in progress belongs to the mode being left. Carried into
+            // read-aloud it would hold the pace at thousands of characters a
+            // second and lock the clip out of it for the rest of the turn.
+            self.rushing = false;
             if !self.start_speaker() {
                 self.cfg.tts.enabled = false;
                 self.notice(t("mode.tts_unavailable"));
@@ -1585,6 +1722,25 @@ impl App {
             // Speech routed to a device the reader excluded is not read-aloud.
             if !self.audio_permitted() {
                 self.report_audio_block();
+            }
+            // A paragraph already on its way out has to come under the voice
+            // too. Without this it finishes at reading speed in silence, which
+            // is the mode the reader has just left — and on a long paragraph
+            // that silence is most of a screen.
+            //
+            // The voice picks up at the sentence the reader has got to rather
+            // than at the top: what is on screen has been read, by eye if not
+            // aloud, and re-reading it would be the mode arguing with them.
+            if let Some((id, text, released)) = self.turn.passage_in_flight() {
+                let text = text.to_string();
+                let from = text
+                    .char_indices()
+                    .nth(released)
+                    .map_or(text.len(), |(at, _)| at);
+                self.turn.hold_reveal(Some(released));
+                if !self.enqueue_speech_from(id, &text, from) {
+                    self.turn.hold_reveal(None);
+                }
             }
         } else if !want.speaks() && self.cfg.tts.enabled {
             self.cfg.tts.enabled = false;
@@ -1652,6 +1808,7 @@ impl App {
         // Whatever was queued behind the voice is not wanted any more: the
         // reader asked for silence, not for the next paragraph.
         self.awaiting_voice = false;
+        self.warmed = None;
         self.silence();
         if self.turn.interrupt(&mut self.sb) {
             self.sb.push(Block::Event(Event::Interrupted));
@@ -1676,8 +1833,16 @@ impl App {
             }
             // Enter during a turn means "get on with it" — including the tool
             // call that is spinning, which used to ignore the key entirely.
+            //
+            // Not the text, though, when the text is being read aloud. Rushing
+            // sets the reveal to thousands of characters a second and takes the
+            // pace away from the clip for the rest of the turn, which is a
+            // paragraph dumped on screen while the voice is still on its first
+            // line — read-aloud stops being read-aloud because of one keypress.
+            // The thinking and the tool call are still hurried along, since
+            // those are readio's own theatre and nobody is listening to them.
             if self.turn.busy() {
-                if !self.rushing {
+                if !self.rushing && !self.speaks() {
                     self.rushing = true;
                     self.turn.set_cps(RUSH_CPS);
                 }
@@ -1738,6 +1903,9 @@ impl App {
         }
         let (steps, _next) = flow::continue_reading(book, self.pos, self.resumed);
         self.resumed = false;
+        // Whatever was rendered ahead belonged to this turn; the next boundary
+        // gets its own look at what is coming.
+        self.warmed = None;
         self.turn.enqueue(steps);
     }
 

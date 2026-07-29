@@ -63,20 +63,44 @@ pub enum Blocked {
 
 /// Work out how to install `spec` on this machine.
 ///
-/// The order is deliberate. `uv tool` and `pipx` both give a CLI its own
-/// environment, which is what these packages are — command-line tools, not
+/// An engine named under `system` is not a Python package at all and goes to
+/// the machine's own package manager; everything else is a wheel.
+///
+/// For wheels the order is deliberate. `uv tool` and `pipx` both give a CLI its
+/// own environment, which is what these packages are — command-line tools, not
 /// libraries to import. Plain `pip install --user` is last because on any
 /// modern distribution or Homebrew Python it now refuses outright
 /// (PEP 668, "externally managed environment"), and a refusal the reader has
 /// to decode is worse than saying up front that nothing suitable is here.
 pub fn plan(engine: &str, spec: &EngineSpec) -> Result<Plan, Blocked> {
-    if spec.pip.is_empty() {
+    if spec.pip.is_empty() && spec.system.is_empty() {
         return Err(Blocked::NoRecipe {
             docs: spec.docs.clone(),
         });
     }
 
-    let (via, mut argv) = if have("uv") {
+    let (via, mut argv) = if !spec.system.is_empty() {
+        // Not everything readio can drive is a Python package. espeak-ng is a C
+        // program, and the machine's own package manager is the only sensible
+        // way to get it: no wheel, no environment, nothing to keep on a path.
+        if have("brew") {
+            ("brew", vec!["brew".to_string(), "install".into()])
+        } else if have("apt-get") {
+            // Non-interactive because this runs inside readio, where there is
+            // no prompt to answer, and with sudo because apt needs it.
+            (
+                "apt",
+                vec![
+                    "sudo".to_string(),
+                    "apt-get".into(),
+                    "install".into(),
+                    "-y".into(),
+                ],
+            )
+        } else {
+            return Err(Blocked::NoInstaller);
+        }
+    } else if have("uv") {
         let mut argv = vec!["uv".into(), "tool".into(), "install".into()];
         if !spec.python.is_empty() {
             argv.push("--python".into());
@@ -98,7 +122,11 @@ pub fn plan(engine: &str, spec: &EngineSpec) -> Result<Plan, Blocked> {
     } else {
         return Err(Blocked::NoInstaller);
     };
-    argv.push(spec.pip.clone());
+    argv.push(if spec.system.is_empty() {
+        spec.pip.clone()
+    } else {
+        spec.system.clone()
+    });
 
     let mut steps = vec![Step {
         argv,
@@ -426,7 +454,7 @@ mod tests {
                 continue;
             }
             assert!(
-                !spec.pip.is_empty(),
+                !spec.pip.is_empty() || !spec.system.is_empty(),
                 "{name} can be installed but readio does not know what to install"
             );
             assert!(

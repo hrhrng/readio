@@ -30,6 +30,7 @@ pub mod command;
 pub mod config;
 pub mod device;
 pub mod install;
+pub mod resident;
 pub mod sentence;
 pub mod wav;
 
@@ -57,6 +58,15 @@ pub struct Clip {
 pub trait Synthesizer: Send + Sync {
     /// Render `text` into `out`, returning the clip with its real duration.
     fn synthesize(&self, text: &str, out: &Path) -> Result<Clip>;
+
+    /// Get ready, before there is anything to say.
+    ///
+    /// An engine that keeps a model in memory has to load it at some point, and
+    /// the worst point is the reader's first sentence. Called once by the
+    /// render thread, so the loading happens while the book is being opened.
+    fn warm(&self) -> Result<()> {
+        Ok(())
+    }
 
     /// Play a clip, blocking until it finishes or `cancel` is set.
     fn play(&self, clip: &Clip, cancel: &AtomicBool) -> Result<()>;
@@ -136,6 +146,15 @@ struct Rendered {
 
 enum Command {
     Speak(Job),
+    /// Render this sentence now and hold the clip until somebody asks for it.
+    ///
+    /// The one thing the pipeline cannot render ahead is the sentence it has
+    /// not been given. Between two paragraphs readio spends a thinking line and
+    /// a tool call before the next passage exists, and the engine spends
+    /// another second after that — all of it in silence. This hands the opening
+    /// sentence over early, while the last clip of the paragraph before it is
+    /// still playing.
+    Warm(String),
     Stop,
 }
 
@@ -273,6 +292,8 @@ pub struct Speaker {
     engine: String,
     /// Sentences handed over but not yet reported finished.
     pending: usize,
+    /// Whether a clip is on the air right now, as opposed to queued behind one.
+    sounding: bool,
 }
 
 impl Speaker {
@@ -322,6 +343,7 @@ impl Speaker {
             player,
             engine,
             pending: 0,
+            sounding: false,
         }
     }
 
@@ -344,11 +366,26 @@ impl Speaker {
         }));
     }
 
+    /// Render a sentence ahead of being asked to say it.
+    ///
+    /// For the paragraph boundary, where the pipeline has nothing to work on:
+    /// the clip is rendered into a slot of its own and handed over the instant
+    /// the same sentence is spoken for real. It costs one render either way, so
+    /// a wrong guess costs nothing but the work — and it does not eat into
+    /// `tts.prefetch`, which is about the sentences of a passage already begun.
+    pub fn prerender(&self, text: &str) {
+        if text.trim().is_empty() {
+            return;
+        }
+        let _ = self.commands.send(Command::Warm(text.to_string()));
+    }
+
     /// Drop everything queued and silence the current clip.
     pub fn stop(&mut self) {
         self.cancel.store(true, Ordering::SeqCst);
         self.pipeline.flush();
         self.pending = 0;
+        self.sounding = false;
         self.inflight.store(0, Ordering::SeqCst);
         // Drain stale events so a later poll does not see the old run.
         while self.events.try_recv().is_ok() {}
@@ -361,8 +398,13 @@ impl Speaker {
         loop {
             match self.events.try_recv() {
                 Ok(event) => {
-                    if let SpeechEvent::Finished { .. } = event {
-                        self.pending = self.pending.saturating_sub(1);
+                    match event {
+                        SpeechEvent::Started { .. } => self.sounding = true,
+                        SpeechEvent::Finished { .. } => {
+                            self.pending = self.pending.saturating_sub(1);
+                            self.sounding = false;
+                        }
+                        _ => {}
                     }
                     out.push(event);
                 }
@@ -376,6 +418,25 @@ impl Speaker {
     /// True while sentences are queued or playing.
     pub fn busy(&self) -> bool {
         self.pending > 0
+    }
+
+    /// Sentences handed over that have not finished playing, the current one
+    /// included. This is the voice's runway: while it is more than one, there
+    /// is a whole clip still to come after this one, and the reader can be sent
+    /// looking for the next passage without any risk of overtaking the sound.
+    pub fn runway(&self) -> usize {
+        self.pending
+    }
+
+    /// Whether the reader can hear something this instant.
+    ///
+    /// Narrower than [`Speaker::runway`] on purpose: a sentence handed over is
+    /// runway from the moment it is accepted, but it is not *sound* until the
+    /// engine has finished rendering it. The difference between the two is
+    /// exactly the dead air prefetch exists to remove, so this is what the
+    /// pacing tests count.
+    pub fn sounding(&self) -> bool {
+        self.sounding
     }
 }
 
@@ -413,10 +474,39 @@ fn render_loop(
 ) {
     let _ = std::fs::create_dir_all(&scratch);
     let mut sequence = 0u64;
+    // One sentence rendered before it was asked for, and the text it says. One
+    // slot, because there is only ever one next paragraph.
+    let mut warm: Option<(String, Clip)> = None;
+
+    // Before the first sentence, not with it: an engine that keeps a model in
+    // memory takes a few seconds to load one, and this thread exists precisely
+    // so that the wait happens somewhere the reader is not.
+    if let Err(err) = synth.warm() {
+        let _ = events.send(SpeechEvent::Failed {
+            message: format!("{err:#}"),
+        });
+        pipeline.close();
+        return;
+    }
 
     while let Ok(command) = commands.recv() {
         let job = match command {
             Command::Speak(job) => job,
+            Command::Warm(text) => {
+                if warm.as_ref().is_none_or(|(had, _)| *had != text) {
+                    sequence += 1;
+                    let out = scratch.join(format!("warm-{sequence}.wav"));
+                    // A failed warm-up is a slower boundary, not an error: if
+                    // the engine is really gone, the sentence itself will say
+                    // so a moment later, in front of the reader.
+                    if let Ok(clip) = synth.synthesize(&text, &out)
+                        && let Some((_, stale)) = warm.replace((text, clip))
+                    {
+                        let _ = std::fs::remove_file(&stale.path);
+                    }
+                }
+                continue;
+            }
             Command::Stop => break,
         };
         if pipeline.is_stale(job.era) || !pipeline.wait_for_room(job.era) {
@@ -424,9 +514,15 @@ fn render_loop(
             continue;
         }
 
-        sequence += 1;
-        let out = scratch.join(format!("utt-{sequence}.wav"));
-        match synth.synthesize(&job.text, &out) {
+        // Rendered a moment ago, under the paragraph before this one.
+        let rendered = match warm.take_if(|(had, _)| *had == job.text) {
+            Some((_, clip)) => Ok(clip),
+            None => {
+                sequence += 1;
+                synth.synthesize(&job.text, &scratch.join(format!("utt-{sequence}.wav")))
+            }
+        };
+        match rendered {
             Ok(clip) => {
                 if !pipeline.push(Rendered { job, clip }) {
                     forget(&inflight);
@@ -439,6 +535,9 @@ fn render_loop(
                 forget(&inflight);
             }
         }
+    }
+    if let Some((_, clip)) = warm.take() {
+        let _ = std::fs::remove_file(&clip.path);
     }
     pipeline.close();
 }
@@ -662,6 +761,52 @@ mod tests {
                 || at("render-start", 1) < at("play-end", 0),
             "rendering must overlap playback, not follow it"
         );
+        drop(speaker);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sentence rendered before it was asked for is not rendered again.
+    ///
+    /// This is what covers the boundary between two paragraphs: the opening
+    /// sentence of the next one is handed over while the last clip of this one
+    /// is still playing, and when the app finally asks for it in earnest the
+    /// clip is already sitting there. The engine's work moves; nothing else
+    /// does.
+    #[test]
+    fn a_sentence_rendered_ahead_is_not_rendered_twice() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let dir = scratch("warm");
+        let mut speaker = Speaker::spawn(Box::new(Fake::new(&log, 60, 20)), dir.clone(), 2);
+
+        speaker.prerender("one.");
+        assert_eq!(
+            count_at_least(&log, "render-end", 1),
+            1,
+            "the warm-up should have rendered the sentence on its own"
+        );
+
+        speaker.speak(0, "one.", (0, 4));
+        assert_eq!(
+            wait_for_finishes(&mut speaker, 1),
+            1,
+            "it should have played"
+        );
+        assert_eq!(
+            count(&log, "render-start"),
+            1,
+            "the sentence was rendered a second time: the clip waiting for it went unused"
+        );
+
+        // And the slot answers for its own text only, or a warm-up would put
+        // the wrong words in the reader's ear.
+        speaker.speak(1, "two.", (4, 8));
+        assert_eq!(wait_for_finishes(&mut speaker, 1), 1, "the second sentence");
+        assert_eq!(
+            count(&log, "render-start"),
+            2,
+            "a different sentence has to be rendered"
+        );
+
         drop(speaker);
         let _ = std::fs::remove_dir_all(&dir);
     }

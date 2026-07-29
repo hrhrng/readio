@@ -177,16 +177,23 @@ They live in `state.json` beside the reading position, stored as character offse
 
 ## Read-aloud
 
-readio ships no model. It invokes an engine you installed through a command template, which is why the binary is 4 MB and why a better model next month is a config edit rather than a release. Four presets ship, chosen from [tts-bench](https://github.com/5uck1ess/tts-bench):
+readio ships no model. It invokes an engine you installed through a command template, which is why the binary is 4 MB and why a better model next month is a config edit rather than a release. Five presets ship, chosen from [tts-bench](https://github.com/5uck1ess/tts-bench):
 
 | Engine | Size · licence | Why it is here |
 | --- | --- | --- |
-| `kokoro` | 82M · Apache-2.0 | default; multilingual, best on long passages |
-| `piper` | ~15M · GPL-3.0 | fastest to first sound; text on stdin |
+| `kokoro` | 82M · Apache-2.0 | default; the best voice here, and it stays loaded |
+| `espeak` | ~4M · GPL-3.0 | instant and robotic; one `brew`/`apt` package, no download |
+| `piper` | ~15M · GPL-3.0 | fastest neural voice to first sound; text on stdin |
 | `supertonic` | 99M · MIT | pure ONNX, no torch, 31 languages |
 | `openai` | — | any OpenAI-compatible `/v1/audio/speech` endpoint |
 
-A word on the speed figures you will find in that benchmark: they measure the models, usually through PyTorch on a GPU. readio drives whatever CLI you installed, and those are mostly onnxruntime on the CPU — `kokoro-tts` synthesizes at roughly 1.4× realtime on an M4, not the 13.8× the model is capable of. That is still fast enough to stay ahead of a listener, because sentences are rendered `prefetch` ahead of the one playing, but it is the number to plan around. On a slower machine, Piper is the preset to reach for.
+A word on the speed figures you will find in that benchmark: they measure the models, usually through PyTorch on a GPU. readio drives command-line engines, and those are mostly onnxruntime on the CPU. It is worth knowing which part of that is the model: for `kokoro-tts`, one short sentence through the CLI took 8.4 seconds on an M4 — four times slower than saying it out loud — of which the ONNX inference was 0.5 s. The rest was starting Python, loading the weights, and, once those were fixed, rebuilding an espeak backend inside `phonemizer` for every single sentence. Addressed below, the same sentence takes 0.5–0.8 s, comfortably ahead of a listener. `espeak-ng` takes 0.03 s and always did; it is the preset to reach for on a slow machine, or when you want sound the instant you press a key.
+
+### The engine stays running
+
+An engine that loads an 82M model per sentence spends all its time loading an 82M model. So a preset may carry a `serve:` line beside its `synth:` one — a command that starts the engine once and speaks a line-delimited JSON protocol over its pipes, one request per sentence, one reply per clip. readio starts it on the first sentence of the session (in fact at boot, under the opening turn, so the wait lands where nobody is listening), keeps it for as long as the app runs, and falls back to the plain `synth:` command line for engines that have no such mode. The worker shipped for Kokoro is `src/tts/worker.py`, compiled into the binary with `include_str!` and written out to `~/.readio/engines/kokoro_worker.py` — atomically, through a staging file, so two readios starting at once cannot hand each other half a script.
+
+The profile of what remained is worth recording, because it is not where anyone would look: with the model warm and resident, 2.216 seconds of every 2.752 were still inside `phonemizer.phonemize`, which builds a fresh espeak backend on each call — eight `dlopen`s, 2.189 s — and documents that it has no cache. Caching one backend per language brings a short sentence to 0.5–0.8 s, of which the actual inference is 0.5. That is a 3.6× improvement made without touching the model.
 
 Templates are argument lists with the placeholders `{text} {out} {voice} {rate} {scale} {model} {lang} {json} {file} {extra}`, so an engine readio has never heard of still works. A sentence is always passed as **one argument** and never through a shell: `$(whoami)` in the text is just eight characters.
 
@@ -274,6 +281,12 @@ render thread ──push──▶ queue (capacity = prefetch) ──pop──▶
 ```
 
 The queue is a `Mutex<VecDeque>` with two condition variables rather than a bounded channel, because a bounded channel cannot be emptied by a third party — the render thread would block sending a clip nobody wants. A locked queue lets `stop()` take the lock, delete the scratch wavs, and wake both threads. Each job carries an `era`; `flush()` bumps it and both threads discard work from an older era, so cancelling never means killing a thread.
+
+That covers every boundary inside a paragraph. It cannot cover the boundary *between* two of them, because until the next turn starts the next paragraph does not exist: the reader waits out a thinking line, a tool call and then a whole synthesis, in silence, every few hundred characters. Rendering ahead has nothing to render.
+
+So the turn is asked where it is going while it is still running. `Step::Advance` sits at the back of its queue for the whole turn, which makes it an honest answer; when the voice is down to its last clip and no more speech is queued, `App::render_ahead` works out the paragraph that comes next, takes its opening sentence, and sends it to the engine as `Command::Warm`. The render thread keeps it in a slot of its own — outside the prefetch queue, which belongs to the passage already begun — and hands it over the moment that sentence is asked for in earnest. Nothing is displayed early and no step runs out of order; the only thing that moves is the engine's work, into the time when the engine has nothing else to do.
+
+Measured with a stand-in engine that takes two seconds a sentence, on a book of one-sentence chapters so the window is almost nothing but boundaries: silence fell from 43% of frames to 18%, and the longest unbroken gap from 3.3 s to 1.3 s — which is the thinking line and the tool call, and those are meant to be there. On a real Kokoro reading Chinese, the reveal goes from 170 to 240 words in the same 75 seconds, with no stall at all after the model has loaded.
 
 ### Output allowlist
 
