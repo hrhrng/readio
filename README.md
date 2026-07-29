@@ -155,8 +155,9 @@ readio ships no speech model. It drives whichever engine you have installed thro
 
 | Engine | Size · licence | Notes |
 | --- | --- | --- |
-| `kokoro` | 82M · Apache-2.0 | default; multilingual, best on long passages |
-| `piper` | ~15M · GPL-3.0 | fastest to first sound; text on stdin |
+| `kokoro` | 82M · Apache-2.0 | default; best voice here, and it stays loaded |
+| `espeak` | ~4M · GPL-3.0 | instant and robotic; one `brew`/`apt` package, nothing to download |
+| `piper` | ~15M · GPL-3.0 | fastest neural voice to first sound; text on stdin |
 | `supertonic` | 99M · MIT | pure ONNX, no torch, 31 languages |
 | `openai` | — | any OpenAI-compatible `/v1/audio/speech` endpoint |
 
@@ -186,7 +187,11 @@ While a passage is spoken, its sentence is washed lightly and the word or charac
 
 Speed works the way an audiobook app's does. `^r` cycles 0.75×, 1×, 1.25×, 1.5×, 2× — the same ladder the web player offers — and `/rate` takes any value from 0.5 to 3. The multiplier sits in the status line next to the engine while audio is playing. Because clips are *rendered* at a speed rather than resampled on playback, a change throws away everything already prefetched and re-queues from the start of the sentence you are hearing, so the new speed arrives within a sentence instead of at the next passage.
 
-Sentences are rendered ahead of playback — `tts.prefetch`, two by default — on a thread of their own, so a sentence boundary is not a hole the length of your engine's synthesis time.
+Sentences are rendered ahead of playback — `tts.prefetch`, two by default — on a thread of their own, so a sentence boundary is not a hole the length of your engine's synthesis time. The boundary between two paragraphs is covered as well: readio asks the turn where it is going, and has the opening sentence of the next paragraph rendered underneath the last clip of this one, rather than starting it cold into silence.
+
+Engines that support it are kept running rather than started per sentence, which is most of what makes a local model usable: Kokoro took 8.4 seconds for a short sentence through its command line and takes 0.5–0.8 as a resident process with its phonemizer cached. If you would rather have sound instantly than have it beautiful, `espeak` says the same sentence in 0.03 and installs from one `brew` or `apt` package.
+
+And read-aloud does not degrade. If the voice breaks — engine gone, device not allowed, synthesis failed — reading stops where the voice stopped and says why, rather than carrying on scrolling to a reader whose eyes are elsewhere. `⏎` retries.
 
 `/device` restricts playback to named audio outputs. When headphones disconnect and the system quietly falls back to the speakers, readio mutes, names the device it found, and offers the way out on screen. An output it cannot identify counts as not allowed.
 
@@ -198,7 +203,7 @@ One file, `~/.readio/config.yaml`, written with comments on first run. readio re
 
 ```sh
 cd apps/tui
-cargo test                                     # 240 tests
+cargo test                                     # 333 tests
 python3 scripts/pty_probe.py 96 24 "wait:0.6,type:/sample,key:enter,wait:2"
 ```
 

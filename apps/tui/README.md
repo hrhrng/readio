@@ -380,7 +380,7 @@ The host directory:
 ## Testing
 
 ```sh
-cargo test          # 276: wrapping, pacing, parsing, import modes, reading, whole frames,
+cargo test          # 333: wrapping, pacing, parsing, import modes, reading, whole frames,
                     # illustrations, read-aloud, the device allowlist, search and jumps,
                     # chapter shape, emphasis, bookmarks, the three modes, effort levels
 ```
