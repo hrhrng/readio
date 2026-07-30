@@ -125,6 +125,8 @@ pub const TABLE: &[(&str, &str, &str)] = &[
     ("chrome.idle_tail", "  ·  shift+tab 换模式  ·  /help 更多",
         "  ·  shift+tab cycles modes  ·  /help for more"),
     ("chrome.busy_tail", "  ·  esc 中断  ·  ↑↓ 滚动", "  ·  esc interrupts  ·  ↑↓ to scroll"),
+    ("chrome.aloud_tail", "  ·  [ / ] 调速  ·  空格暂停",
+        "  ·  [ / ] speed  ·  space pauses"),
     // Pausing wears the agent's own clothes: a stopped stream is a model
     // thinking, which is the one state a coding agent is always allowed to be in.
     // esc holds the turn where it is. It is called an interruption because that
@@ -132,6 +134,9 @@ pub const TABLE: &[(&str, &str, &str)] = &[
     // every agent that stops mid-answer.
     ("chrome.paused", "已中断", "Interrupted"),
     ("chrome.paused_keys", "⏎ 或空格继续", "⏎ or space to continue"),
+    ("chrome.audio_paused", "朗读已暂停", "Read-aloud paused"),
+    ("chrome.audio_paused_keys", "空格从原音频位置继续",
+        "space resumes at the same audio position"),
     ("menu.hint", "↑↓ 选  ·  tab 补全  ·  ⏎ 执行  ·  esc 关掉",
         "↑↓ to choose  ·  tab completes  ·  ⏎ runs it  ·  esc closes"),
     // A select has nothing to complete: the row is the answer, so tab runs it
@@ -380,7 +385,8 @@ The short forms -c / -l / -m work too."),
         "{0} is a command you configured yourself; readio neither installs nor starts it."),
     ("voice.engine_set", "朗读引擎：{0}", "Speech engine: {0}"),
     ("voice.voice_set", "朗读音色：{0}", "Speech voice: {0}"),
-    ("voice.on", "已进入朗读模式：{0}", "Read-aloud mode: {0}"),
+    ("voice.on", "已进入朗读模式：{0}  ·  [ / ] 调速  ·  空格暂停",
+        "Read-aloud mode: {0}  ·  [ / ] speed  ·  space pauses"),
     ("voice.off", "已退出朗读模式", "Left read-aloud mode"),
     ("voice.auto_set", "已清除音色和语言覆盖，使用模型默认值。",
         "Cleared voice and language overrides; using the model defaults."),
@@ -408,8 +414,8 @@ The short forms -c / -l / -m work too."),
     ("voice.speed_set", "朗读倍速 {0}", "Read-aloud speed {0}"),
     ("voice.speed_later", "朗读倍速 {0}，下次开启朗读时生效",
         "Read-aloud speed {0}; it takes effect when you turn speech on"),
-    ("voice.speed_now", "当前倍速 {0}  ·  可选 {1}  ·  ^r 循环切换",
-        "Speed {0}   ladder: {1}   (^r cycles)"),
+    ("voice.speed_now", "当前倍速 {0}  ·  可选 {1}  ·  [ / ] 调速",
+        "Speed {0}   ladder: {1}   ([ / ] changes speed)"),
     ("voice.unknown_engine", "没有这个引擎：{0}。可用：{1}", "No such engine: {0}. Available: {1}"),
     // Short on purpose: this rides the status row, where it fades on its own
     // after a few seconds. It used to be a transcript line long enough to name

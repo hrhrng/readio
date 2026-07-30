@@ -8,14 +8,14 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 
 use super::config::{EngineSpec, LanguageSpec};
 use super::resident;
-use super::{Clip, Synthesizer, wav};
+use super::{Clip, PlaybackControl, Synthesizer, wav};
 use crate::i18n::{t, tf};
 
 /// A synthesizer built from an [`EngineSpec`].
@@ -120,11 +120,11 @@ impl Synthesizer for CommandSynth {
         })
     }
 
-    fn play(&self, clip: &Clip, cancel: &AtomicBool) -> Result<()> {
+    fn play(&self, clip: &Clip, control: &PlaybackControl) -> Result<()> {
         if self.spec.play.trim().is_empty() {
             // The synth command played it itself; wait out its duration so the
             // caller's pacing still lines up.
-            return sleep_cancellable(clip.ms, cancel);
+            return sleep_controlled(clip.ms, control);
         }
         let args = self.build(&self.spec.play, "", &clip.path, Some(&clip.path));
         let Some((program, rest)) = args.split_first() else {
@@ -140,12 +140,18 @@ impl Synthesizer for CommandSynth {
             .spawn()
             .with_context(|| tf("synth.cannot_play", &[&program]))?;
 
-        // Poll so an interrupt can cut the audio off mid-sentence.
+        // Poll so pause can hold the player's own audio cursor and an interrupt
+        // can cut it off mid-sentence.
+        let mut paused = false;
         loop {
-            if cancel.load(Ordering::SeqCst) {
+            if control.cancelled() {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Ok(());
+            }
+            if control.paused() != paused {
+                paused = control.paused();
+                set_process_paused(child.id(), paused)?;
             }
             match child.try_wait()? {
                 Some(status) if status.success() => return Ok(()),
@@ -471,16 +477,51 @@ fn run(args: &[String], input: Option<&str>, timeout: Duration) -> Result<()> {
     }
 }
 
-/// Sleep in slices so a cancel lands promptly.
-fn sleep_cancellable(ms: u64, cancel: &AtomicBool) -> Result<()> {
-    let deadline = std::time::Instant::now() + Duration::from_millis(ms);
-    while std::time::Instant::now() < deadline {
-        if cancel.load(Ordering::SeqCst) {
+/// Keep the clock used by self-playing engines on the same exact audio cursor.
+fn sleep_controlled(ms: u64, control: &PlaybackControl) -> Result<()> {
+    let mut remaining = Duration::from_millis(ms);
+    let mut sampled = std::time::Instant::now();
+    while !remaining.is_zero() {
+        if control.cancelled() {
             return Ok(());
         }
+        let now = std::time::Instant::now();
+        if !control.paused() {
+            remaining = remaining.saturating_sub(now.saturating_duration_since(sampled));
+        }
+        sampled = now;
         std::thread::sleep(Duration::from_millis(15));
     }
     Ok(())
+}
+
+/// Suspend the OS player without destroying its playback position.
+///
+/// readio's release targets are macOS and Linux; their ordinary players
+/// (`afplay` and `aplay`) are direct child processes, so SIGSTOP/SIGCONT is the
+/// smallest reliable playback API they share.
+#[cfg(unix)]
+fn set_process_paused(pid: u32, paused: bool) -> Result<()> {
+    let signal = if paused { libc::SIGSTOP } else { libc::SIGCONT };
+    // SAFETY: `pid` came from the live child we just spawned and `signal` is one
+    // of the two process-control signals accepted by kill(2).
+    let result = unsafe { libc::kill(pid as libc::pid_t, signal) };
+    if result == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        // The process finished between `try_wait` polls; the next poll will
+        // collect it, so there is nothing left to pause.
+        Ok(())
+    } else {
+        Err(err.into())
+    }
+}
+
+#[cfg(not(unix))]
+fn set_process_paused(_pid: u32, _paused: bool) -> Result<()> {
+    Err(anyhow!("exact audio pause is unavailable on this platform"))
 }
 
 /// Resolve a program from an explicit path, readio's managed runtime, or PATH.

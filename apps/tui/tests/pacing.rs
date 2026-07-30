@@ -429,6 +429,79 @@ fn resuming_read_aloud_restores_the_voice_clock_before_tokens_move() {
     );
 }
 
+/// Pause belongs to the audio timeline, not to the sentence queue.
+///
+/// Re-queueing the sentence on resume sounds like a stutter and also pays the
+/// synthesis cost a second time. A long clip with a deliberately slow synth
+/// makes the distinction observable without listening: resuming an existing
+/// audio pointer advances promptly, while synthesizing the sentence again
+/// cannot possibly do so inside this window.
+#[test]
+fn pause_and_resume_keep_the_exact_audio_pointer() {
+    let _guard = exclusive();
+    let source = long_chapters(common::isolated_home());
+    let (mut app, mut terminal) = fixture_with(source, SYNTH_MS, LONG_CLIP_MS);
+    start_reading_aloud(&mut app, &mut terminal);
+    until(
+        &mut app,
+        &mut terminal,
+        "the first spoken character",
+        |app| shown(app).is_some_and(|chars| chars > 0),
+    );
+
+    app.on_key(KeyEvent::from(KeyCode::Char(' ')));
+    assert!(app.turn.paused(), "space should pause the audio timeline");
+    assert!(
+        !app.voice_sounding(),
+        "paused audio must not report itself as audible"
+    );
+    let held = shown(&app).expect("a passage is in flight");
+    let paused_until = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < paused_until {
+        tick(&mut app, &mut terminal);
+        assert_eq!(
+            shown(&app),
+            Some(held),
+            "tokens moved while the audio pointer was paused"
+        );
+    }
+
+    app.on_key(KeyEvent::from(KeyCode::Char(' ')));
+    let resumed = Instant::now();
+    until(
+        &mut app,
+        &mut terminal,
+        "the held audio pointer to move",
+        |app| shown(app).is_some_and(|chars| chars > held),
+    );
+    assert!(
+        resumed.elapsed() < Duration::from_millis(650),
+        "resume waited for the sentence to synthesize again instead of continuing its audio"
+    );
+}
+
+#[test]
+fn read_aloud_exposes_and_obeys_bracket_speed_keys() {
+    let _guard = exclusive();
+    let (mut app, mut terminal) = fixture_with(
+        long_chapters(common::isolated_home()),
+        SYNTH_MS,
+        LONG_CLIP_MS,
+    );
+    start_reading_aloud(&mut app, &mut terminal);
+
+    app.on_key(KeyEvent::from(KeyCode::Char(']')));
+    assert_eq!(app.multiplier(), 1.25, "] should make read-aloud faster");
+    app.on_key(KeyEvent::from(KeyCode::Char('[')));
+    assert_eq!(app.multiplier(), 1.0, "[ should make read-aloud slower");
+
+    let view = screen(&terminal);
+    assert!(
+        view.contains("[ / ]") || view.contains("[ ]"),
+        "read-aloud should print its speed keys where they can be discovered:\n{view}"
+    );
+}
+
 /// Enter must not take the pace away from the voice.
 ///
 /// `⏎` during a turn means "get on with it", and it did that by setting the

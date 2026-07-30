@@ -31,7 +31,7 @@ use crate::ui::scrollback::Scrollback;
 use crate::ui::voice as voice_ui;
 use crate::voice::device::{self, Gate, Verdict};
 use crate::voice::sentence::Unit;
-use crate::voice::{Speaker, SpeechEvent, command::CommandSynth, install, sentence};
+use crate::voice::{self, Speaker, SpeechEvent, command::CommandSynth, install, sentence};
 
 use flow::Pos;
 use turn::{Effect, Step, Turn};
@@ -223,6 +223,10 @@ struct Cursor {
     /// Words or characters, in passage coordinates.
     units: Vec<Unit>,
     started: Instant,
+    /// When present, elapsed audio time is held at this instant. Resume moves
+    /// `started` forward by the pause duration so the visual cursor and the OS
+    /// player's audio cursor continue from the same millisecond.
+    paused: Option<Instant>,
     /// Clip duration, which is what the cursor's speed is derived from.
     ms: u64,
     /// Last unit shown, so the scrollback is only touched when it changes.
@@ -231,6 +235,24 @@ struct Cursor {
     /// clip's own duration: some players hand the audio to a daemon and return
     /// immediately, and the highlight has to follow the sound, not the process.
     done: bool,
+}
+
+impl Cursor {
+    fn pause(&mut self) {
+        self.paused.get_or_insert_with(Instant::now);
+    }
+
+    fn resume(&mut self) {
+        if let Some(paused) = self.paused.take() {
+            self.started += paused.elapsed();
+        }
+    }
+
+    fn elapsed(&self) -> std::time::Duration {
+        self.paused
+            .map(|paused| paused.saturating_duration_since(self.started))
+            .unwrap_or_else(|| self.started.elapsed())
+    }
 }
 
 impl App {
@@ -1141,6 +1163,7 @@ impl App {
             sentence: range,
             units,
             started: Instant::now(),
+            paused: self.turn.paused().then(Instant::now),
             ms,
             shown: None,
             done: false,
@@ -1159,7 +1182,7 @@ impl App {
         };
         // A clip that has played out: drop the word, keep the sentence lit until
         // the next one starts, and only then admit to being idle.
-        if cursor.done && cursor.started.elapsed().as_millis() as u64 >= cursor.ms {
+        if cursor.done && cursor.elapsed().as_millis() as u64 >= cursor.ms {
             let (id, sentence) = (cursor.id, cursor.sentence);
             self.cursor = None;
             self.sb.set_highlight(id, Some(Highlight::new(sentence)));
@@ -1169,7 +1192,7 @@ impl App {
             }
             return;
         }
-        let progress = cursor.started.elapsed().as_millis() as f32 / cursor.ms as f32;
+        let progress = cursor.elapsed().as_millis() as f32 / cursor.ms as f32;
         let Some(unit) = sentence::unit_at(&cursor.units, progress) else {
             return;
         };
@@ -1433,6 +1456,19 @@ impl App {
             // A select owns the letters while it is open: they narrow the rows
             // instead of landing in a composer the reader cannot see behind it.
             (KeyCode::Char(c), false) if self.select.is_some() => self.menu_type(c),
+            // Brackets are the audiobook-speed control, but only while the
+            // reader is actually in that player and has not started typing.
+            // Anywhere else they remain ordinary prompt characters.
+            (KeyCode::Char(']'), false)
+                if self.mode == ReadMode::Speak && self.prompt.is_empty() && !self.menu_open() =>
+            {
+                self.step_voice_speed(true)
+            }
+            (KeyCode::Char('['), false)
+                if self.mode == ReadMode::Speak && self.prompt.is_empty() && !self.menu_open() =>
+            {
+                self.step_voice_speed(false)
+            }
             // Space is play/pause, the way it is in every player — but only on an
             // empty line. The moment there is anything to type, a space is a
             // space; a reader writing `/goto 3` must not have the turn stop
@@ -1771,7 +1807,7 @@ impl App {
         }
     }
 
-    /// Space: stop if it is running, carry on if it is not.
+    /// Space: pause if it is running, carry on if it is not.
     ///
     /// One key for both halves, because that is what space means everywhere else
     /// a stream of anything plays. `esc` and `⏎` keep their own meanings — esc
@@ -1794,27 +1830,30 @@ impl App {
             return;
         }
         // The mode is a setting, not a consequence: pausing holds the place
-        // without demoting auto-scroll to manual. Audio cannot be frozen
-        // mid-clip, so it stops and picks up at the sentence the reader was on.
-        self.silence();
+        // without demoting auto-scroll to manual. Read-aloud keeps the live
+        // player and its audio cursor; stopping and re-queueing here would
+        // replay the current sentence when the reader comes back.
+        if self.speech {
+            if let Some(speaker) = self.speaker.as_ref() {
+                speaker.pause();
+            }
+            if let Some(cursor) = self.cursor.as_mut() {
+                cursor.pause();
+            }
+        }
     }
 
     fn resume_turn(&mut self) {
         if !self.turn.paused() {
             return;
         }
-        let passage = self
-            .turn
-            .passage_in_flight()
-            .map(|(id, text, released)| (id, text.to_string(), released));
         self.turn.resume();
-        if self.speech
-            && let Some((id, text, released)) = passage
-        {
-            let from = char_to_byte(&text, released);
-            self.turn.hold_reveal(Some(released));
-            if !self.enqueue_speech_from(id, &text, from) {
-                self.stop_reading();
+        if self.speech {
+            if let Some(cursor) = self.cursor.as_mut() {
+                cursor.resume();
+            }
+            if let Some(speaker) = self.speaker.as_ref() {
+                speaker.resume();
             }
         }
     }
@@ -2781,6 +2820,22 @@ impl App {
     /// means "read faster" whether the words are being typed or spoken.
     fn step_speed(&mut self) {
         self.set_effort(self.cfg.effort.level.next());
+    }
+
+    /// `[` / `]`: a direct audiobook control, independent of the named effort
+    /// ladder. The chosen multiplier is still stored in the active effort slot
+    /// so `/rate`, the status chip and the voice engine all report one truth.
+    fn step_voice_speed(&mut self, faster: bool) {
+        let current = self.multiplier();
+        let speed = if faster {
+            voice::next_speed(current)
+        } else {
+            voice::previous_speed(current)
+        };
+        let level = self.cfg.effort.level;
+        self.cfg.effort.multipliers.set(level, speed);
+        self.set_effort(level);
+        self.notice(&tf("voice.speed_set", &[&voice::speed_label(speed)]));
     }
 
     /// `/lang zh | en | auto`

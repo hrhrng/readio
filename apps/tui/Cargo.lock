@@ -950,6 +950,7 @@ dependencies = [
  "dirs",
  "futures",
  "image",
+ "libc",
  "pdf-extract",
  "quick-xml",
  "ratatui",

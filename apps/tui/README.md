@@ -354,6 +354,13 @@ Opening a book whose voice differs from the one that was reading drops the engin
 
 Playback speed is the effort multiplier — one control for both worlds, described under [Pace, as reasoning effort](#pace-as-reasoning-effort). While audio plays it sits next to the engine in the status line whenever it is not 1×: `⏵ kokoro · zf_xiaobei 1.5×`.
 
+In Read-aloud, `[` slows down and `]` speeds up through
+`0.75× → 1× → 1.25× → 1.5× → 2×`; the keys stay printed beside the mode chip
+instead of being hidden in help. Space pauses the live OS player and the reveal
+clock together. It does not cancel or re-queue the sentence, so another space
+continues from the same audio millisecond without repeating what was already
+heard.
+
 Speed applies at synthesis, not at playback: resampling would change the voice along with the tempo. The cost is that a speed change invalidates everything already prefetched, so `set_effort` flushes the pipeline, notes where the sentence in progress began, and re-queues from there. A change is heard within a sentence rather than at the next passage.
 
 Sentences are rendered ahead of playback on a thread of their own, `voice.prefetch` of them (two by default), so a sentence boundary is not a hole the length of the engine's synthesis time:
@@ -448,6 +455,8 @@ The host directory:
 | `⏎` | load the next passage; in the library, open the last book |
 | `⏎` while streaming | rush this turn to its end |
 | `esc` | interrupt the turn, keeping your place; `⏎` carries on |
+| `space` | pause / resume at the same audio position |
+| `[` · `]` | slower · faster Read-aloud |
 | `shift+tab` | cycle Manual → Auto → Read-aloud |
 | `/` | the command menu: `↑ ↓` to choose, `tab` completes, `⏎` runs |
 | `↑ ↓`, wheel, `pgup` `pgdn`, `home` `end` | scroll; at the bottom in manual mode, load more |

@@ -154,7 +154,12 @@ pub fn render_activity(area: Rect, buf: &mut Buffer, c: &Chrome<'_>) {
             Style::default().fg(th.accent_warning),
         ),
         Span::styled(
-            t("chrome.paused").to_string(),
+            t(if c.mode == crate::mode::Mode::Speak {
+                "chrome.audio_paused"
+            } else {
+                "chrome.paused"
+            })
+            .to_string(),
             Style::default().fg(th.accent_thinking),
         ),
     ]);
@@ -192,7 +197,15 @@ pub fn render_status(area: Rect, buf: &mut Buffer, c: &Chrome<'_>) {
         // only the way out of it belongs.
         vec![
             Span::raw("  "),
-            Span::styled(t("chrome.paused_keys").to_string(), faint),
+            Span::styled(
+                t(if c.mode == crate::mode::Mode::Speak {
+                    "chrome.audio_paused_keys"
+                } else {
+                    "chrome.paused_keys"
+                })
+                .to_string(),
+                faint,
+            ),
         ]
     } else if let Some(notice) = c.notice {
         vec![
@@ -217,7 +230,12 @@ pub fn render_status(area: Rect, buf: &mut Buffer, c: &Chrome<'_>) {
             ),
         ];
         spans.extend(speech_span(c));
-        spans.push(Span::styled(t("chrome.busy_tail").to_string(), faint));
+        let tail = if c.mode == crate::mode::Mode::Speak {
+            "chrome.aloud_tail"
+        } else {
+            "chrome.busy_tail"
+        };
+        spans.push(Span::styled(t(tail).to_string(), faint));
         spans
     } else if c.scrolled {
         vec![
@@ -260,8 +278,13 @@ pub fn render_status(area: Rect, buf: &mut Buffer, c: &Chrome<'_>) {
         spans
     };
 
+    let mode_chip = if c.mode == crate::mode::Mode::Speak {
+        format!("{} [ / ]", crate::mode::chip(c.mode))
+    } else {
+        crate::mode::chip(c.mode)
+    };
     let mut right = vec![Span::styled(
-        format!("{}  ", crate::mode::chip(c.mode)),
+        format!("{mode_chip}  "),
         Style::default().fg(if c.mode.scrolls() {
             th.accent_success
         } else {
@@ -306,8 +329,9 @@ const HELP: &[(&str, &str, &str)] = &[
     ("⏎", "载入下一段；命令以 / 开头", "load the next passage; commands start with /"),
     ("⏎ (输出中 / mid-turn)", "加速当前这一轮，直接读到底", "rush the current turn to its end"),
     ("esc", "中断这一轮，位置留在原处；回车接着读", "interrupt the turn, keeping your place; ⏎ carries on"),
-    ("空格 space", "停下 / 接着读，跟播放器一个意思（输入框是空的时候）",
-        "stop or carry on, the way it works in a player (when the line is empty)"),
+    ("空格 space", "原地暂停 / 从同一音频位置继续（输入框是空的时候）",
+        "pause in place / resume at the same audio position (when the line is empty)"),
+    ("[ / ]", "朗读减速 / 加速", "slower / faster read-aloud"),
     ("shift+tab", "循环手动 / 自动 / 朗读模式",
         "cycle manual / auto / read-aloud"),
     ("↑ ↓ / 滚轮 wheel", "滚动；手动模式下滚到底会载入下一段",

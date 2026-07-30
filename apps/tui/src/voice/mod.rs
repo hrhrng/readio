@@ -68,8 +68,12 @@ pub trait Synthesizer: Send + Sync {
         Ok(())
     }
 
-    /// Play a clip, blocking until it finishes or `cancel` is set.
-    fn play(&self, clip: &Clip, cancel: &AtomicBool) -> Result<()>;
+    /// Play a clip, blocking until it finishes or is cancelled.
+    ///
+    /// Pause is deliberately separate from cancellation. A pause keeps the
+    /// player's audio cursor alive so resume continues at the same millisecond;
+    /// cancellation throws the clip away for an interrupt or speed change.
+    fn play(&self, clip: &Clip, control: &PlaybackControl) -> Result<()>;
 
     /// Read at a different speed from now on.
     ///
@@ -114,7 +118,7 @@ pub enum SpeechEvent {
     Failed { message: String },
 }
 
-/// The playback speeds `^r` steps through.
+/// The playback speeds `[` and `]` step through.
 ///
 /// The same five the web player offers, so the two readio apps feel the same in
 /// the hand; `/rate` still takes any value between 0.5 and 3.
@@ -130,6 +134,16 @@ pub fn next_speed(current: f32) -> f32 {
         .copied()
         .find(|speed| *speed > current + 0.001)
         .unwrap_or(SPEEDS[0])
+}
+
+/// The next speed down, wrapping round to the fastest.
+pub fn previous_speed(current: f32) -> f32 {
+    SPEEDS
+        .iter()
+        .rev()
+        .copied()
+        .find(|speed| *speed < current - 0.001)
+        .unwrap_or(*SPEEDS.last().expect("the speed ladder is not empty"))
 }
 
 /// A speed as an audiobook app writes it: `1×`, `1.25×`, `0.75×`.
@@ -294,12 +308,34 @@ impl Pipeline {
     }
 }
 
+/// Live controls for one clip.
+///
+/// Cancellation is tied to the queue era instead of a boolean that has to be
+/// reset. Once `stop()` advances the era, an old player can never miss a brief
+/// true/false pulse and carry on speaking. Pause is shared across eras because
+/// it preserves, rather than invalidates, the clip currently on the air.
+pub struct PlaybackControl {
+    pipeline: Arc<Pipeline>,
+    era: u64,
+    paused: Arc<AtomicBool>,
+}
+
+impl PlaybackControl {
+    pub fn cancelled(&self) -> bool {
+        self.pipeline.is_closed() || self.pipeline.is_stale(self.era)
+    }
+
+    pub fn paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
+}
+
 /// Background speech: one thread rendering, one playing, `prefetch` clips of
 /// slack between them.
 pub struct Speaker {
     commands: Sender<Command>,
     events: Receiver<SpeechEvent>,
-    cancel: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     pipeline: Arc<Pipeline>,
     /// Sentences accepted but not yet finished playing. Zero means the reader
     /// can go back to timed reading.
@@ -325,7 +361,7 @@ impl Speaker {
         let engine = synth.describe();
         let (commands, command_rx) = channel::<Command>();
         let (event_tx, events) = channel::<SpeechEvent>();
-        let cancel = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
         let pipeline = Arc::new(Pipeline::new(prefetch.max(1)));
         let inflight = Arc::new(AtomicUsize::new(0));
 
@@ -345,15 +381,15 @@ impl Speaker {
             .spawn({
                 let pipeline = Arc::clone(&pipeline);
                 let inflight = Arc::clone(&inflight);
-                let cancel = Arc::clone(&cancel);
-                move || play_loop(synth, event_tx, pipeline, inflight, cancel)
+                let paused = Arc::clone(&paused);
+                move || play_loop(synth, event_tx, pipeline, inflight, paused)
             })
             .ok();
 
         Self {
             commands,
             events,
-            cancel,
+            paused,
             pipeline,
             inflight,
             render,
@@ -397,16 +433,25 @@ impl Speaker {
         let _ = self.commands.send(Command::Warm(text.to_string()));
     }
 
+    /// Freeze the current clip at its audio cursor, leaving the queue intact.
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+    }
+
+    /// Continue the same clip from the audio cursor held by [`Speaker::pause`].
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+    }
+
     /// Drop everything queued and silence the current clip.
     pub fn stop(&mut self) {
-        self.cancel.store(true, Ordering::SeqCst);
         self.pipeline.flush();
+        self.paused.store(false, Ordering::SeqCst);
         self.pending = 0;
         self.sounding = false;
         self.inflight.store(0, Ordering::SeqCst);
         // Drain stale events so a later poll does not see the old run.
         while self.events.try_recv().is_ok() {}
-        self.cancel.store(false, Ordering::SeqCst);
     }
 
     /// Non-blocking read of everything that happened since the last call.
@@ -453,13 +498,13 @@ impl Speaker {
     /// exactly the dead air prefetch exists to remove, so this is what the
     /// pacing tests count.
     pub fn sounding(&self) -> bool {
-        self.sounding
+        self.sounding && !self.paused.load(Ordering::SeqCst)
     }
 }
 
 impl Drop for Speaker {
     fn drop(&mut self) {
-        self.cancel.store(true, Ordering::SeqCst);
+        self.pipeline.flush();
         self.pipeline.close();
         let _ = self.commands.send(Command::Stop);
         if let Some(render) = self.render.take() {
@@ -565,7 +610,7 @@ fn play_loop(
     events: Sender<SpeechEvent>,
     pipeline: Arc<Pipeline>,
     inflight: Arc<AtomicUsize>,
-    cancel: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
 ) {
     while let Some(Rendered { job, clip }) = pipeline.pop() {
         if pipeline.is_stale(job.era) {
@@ -580,11 +625,16 @@ fn play_loop(
             chars: job.text.chars().count(),
             ms: clip.ms,
         });
-        let played = synth.play(&clip, &cancel);
+        let control = PlaybackControl {
+            pipeline: Arc::clone(&pipeline),
+            era: job.era,
+            paused: Arc::clone(&paused),
+        };
+        let played = synth.play(&clip, &control);
         let _ = std::fs::remove_file(&clip.path);
         let _ = events.send(SpeechEvent::Finished { id: job.id });
         if let Err(err) = played
-            && !cancel.load(Ordering::SeqCst)
+            && !control.cancelled()
         {
             let _ = events.send(SpeechEvent::Failed {
                 message: format!("{err:#}"),
@@ -618,6 +668,14 @@ mod tests {
         assert_eq!(next_speed(0.5), 0.75);
         assert_eq!(next_speed(1.1), 1.25);
         assert_eq!(next_speed(2.7), 0.75, "past the top, wrap");
+    }
+
+    #[test]
+    fn the_speed_ladder_steps_down_and_wraps() {
+        assert_eq!(previous_speed(1.25), 1.0);
+        assert_eq!(previous_speed(1.0), 0.75);
+        assert_eq!(previous_speed(0.75), 2.0);
+        assert_eq!(previous_speed(1.1), 1.0);
     }
 
     #[test]
@@ -676,15 +734,27 @@ mod tests {
             })
         }
 
-        fn play(&self, _clip: &Clip, _cancel: &AtomicBool) -> Result<()> {
+        fn play(&self, _clip: &Clip, control: &PlaybackControl) -> Result<()> {
             self.note("play-start");
-            std::thread::sleep(self.play);
+            let mut remaining = self.play;
+            let mut sampled = Instant::now();
+            while !remaining.is_zero() && !control.cancelled() {
+                let now = Instant::now();
+                if !control.paused() {
+                    remaining = remaining.saturating_sub(now.saturating_duration_since(sampled));
+                }
+                sampled = now;
+                std::thread::sleep(Duration::from_millis(2));
+            }
             if let Some(hold) = &self.hold {
                 // The deadline is a safety net, not part of the contract: a bug
                 // should fail an assertion rather than hang the suite, and it is
                 // short because a failing run has to wait it out once per clip.
                 let deadline = Instant::now() + Duration::from_secs(2);
-                while hold.load(Ordering::SeqCst) && Instant::now() < deadline {
+                while hold.load(Ordering::SeqCst)
+                    && !control.cancelled()
+                    && Instant::now() < deadline
+                {
                     std::thread::sleep(Duration::from_millis(2));
                 }
             }
@@ -866,6 +936,34 @@ mod tests {
         );
 
         hold.store(false, Ordering::SeqCst);
+        drop(speaker);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pause_holds_the_live_clip_without_rendering_it_again() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let dir = scratch("pause");
+        let mut speaker = Speaker::spawn(Box::new(Fake::new(&log, 10, 240)), dir.clone(), 2);
+        speaker.speak(7, "a sentence.", (4, 15));
+        assert_eq!(count_at_least(&log, "play-start", 1), 1);
+
+        speaker.pause();
+        std::thread::sleep(Duration::from_millis(320));
+        assert_eq!(
+            count(&log, "play-end"),
+            0,
+            "the audio cursor advanced while playback was paused"
+        );
+        assert!(speaker.busy(), "pause must preserve the live sentence");
+
+        speaker.resume();
+        assert_eq!(wait_for_finishes(&mut speaker, 1), 1);
+        assert_eq!(
+            count(&log, "render-start"),
+            1,
+            "resume rendered the same sentence a second time"
+        );
         drop(speaker);
         let _ = std::fs::remove_dir_all(&dir);
     }
