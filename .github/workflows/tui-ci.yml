@@ -38,10 +38,13 @@ jobs:
       # The resident-worker tests use tiny fake MLX models, but exercise the
       # real NumPy WAV conversion and Hugging Face disk-space preflight.
       - name: Install worker test dependencies
-        run: >-
-          python3 -m pip install --disable-pip-version-check
-          "numpy>=1.26,<3"
-          "huggingface_hub>=0.27,<2"
+        run: |
+          python3 -m venv "${RUNNER_TEMP}/readio-worker-tests"
+          "${RUNNER_TEMP}/readio-worker-tests/bin/python" -m pip install \
+            --disable-pip-version-check \
+            "numpy>=1.26,<3" \
+            "huggingface_hub>=0.27,<2"
+          echo "${RUNNER_TEMP}/readio-worker-tests/bin" >> "${GITHUB_PATH}"
 
       - name: Format
         run: cargo fmt --check
