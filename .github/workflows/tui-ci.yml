@@ -35,6 +35,14 @@ jobs:
         with:
           workspaces: apps/tui
 
+      # The resident-worker tests use tiny fake MLX models, but exercise the
+      # real NumPy WAV conversion and Hugging Face disk-space preflight.
+      - name: Install worker test dependencies
+        run: >-
+          python3 -m pip install --disable-pip-version-check
+          "numpy>=1.26,<3"
+          "huggingface_hub>=0.27,<2"
+
       - name: Format
         run: cargo fmt --check
       - name: Lint
