@@ -359,7 +359,8 @@ In Read-aloud, `[` slows down and `]` speeds up through
 instead of being hidden in help. Space pauses the live OS player and the reveal
 clock together. It does not cancel or re-queue the sentence, so another space
 continues from the same audio millisecond without repeating what was already
-heard.
+heard. `esc` followed by `⏎` uses the same held audio pointer while a
+Read-aloud turn is interrupted.
 
 Speed applies at synthesis, not at playback: resampling would change the voice along with the tempo. The cost is that a speed change invalidates everything already prefetched, so `set_effort` flushes the pipeline, notes where the sentence in progress began, and re-queues from there. A change is heard within a sentence rather than at the next passage.
 
