@@ -1,17 +1,19 @@
-//! The three ways readio moves through a book.
+//! The three parallel ways readio advances through a book.
 //!
-//! A reader is doing one of three things: turning the pages themselves, letting
-//! the text come at a set pace, or listening. Those used to be two independent
-//! switches — `/auto` and `/tts` — which meant four states, one of which
-//! ("listening, but the passages stop coming") made no sense. One mode with
-//! three values cannot get into that state.
+//! Manual waits for the reader, auto reveals at the configured text pace, and
+//! read-aloud reveals at the voice's pace. Read-aloud is deliberately not an
+//! automatic fallback: if its TTS engine cannot keep up or cannot run, the text
+//! waits or stops in read-aloud rather than silently becoming auto.
 //!
 //! The costume matters too: a coding agent shows its mode as a chip near the
 //! prompt and cycles it with `shift+tab`, so readio does the same.
 
+use serde::{Deserialize, Serialize};
+
 use crate::i18n::t;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Mode {
     /// Nothing advances by itself: `⏎` loads the next passage, and so does `↓`
     /// once the reader is at the bottom of what has arrived.
@@ -19,8 +21,9 @@ pub enum Mode {
     Manual,
     /// Passages keep coming at the configured reveal speed.
     Auto,
-    /// Read-aloud, which brings its own scrolling: the voice sets the pace and
-    /// the highlight follows it.
+    /// Read-aloud: the voice owns token pace and passages continue only while
+    /// that voice remains available.
+    #[serde(rename = "aloud", alias = "tts", alias = "speak", alias = "voice")]
     Speak,
 }
 
@@ -31,15 +34,6 @@ impl Mode {
             Mode::Manual => Mode::Auto,
             Mode::Auto => Mode::Speak,
             Mode::Speak => Mode::Manual,
-        }
-    }
-
-    /// What the two underlying switches say, read back as a mode.
-    pub fn of(auto: bool, speaking: bool) -> Self {
-        match (speaking, auto) {
-            (true, _) => Mode::Speak,
-            (false, true) => Mode::Auto,
-            (false, false) => Mode::Manual,
         }
     }
 
@@ -62,22 +56,22 @@ impl Mode {
         }
     }
 
-    /// The spelling `/mode` writes and reads.
+    /// The spelling `/mode` and the config file write.
     pub fn code(self) -> &'static str {
         match self {
             Mode::Manual => "manual",
             Mode::Auto => "auto",
-            Mode::Speak => "tts",
+            Mode::Speak => "aloud",
         }
     }
 
     /// Every spelling `/mode` accepts, generous on purpose: the reader should not
-    /// have to remember whether it is `tts`, `speak` or `voice`.
+    /// have to remember whether it is `aloud`, `speak` or `voice`.
     pub fn parse(arg: &str) -> Option<Self> {
         match arg.trim().to_ascii_lowercase().as_str() {
             "manual" | "m" | "step" | "hand" | "off" | "手动" => Some(Mode::Manual),
             "auto" | "a" | "scroll" | "自动" | "自动滚动" => Some(Mode::Auto),
-            "tts" | "t" | "speak" | "voice" | "read" | "aloud" | "朗读" => Some(Mode::Speak),
+            "aloud" | "tts" | "t" | "speak" | "voice" | "read" | "朗读" => Some(Mode::Speak),
             _ => None,
         }
     }
@@ -87,7 +81,7 @@ impl Mode {
         match self {
             Mode::Manual => t("mode.manual"),
             Mode::Auto => t("mode.auto"),
-            Mode::Speak => t("mode.tts"),
+            Mode::Speak => t("mode.aloud"),
         }
     }
 
@@ -108,7 +102,7 @@ impl Mode {
         match self {
             Mode::Manual => t("mode.chip_manual"),
             Mode::Auto => t("mode.chip_auto"),
-            Mode::Speak => t("mode.chip_tts"),
+            Mode::Speak => t("mode.chip_aloud"),
         }
     }
 }
@@ -128,7 +122,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shift_tab_visits_every_mode_and_comes_back() {
+    fn shift_tab_visits_all_three_parallel_modes() {
         let mut mode = Mode::Manual;
         let mut seen = vec![mode];
         for _ in 0..3 {
@@ -141,14 +135,23 @@ mod tests {
         );
     }
 
+    /// The mode is a value, not an arithmetic on two switches: whatever is
+    /// written in the config file is what comes back, including the spellings
+    /// older files used.
     #[test]
-    fn a_mode_is_just_a_reading_of_the_two_switches() {
-        assert_eq!(Mode::of(false, false), Mode::Manual);
-        assert_eq!(Mode::of(true, false), Mode::Auto);
-        assert_eq!(Mode::of(true, true), Mode::Speak);
-        // Speech implies scrolling, so the impossible fourth state reads as the
-        // mode the reader meant.
-        assert_eq!(Mode::of(false, true), Mode::Speak);
+    fn a_mode_survives_the_round_trip_through_the_config_file() {
+        for mode in [Mode::Manual, Mode::Auto, Mode::Speak] {
+            let written = serde_yaml_ng::to_string(&mode).expect("write");
+            let back: Mode = serde_yaml_ng::from_str(&written).expect("read");
+            assert_eq!(back, mode, "wrote {written:?}");
+            assert!(
+                written.contains(mode.code()),
+                "the file should say {:?}, not {written:?}",
+                mode.code()
+            );
+        }
+        let old: Mode = serde_yaml_ng::from_str("tts").expect("older files said tts");
+        assert_eq!(old, Mode::Speak);
     }
 
     #[test]
@@ -159,7 +162,7 @@ mod tests {
         for spelling in ["auto", "scroll", "自动滚动"] {
             assert_eq!(Mode::parse(spelling), Some(Mode::Auto), "{spelling}");
         }
-        for spelling in ["tts", "speak", "voice", "朗读"] {
+        for spelling in ["aloud", "tts", "speak", "voice", "朗读"] {
             assert_eq!(Mode::parse(spelling), Some(Mode::Speak), "{spelling}");
         }
         assert_eq!(Mode::parse("faster"), None);

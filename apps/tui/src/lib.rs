@@ -16,7 +16,7 @@
 //! - [`mode`] / [`effort`] — the three ways a reader moves through a book, and
 //!   the pace they read at, worn as an agent's reasoning effort.
 //! - [`i18n`] — every user-visible string, Chinese and English.
-//! - [`tts`] — read-aloud: local speech engines and playback.
+//! - [`voice`] — read-aloud: which engine reads, and the playback behind it.
 
 pub mod app;
 pub mod book;
@@ -31,7 +31,7 @@ pub mod paths;
 pub mod store;
 pub mod stream;
 pub mod theme;
-pub mod tts;
 pub mod ui;
 pub mod util;
+pub mod voice;
 pub mod wrap;

@@ -21,8 +21,8 @@ fn exclusive() -> std::sync::MutexGuard<'static, ()> {
 fn fixture() -> (App, Terminal<TestBackend>) {
     common::isolated_home();
     let mut config = readio::config::Config::load().0;
-    config.tts.enabled = false;
-    config.tts.output.allow.clear();
+    config.reading.mode = readio::mode::Mode::Manual;
+    config.voice.output.allow.clear();
     config.reading.speed = 46.0;
     config.effort = readio::config::EffortConfig::default();
     let _ = config.save();

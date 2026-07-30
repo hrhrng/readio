@@ -22,7 +22,7 @@
 //!
 //! Why two threads: synthesis is fast (13× realtime for kokoro on an M4) but
 //! not instant, and doing it between clips puts a hole of exactly that length
-//! into every sentence boundary. The renderer runs up to `tts.prefetch` clips
+//! into every sentence boundary. The renderer runs up to `voice.prefetch` clips
 //! ahead of the player, which is the same trick the web player uses with its
 //! prefetch window.
 
@@ -30,6 +30,7 @@ pub mod command;
 pub mod config;
 pub mod device;
 pub mod install;
+mod output;
 pub mod resident;
 pub mod sentence;
 pub mod wav;
@@ -41,6 +42,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
@@ -68,8 +70,29 @@ pub trait Synthesizer: Send + Sync {
         Ok(())
     }
 
-    /// Play a clip, blocking until it finishes or `cancel` is set.
-    fn play(&self, clip: &Clip, cancel: &AtomicBool) -> Result<()>;
+    /// Play a clip, blocking until it finishes or is cancelled.
+    ///
+    /// Pause is deliberately separate from cancellation. A pause keeps the
+    /// player's audio cursor alive so resume continues at the same millisecond;
+    /// cancellation throws the clip away for an interrupt or speed change.
+    fn play(&self, clip: &Clip, control: &PlaybackControl) -> Result<()>;
+
+    /// Read at a different speed from now on.
+    ///
+    /// Speed is applied at synthesis rather than at playback — resampling would
+    /// change the voice along with the tempo — so it has to reach the engine
+    /// rather than the player. It is a live setting and not a constructor
+    /// argument because the alternative is rebuilding the engine to change it,
+    /// and for one that keeps a model in memory that means the reader waits out
+    /// a model load for having pressed `^r`.
+    ///
+    /// Only what has not been rendered yet is affected; the caller flushes.
+    fn set_rate(&self, _rate: f32) {}
+
+    /// The speed in force, as the renderer would use it right now.
+    fn rate(&self) -> f32 {
+        1.0
+    }
 
     /// Short human-readable name, shown in the status line.
     fn describe(&self) -> String;
@@ -97,7 +120,7 @@ pub enum SpeechEvent {
     Failed { message: String },
 }
 
-/// The playback speeds `^r` steps through.
+/// The playback speeds `[` and `]` step through.
 ///
 /// The same five the web player offers, so the two readio apps feel the same in
 /// the hand; `/rate` still takes any value between 0.5 and 3.
@@ -113,6 +136,16 @@ pub fn next_speed(current: f32) -> f32 {
         .copied()
         .find(|speed| *speed > current + 0.001)
         .unwrap_or(SPEEDS[0])
+}
+
+/// The next speed down, wrapping round to the fastest.
+pub fn previous_speed(current: f32) -> f32 {
+    SPEEDS
+        .iter()
+        .rev()
+        .copied()
+        .find(|speed| *speed < current - 0.001)
+        .unwrap_or(*SPEEDS.last().expect("the speed ladder is not empty"))
 }
 
 /// A speed as an audiobook app writes it: `1×`, `1.25×`, `0.75×`.
@@ -170,7 +203,7 @@ struct Pipeline {
     ready: Condvar,
     /// A clip left the queue, or the era changed.
     room: Condvar,
-    /// How many clips may wait ahead of the one playing: `tts.prefetch`.
+    /// How many clips may wait ahead of the one playing: `voice.prefetch`.
     capacity: usize,
     era: AtomicU64,
     closed: AtomicBool,
@@ -277,12 +310,375 @@ impl Pipeline {
     }
 }
 
+/// Live controls for one clip.
+///
+/// Cancellation is tied to the queue era instead of a boolean that has to be
+/// reset. Once `stop()` advances the era, an old player can never miss a brief
+/// true/false pulse and carry on speaking. Pause is shared across eras because
+/// it preserves, rather than invalidates, the clip currently on the air.
+pub struct PlaybackControl {
+    pipeline: Arc<Pipeline>,
+    era: u64,
+    paused: Arc<AtomicBool>,
+    clock: Arc<PlaybackClock>,
+    events: Sender<SpeechEvent>,
+    id: u64,
+    range: (usize, usize),
+    chars: usize,
+    ms: u64,
+}
+
+impl PlaybackControl {
+    pub fn cancelled(&self) -> bool {
+        self.pipeline.is_closed() || self.pipeline.is_stale(self.era)
+    }
+
+    pub fn paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
+
+    /// Commit the only start that matters: the player has accepted the clip
+    /// and its presentation timestamp is now advancing.
+    pub fn started(&self) {
+        if self.clock.start(
+            self.id,
+            self.range,
+            self.chars,
+            self.ms,
+            self.era,
+            self.paused(),
+        ) {
+            let _ = self.events.send(SpeechEvent::Started {
+                id: self.id,
+                range: self.range,
+                chars: self.chars,
+                ms: self.ms,
+            });
+        }
+    }
+
+    /// Start a callback-driven clip whose position is measured in PCM frames.
+    pub fn started_frames(&self, total_frames: u64, sample_rate: u32) {
+        if self.clock.start_frames(
+            self.id,
+            self.range,
+            total_frames,
+            sample_rate,
+            self.era,
+            self.paused(),
+        ) {
+            let duration = frames_duration(total_frames, sample_rate);
+            let _ = self.events.send(SpeechEvent::Started {
+                id: self.id,
+                range: self.range,
+                chars: self.chars,
+                ms: duration.as_millis().min(u64::MAX as u128) as u64,
+            });
+        }
+    }
+
+    /// Publish an absolute audio-callback-boundary frame position.
+    pub fn presented_frames(&self, frames: u64) {
+        self.clock.present_frames(self.era, frames);
+    }
+
+    /// The player has actually stopped advancing its audio pointer.
+    pub fn pause_applied(&self) {
+        self.clock.pause(self.era);
+    }
+
+    /// The player has actually resumed its audio pointer.
+    pub fn resume_applied(&self) {
+        self.clock.resume(self.era);
+    }
+
+    fn finished(&self) {
+        self.clock.finish(self.era);
+    }
+}
+
+/// One sample from the global read-aloud presentation timeline.
+///
+/// Every visual consumer receives this same position. `elapsed` advances only
+/// while the player says it is advancing; synthesis, process startup and pause
+/// are deliberately absent from the timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaybackPosition {
+    pub id: u64,
+    pub range: (usize, usize),
+    pub elapsed: Duration,
+    pub duration: Duration,
+    pub paused: bool,
+    pub finished: bool,
+}
+
+struct ClockClip {
+    id: u64,
+    range: (usize, usize),
+    era: u64,
+    source: ClockSource,
+    duration: Duration,
+    finished: bool,
+}
+
+enum ClockSource {
+    /// Compatibility path for a configured OS player command, which cannot
+    /// report frames and therefore advances from a monotonic start instant.
+    Estimated {
+        elapsed: Duration,
+        running_since: Option<Instant>,
+    },
+    /// An embedded audio callback is authoritative. Wall time never advances
+    /// this source; only an absolute presented-frame report can move it.
+    Frames {
+        elapsed: Duration,
+        sample_rate: u32,
+        paused: bool,
+    },
+}
+
+impl ClockClip {
+    fn elapsed(&self) -> Duration {
+        match self.source {
+            ClockSource::Estimated {
+                elapsed,
+                running_since,
+            } => running_since
+                .map(|started| elapsed + started.elapsed())
+                .unwrap_or(elapsed),
+            ClockSource::Frames { elapsed, .. } => elapsed,
+        }
+        .min(self.duration)
+    }
+
+    fn paused(&self) -> bool {
+        match self.source {
+            ClockSource::Estimated { running_since, .. } => running_since.is_none(),
+            ClockSource::Frames { paused, .. } => paused,
+        }
+    }
+
+    fn advancing(&self) -> bool {
+        !self.finished && !self.paused()
+    }
+}
+
+#[derive(Default)]
+struct PlaybackClock {
+    clip: Mutex<Option<ClockClip>>,
+    changed: Condvar,
+}
+
+impl PlaybackClock {
+    fn lock(&self) -> MutexGuard<'_, Option<ClockClip>> {
+        self.clip
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn start(
+        &self,
+        id: u64,
+        range: (usize, usize),
+        _chars: usize,
+        ms: u64,
+        era: u64,
+        paused: bool,
+    ) -> bool {
+        let mut slot = self.lock();
+        if slot
+            .as_ref()
+            .is_some_and(|clip| clip.era == era && !clip.finished)
+        {
+            return false;
+        }
+        *slot = Some(ClockClip {
+            id,
+            range,
+            era,
+            source: ClockSource::Estimated {
+                elapsed: Duration::ZERO,
+                running_since: (!paused).then(Instant::now),
+            },
+            duration: Duration::from_millis(ms),
+            finished: false,
+        });
+        drop(slot);
+        self.changed.notify_all();
+        true
+    }
+
+    fn start_frames(
+        &self,
+        id: u64,
+        range: (usize, usize),
+        total_frames: u64,
+        sample_rate: u32,
+        era: u64,
+        paused: bool,
+    ) -> bool {
+        let mut slot = self.lock();
+        if sample_rate == 0
+            || slot
+                .as_ref()
+                .is_some_and(|clip| clip.era == era && !clip.finished)
+        {
+            return false;
+        }
+        *slot = Some(ClockClip {
+            id,
+            range,
+            era,
+            source: ClockSource::Frames {
+                elapsed: Duration::ZERO,
+                sample_rate,
+                paused,
+            },
+            duration: frames_duration(total_frames, sample_rate),
+            finished: false,
+        });
+        drop(slot);
+        self.changed.notify_all();
+        true
+    }
+
+    fn present_frames(&self, era: u64, frames: u64) {
+        let mut slot = self.lock();
+        let Some(clip) = slot.as_mut().filter(|clip| clip.era == era) else {
+            return;
+        };
+        let ClockSource::Frames {
+            elapsed,
+            sample_rate,
+            ..
+        } = &mut clip.source
+        else {
+            return;
+        };
+        *elapsed = frames_duration(frames, *sample_rate).min(clip.duration);
+    }
+
+    fn pause(&self, era: u64) {
+        let mut slot = self.lock();
+        let Some(clip) = slot.as_mut().filter(|clip| clip.era == era) else {
+            return;
+        };
+        match &mut clip.source {
+            ClockSource::Estimated {
+                elapsed,
+                running_since,
+            } => {
+                if let Some(started) = running_since.take() {
+                    *elapsed = (*elapsed + started.elapsed()).min(clip.duration);
+                }
+            }
+            ClockSource::Frames { paused, .. } => *paused = true,
+        }
+        drop(slot);
+        self.changed.notify_all();
+    }
+
+    fn resume(&self, era: u64) {
+        let mut slot = self.lock();
+        let Some(clip) = slot.as_mut().filter(|clip| clip.era == era) else {
+            return;
+        };
+        if !clip.finished {
+            match &mut clip.source {
+                ClockSource::Estimated { running_since, .. } => {
+                    if running_since.is_none() {
+                        *running_since = Some(Instant::now());
+                    }
+                }
+                ClockSource::Frames { paused, .. } => *paused = false,
+            }
+        }
+        drop(slot);
+        self.changed.notify_all();
+    }
+
+    fn finish(&self, era: u64) {
+        let mut slot = self.lock();
+        let Some(clip) = slot.as_mut().filter(|clip| clip.era == era) else {
+            return;
+        };
+        match &mut clip.source {
+            ClockSource::Estimated {
+                elapsed,
+                running_since,
+            } => {
+                *elapsed = clip.duration;
+                *running_since = None;
+            }
+            ClockSource::Frames {
+                elapsed, paused, ..
+            } => {
+                *elapsed = clip.duration;
+                *paused = false;
+            }
+        }
+        clip.finished = true;
+        drop(slot);
+        self.changed.notify_all();
+    }
+
+    fn clear(&self) {
+        *self.lock() = None;
+        self.changed.notify_all();
+    }
+
+    fn position(&self) -> Option<PlaybackPosition> {
+        let slot = self.lock();
+        let clip = slot.as_ref()?;
+        Some(PlaybackPosition {
+            id: clip.id,
+            range: clip.range,
+            elapsed: clip.elapsed(),
+            duration: clip.duration,
+            paused: clip.paused() && !clip.finished,
+            finished: clip.finished,
+        })
+    }
+
+    fn wait_until_paused(&self) {
+        let mut slot = self.lock();
+        while slot.as_ref().is_some_and(ClockClip::advancing) {
+            slot = self
+                .changed
+                .wait(slot)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn wait_until_running(&self) {
+        let mut slot = self.lock();
+        while slot
+            .as_ref()
+            .is_some_and(|clip| clip.paused() && !clip.finished)
+        {
+            slot = self
+                .changed
+                .wait(slot)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+}
+
+fn frames_duration(frames: u64, sample_rate: u32) -> Duration {
+    if sample_rate == 0 {
+        return Duration::ZERO;
+    }
+    let nanos = (frames as u128 * 1_000_000_000u128) / sample_rate as u128;
+    Duration::from_nanos(nanos.min(u64::MAX as u128) as u64)
+}
+
 /// Background speech: one thread rendering, one playing, `prefetch` clips of
 /// slack between them.
 pub struct Speaker {
     commands: Sender<Command>,
     events: Receiver<SpeechEvent>,
-    cancel: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    clock: Arc<PlaybackClock>,
     pipeline: Arc<Pipeline>,
     /// Sentences accepted but not yet finished playing. Zero means the reader
     /// can go back to timed reading.
@@ -308,7 +704,8 @@ impl Speaker {
         let engine = synth.describe();
         let (commands, command_rx) = channel::<Command>();
         let (event_tx, events) = channel::<SpeechEvent>();
-        let cancel = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
+        let clock = Arc::new(PlaybackClock::default());
         let pipeline = Arc::new(Pipeline::new(prefetch.max(1)));
         let inflight = Arc::new(AtomicUsize::new(0));
 
@@ -328,15 +725,17 @@ impl Speaker {
             .spawn({
                 let pipeline = Arc::clone(&pipeline);
                 let inflight = Arc::clone(&inflight);
-                let cancel = Arc::clone(&cancel);
-                move || play_loop(synth, event_tx, pipeline, inflight, cancel)
+                let paused = Arc::clone(&paused);
+                let clock = Arc::clone(&clock);
+                move || play_loop(synth, event_tx, pipeline, inflight, paused, clock)
             })
             .ok();
 
         Self {
             commands,
             events,
-            cancel,
+            paused,
+            clock,
             pipeline,
             inflight,
             render,
@@ -372,7 +771,7 @@ impl Speaker {
     /// the clip is rendered into a slot of its own and handed over the instant
     /// the same sentence is spoken for real. It costs one render either way, so
     /// a wrong guess costs nothing but the work — and it does not eat into
-    /// `tts.prefetch`, which is about the sentences of a passage already begun.
+    /// `voice.prefetch`, which is about the sentences of a passage already begun.
     pub fn prerender(&self, text: &str) {
         if text.trim().is_empty() {
             return;
@@ -380,16 +779,33 @@ impl Speaker {
         let _ = self.commands.send(Command::Warm(text.to_string()));
     }
 
+    /// Freeze the current clip at its audio cursor, leaving the queue intact.
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+        self.clock.wait_until_paused();
+    }
+
+    /// Continue the same clip from the audio cursor held by [`Speaker::pause`].
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+        self.clock.wait_until_running();
+    }
+
+    /// The single presentation timestamp sampled by text and highlighting.
+    pub fn position(&self) -> Option<PlaybackPosition> {
+        self.clock.position()
+    }
+
     /// Drop everything queued and silence the current clip.
     pub fn stop(&mut self) {
-        self.cancel.store(true, Ordering::SeqCst);
         self.pipeline.flush();
+        self.paused.store(false, Ordering::SeqCst);
+        self.clock.clear();
         self.pending = 0;
         self.sounding = false;
         self.inflight.store(0, Ordering::SeqCst);
         // Drain stale events so a later poll does not see the old run.
         while self.events.try_recv().is_ok() {}
-        self.cancel.store(false, Ordering::SeqCst);
     }
 
     /// Non-blocking read of everything that happened since the last call.
@@ -436,13 +852,13 @@ impl Speaker {
     /// exactly the dead air prefetch exists to remove, so this is what the
     /// pacing tests count.
     pub fn sounding(&self) -> bool {
-        self.sounding
+        self.sounding && !self.paused.load(Ordering::SeqCst)
     }
 }
 
 impl Drop for Speaker {
     fn drop(&mut self) {
-        self.cancel.store(true, Ordering::SeqCst);
+        self.pipeline.flush();
         self.pipeline.close();
         let _ = self.commands.send(Command::Stop);
         if let Some(render) = self.render.take() {
@@ -548,7 +964,8 @@ fn play_loop(
     events: Sender<SpeechEvent>,
     pipeline: Arc<Pipeline>,
     inflight: Arc<AtomicUsize>,
-    cancel: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    clock: Arc<PlaybackClock>,
 ) {
     while let Some(Rendered { job, clip }) = pipeline.pop() {
         if pipeline.is_stale(job.era) {
@@ -557,17 +974,23 @@ fn play_loop(
             continue;
         }
 
-        let _ = events.send(SpeechEvent::Started {
+        let control = PlaybackControl {
+            pipeline: Arc::clone(&pipeline),
+            era: job.era,
+            paused: Arc::clone(&paused),
+            clock: Arc::clone(&clock),
+            events: events.clone(),
             id: job.id,
             range: job.range,
             chars: job.text.chars().count(),
             ms: clip.ms,
-        });
-        let played = synth.play(&clip, &cancel);
+        };
+        let played = synth.play(&clip, &control);
+        control.finished();
         let _ = std::fs::remove_file(&clip.path);
         let _ = events.send(SpeechEvent::Finished { id: job.id });
         if let Err(err) = played
-            && !cancel.load(Ordering::SeqCst)
+            && !control.cancelled()
         {
             let _ = events.send(SpeechEvent::Failed {
                 message: format!("{err:#}"),
@@ -604,6 +1027,14 @@ mod tests {
     }
 
     #[test]
+    fn the_speed_ladder_steps_down_and_wraps() {
+        assert_eq!(previous_speed(1.25), 1.0);
+        assert_eq!(previous_speed(1.0), 0.75);
+        assert_eq!(previous_speed(0.75), 2.0);
+        assert_eq!(previous_speed(1.1), 1.0);
+    }
+
+    #[test]
     fn speeds_read_like_an_audiobook_app() {
         assert_eq!(speed_label(1.0), "1×");
         assert_eq!(speed_label(1.5), "1.5×");
@@ -616,8 +1047,10 @@ mod tests {
     /// can tell a pipeline from a queue.
     struct Fake {
         log: Arc<Mutex<Vec<(&'static str, Instant)>>>,
+        start: Duration,
         synth: Duration,
         play: Duration,
+        control_tick: Duration,
         /// While this stays true, `play` does not return. Parking the player
         /// inside a clip lets a test reason about the pipeline's shape without
         /// depending on how fast the machine happens to be.
@@ -628,10 +1061,22 @@ mod tests {
         fn new(log: &Arc<Mutex<Vec<(&'static str, Instant)>>>, synth: u64, play: u64) -> Self {
             Self {
                 log: Arc::clone(log),
+                start: Duration::ZERO,
                 synth: Duration::from_millis(synth),
                 play: Duration::from_millis(play),
+                control_tick: Duration::from_millis(2),
                 hold: None,
             }
+        }
+
+        fn starting_after(mut self, ms: u64) -> Self {
+            self.start = Duration::from_millis(ms);
+            self
+        }
+
+        fn checking_controls_every(mut self, ms: u64) -> Self {
+            self.control_tick = Duration::from_millis(ms);
+            self
         }
 
         fn parked(mut self, hold: &Arc<AtomicBool>) -> Self {
@@ -659,15 +1104,38 @@ mod tests {
             })
         }
 
-        fn play(&self, _clip: &Clip, _cancel: &AtomicBool) -> Result<()> {
+        fn play(&self, _clip: &Clip, control: &PlaybackControl) -> Result<()> {
+            std::thread::sleep(self.start);
             self.note("play-start");
-            std::thread::sleep(self.play);
+            control.started();
+            let mut remaining = self.play;
+            let mut sampled = Instant::now();
+            let mut paused = control.paused();
+            while !remaining.is_zero() && !control.cancelled() {
+                if control.paused() != paused {
+                    paused = control.paused();
+                    if paused {
+                        control.pause_applied();
+                    } else {
+                        control.resume_applied();
+                    }
+                }
+                let now = Instant::now();
+                if !paused {
+                    remaining = remaining.saturating_sub(now.saturating_duration_since(sampled));
+                }
+                sampled = now;
+                std::thread::sleep(self.control_tick);
+            }
             if let Some(hold) = &self.hold {
                 // The deadline is a safety net, not part of the contract: a bug
                 // should fail an assertion rather than hang the suite, and it is
                 // short because a failing run has to wait it out once per clip.
                 let deadline = Instant::now() + Duration::from_secs(2);
-                while hold.load(Ordering::SeqCst) && Instant::now() < deadline {
+                while hold.load(Ordering::SeqCst)
+                    && !control.cancelled()
+                    && Instant::now() < deadline
+                {
                     std::thread::sleep(Duration::from_millis(2));
                 }
             }
@@ -726,7 +1194,7 @@ mod tests {
         done
     }
 
-    /// The point of `tts.prefetch`: sentence two is rendered while sentence one
+    /// The point of `voice.prefetch`: sentence two is rendered while sentence one
     /// is still playing. Before the pipeline existed, every sentence boundary
     /// held a gap exactly as long as synthesis took.
     #[test]
@@ -851,6 +1319,152 @@ mod tests {
         hold.store(false, Ordering::SeqCst);
         drop(speaker);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pause_holds_the_live_clip_without_rendering_it_again() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let dir = scratch("pause");
+        let mut speaker = Speaker::spawn(Box::new(Fake::new(&log, 10, 240)), dir.clone(), 2);
+        speaker.speak(7, "a sentence.", (4, 15));
+        assert_eq!(count_at_least(&log, "play-start", 1), 1);
+
+        speaker.pause();
+        std::thread::sleep(Duration::from_millis(320));
+        assert_eq!(
+            count(&log, "play-end"),
+            0,
+            "the audio cursor advanced while playback was paused"
+        );
+        assert!(speaker.busy(), "pause must preserve the live sentence");
+
+        speaker.resume();
+        assert_eq!(wait_for_finishes(&mut speaker, 1), 1);
+        assert_eq!(
+            count(&log, "render-start"),
+            1,
+            "resume rendered the same sentence a second time"
+        );
+        drop(speaker);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The UI clock must begin when the player does, not when a rendered file
+    /// merely leaves the queue. Process startup is normally small, but it is
+    /// still real time in which advancing tokens or highlights would put the
+    /// page ahead of the sound.
+    #[test]
+    fn playback_started_is_reported_only_when_the_player_really_starts() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let dir = scratch("player-start");
+        let fake = Fake::new(&log, 10, 80).starting_after(180);
+        let mut speaker = Speaker::spawn(Box::new(fake), dir.clone(), 1);
+        speaker.speak(5, "a sentence.", (3, 14));
+        assert_eq!(count_at_least(&log, "render-end", 1), 1);
+
+        std::thread::sleep(Duration::from_millis(70));
+        assert!(
+            !speaker
+                .poll()
+                .iter()
+                .any(|event| matches!(event, SpeechEvent::Started { .. })),
+            "the global playback clock started while the OS player was still starting"
+        );
+
+        assert_eq!(count_at_least(&log, "play-start", 1), 1);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut started = false;
+        while !started && Instant::now() < deadline {
+            started = speaker
+                .poll()
+                .iter()
+                .any(|event| matches!(event, SpeechEvent::Started { .. }));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(started, "the real player start was never reported");
+        drop(speaker);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Returning from pause before the player has frozen means the UI and the
+    /// audio cursor record two different pause instants. The global clock's
+    /// pause boundary is the player's acknowledgement, even when that player
+    /// takes a noticeable polling interval to apply it.
+    #[test]
+    fn pause_returns_only_after_the_global_clock_is_frozen() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let dir = scratch("pause-ack");
+        let fake = Fake::new(&log, 5, 600).checking_controls_every(120);
+        let mut speaker = Speaker::spawn(Box::new(fake), dir.clone(), 1);
+        speaker.speak(8, "a sentence.", (0, 11));
+        assert_eq!(count_at_least(&log, "play-start", 1), 1);
+
+        speaker.pause();
+        let position = speaker.position().expect("the active playback clock");
+        assert!(
+            position.paused,
+            "pause returned while the global playback clock was still advancing"
+        );
+
+        speaker.resume();
+        drop(speaker);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pause requested while the OS player is starting belongs to that clip,
+    /// even though there is no audio cursor to acknowledge yet. Starting the
+    /// global clock as running would let text move under a paused reader and
+    /// makes resume jump by the whole process-start delay.
+    #[test]
+    fn a_clip_that_starts_during_pause_enters_the_clock_paused() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let dir = scratch("pause-during-start");
+        let fake = Fake::new(&log, 5, 400).starting_after(180);
+        let mut speaker = Speaker::spawn(Box::new(fake), dir.clone(), 1);
+        speaker.speak(13, "a sentence.", (0, 11));
+        assert_eq!(count_at_least(&log, "render-end", 1), 1);
+
+        speaker.pause();
+        assert_eq!(count_at_least(&log, "play-start", 1), 1);
+        let first = speaker.position().expect("the started clip");
+        assert!(first.paused, "the clip ignored the pending pause");
+        std::thread::sleep(Duration::from_millis(60));
+        let later = speaker.position().expect("the same clip");
+        assert_eq!(
+            later.elapsed, first.elapsed,
+            "the clock advanced while the player was paused"
+        );
+
+        speaker.resume();
+        drop(speaker);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Once a device callback owns the timeline, wall time is irrelevant. The
+    /// position is exactly the number of frames the output layer has reported,
+    /// and remains stable between callbacks even if the UI thread sleeps.
+    #[test]
+    fn a_frame_clock_advances_only_when_audio_frames_are_presented() {
+        let clock = PlaybackClock::default();
+        assert!(clock.start_frames(21, (2, 9), 48_000, 48_000, 7, false));
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(
+            clock.position().expect("frame clock").elapsed,
+            Duration::ZERO,
+            "wall time advanced a callback-driven clock"
+        );
+
+        clock.present_frames(7, 12_000);
+        assert_eq!(
+            clock.position().expect("frame clock").elapsed,
+            Duration::from_millis(250)
+        );
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(
+            clock.position().expect("frame clock").elapsed,
+            Duration::from_millis(250),
+            "the clock integrated a second, independent timer"
+        );
     }
 
     /// A speed change throws away everything rendered at the old speed. The

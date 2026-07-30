@@ -115,11 +115,10 @@ pub struct Turn {
     spoken: Option<(u64, String)>,
     /// How far into the current passage the text may go, in characters.
     ///
-    /// Read-aloud sets this to the end of the sentence being spoken. Without it
-    /// the reveal is only *nudged* towards the audio — the pacer is told the
-    /// clip's characters per second once the clip starts — and a voice that
-    /// reads Chinese at four characters a second cannot catch a reveal that
-    /// spent the whole synthesis wait running at forty-six.
+    /// Read-aloud continually sets this to the position projected from the
+    /// player's presentation timestamp. The pacer may service the turn first,
+    /// but it can never step past the last sampled audio position; the absolute
+    /// projection then fills the exact missing prefix.
     reveal_limit: Option<usize>,
     /// Whether a passage starting from now is going to be read aloud, and so
     /// should wait for its first clip instead of streaming into the silence.
@@ -256,6 +255,44 @@ impl Turn {
             }) => Some((*id, source.as_str(), *released)),
             _ => None,
         }
+    }
+
+    /// Project a passage onto an absolute playback position.
+    ///
+    /// Read-aloud does not earn characters by integrating a second clock. The
+    /// player supplies the exact target on its presentation timeline and the
+    /// turn releases precisely the missing prefix, ignoring phrase pauses and
+    /// the normal text pacer's minimum speed.
+    pub fn reveal_passage_to(&mut self, id: u64, target: usize, sb: &mut Scrollback) -> bool {
+        let Some(Active::Stream {
+            id: active,
+            kind: StreamKind::Passage,
+            queue,
+            released,
+            source,
+            ..
+        }) = self.active.as_mut()
+        else {
+            return false;
+        };
+        if *active != id {
+            return false;
+        }
+
+        let target = target.min(source.chars().count()).max(*released);
+        let text = drain_chars(queue, target.saturating_sub(*released));
+        if !text.is_empty() {
+            *released += text.chars().count();
+            let counted = text.chars().filter(|c| *c != '\n').count();
+            self.turn_chars += counted;
+            self.session_chars += counted;
+            sb.push_chunk(id, &text);
+        }
+        // The normal pacer still runs for manual/auto and for the turn machine,
+        // but while a voice owns this passage it may never step past the PTS
+        // sampled above.
+        self.reveal_limit = Some(*released);
+        true
     }
 
     pub fn busy(&self) -> bool {
@@ -476,6 +513,27 @@ impl Turn {
 
 fn elapsed_ms(since: Instant) -> u64 {
     since.elapsed().as_millis() as u64
+}
+
+/// Remove exactly `wanted` characters without applying phrase timing.
+fn drain_chars(queue: &mut VecDeque<Chunk>, mut wanted: usize) -> String {
+    let mut out = String::new();
+    while wanted > 0 {
+        let Some(front) = queue.front_mut() else {
+            break;
+        };
+        let chars = front.text.chars().count();
+        if chars <= wanted {
+            let chunk = queue.pop_front().expect("front checked");
+            wanted -= chars;
+            out.push_str(&chunk.text);
+        } else {
+            out.extend(front.text.chars().take(wanted));
+            front.text = front.text.chars().skip(wanted).collect();
+            wanted = 0;
+        }
+    }
+    out
 }
 
 #[cfg(test)]

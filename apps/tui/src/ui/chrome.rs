@@ -29,8 +29,7 @@ pub struct Chrome<'a> {
     /// whitelist. Shown wherever the engine name would be, because a silent
     /// mute is indistinguishable from a broken engine.
     pub audio_muted: bool,
-    /// Which of the three reading modes is in force, shown as a chip the way a
-    /// coding agent shows the mode `shift+tab` cycles.
+    /// Manual, auto or read-aloud, shown as the chip `shift+tab` cycles.
     pub mode: crate::mode::Mode,
     /// Reading pace, shown where a coding agent shows reasoning effort: beside the
     /// model name.
@@ -155,7 +154,12 @@ pub fn render_activity(area: Rect, buf: &mut Buffer, c: &Chrome<'_>) {
             Style::default().fg(th.accent_warning),
         ),
         Span::styled(
-            t("chrome.paused").to_string(),
+            t(if c.mode == crate::mode::Mode::Speak {
+                "chrome.audio_paused"
+            } else {
+                "chrome.paused"
+            })
+            .to_string(),
             Style::default().fg(th.accent_thinking),
         ),
     ]);
@@ -193,7 +197,15 @@ pub fn render_status(area: Rect, buf: &mut Buffer, c: &Chrome<'_>) {
         // only the way out of it belongs.
         vec![
             Span::raw("  "),
-            Span::styled(t("chrome.paused_keys").to_string(), faint),
+            Span::styled(
+                t(if c.mode == crate::mode::Mode::Speak {
+                    "chrome.audio_paused_keys"
+                } else {
+                    "chrome.paused_keys"
+                })
+                .to_string(),
+                faint,
+            ),
         ]
     } else if let Some(notice) = c.notice {
         vec![
@@ -218,7 +230,12 @@ pub fn render_status(area: Rect, buf: &mut Buffer, c: &Chrome<'_>) {
             ),
         ];
         spans.extend(speech_span(c));
-        spans.push(Span::styled(t("chrome.busy_tail").to_string(), faint));
+        let tail = if c.mode == crate::mode::Mode::Speak {
+            "chrome.aloud_tail"
+        } else {
+            "chrome.busy_tail"
+        };
+        spans.push(Span::styled(t(tail).to_string(), faint));
         spans
     } else if c.scrolled {
         vec![
@@ -261,8 +278,13 @@ pub fn render_status(area: Rect, buf: &mut Buffer, c: &Chrome<'_>) {
         spans
     };
 
+    let mode_chip = if c.mode == crate::mode::Mode::Speak {
+        format!("{} [ / ]", crate::mode::chip(c.mode))
+    } else {
+        crate::mode::chip(c.mode)
+    };
     let mut right = vec![Span::styled(
-        format!("{}  ", crate::mode::chip(c.mode)),
+        format!("{mode_chip}  "),
         Style::default().fg(if c.mode.scrolls() {
             th.accent_success
         } else {
@@ -307,17 +329,18 @@ const HELP: &[(&str, &str, &str)] = &[
     ("⏎", "载入下一段；命令以 / 开头", "load the next passage; commands start with /"),
     ("⏎ (输出中 / mid-turn)", "加速当前这一轮，直接读到底", "rush the current turn to its end"),
     ("esc", "中断这一轮，位置留在原处；回车接着读", "interrupt the turn, keeping your place; ⏎ carries on"),
-    ("空格 space", "停下 / 接着读，跟播放器一个意思（输入框是空的时候）",
-        "stop or carry on, the way it works in a player (when the line is empty)"),
-    ("shift+tab", "循环三种模式：手动 / 自动滚动 / 朗读",
-        "cycle the modes: manual / auto-scroll / read-aloud"),
+    ("空格 space", "原地暂停 / 从同一音频位置继续（输入框是空的时候）",
+        "pause in place / resume at the same audio position (when the line is empty)"),
+    ("[ / ]", "朗读减速 / 加速", "slower / faster read-aloud"),
+    ("shift+tab", "循环手动 / 自动 / 朗读模式",
+        "cycle manual / auto / read-aloud"),
     ("↑ ↓ / 滚轮 wheel", "滚动；手动模式下滚到底会载入下一段",
         "scroll; in manual mode, at the bottom it loads more"),
     ("pgup pgdn / home end", "翻页；到顶 / 到底", "by page; to the top / to the tail"),
     ("^p ^n", "翻输入历史", "input history"),
     ("^t", "展开/折叠思考过程", "fold or unfold reasoning"),
     ("^o", "展开/折叠工具调用", "fold or unfold tool calls"),
-    ("^s", "开关朗读", "toggle read-aloud"),
+    ("^s", "进入朗读 / 返回之前模式", "enter read-aloud / return to the previous mode"),
     ("^r", "推理强度下一档，也就是读快一点/慢一点", "next reasoning effort: read faster or slower"),
     ("^l", "清屏", "clear the screen"),
     ("^c ^d", "退出；正在输出时 ^c 先把这一轮丢掉（esc 只是中断，还能接着读）",
@@ -335,8 +358,8 @@ const HELP: &[(&str, &str, &str)] = &[
     ("/next /prev", "下一章 / 上一章", "next / previous chapter"),
     ("/find <term>", "全书检索；输序号跳到那一处", "search the book; type a number to jump"),
     ("^g ^b", "下一处 / 上一处命中", "next / previous hit"),
-    ("/mode [manual|auto|tts]", "三种读法；shift+tab 也能切",
-        "the three reading modes; shift+tab cycles too"),
+    ("/mode [manual|auto|aloud]", "手动 / 自动 / 朗读；shift+tab 循环",
+        "manual / auto / read-aloud; shift+tab cycles"),
     ("/plan", "章节清单", "chapters as a plan"),
     ("/context", "阅读上下文", "context window readout"),
     ("/progress", "进度摘要", "one-line progress"),
@@ -347,9 +370,8 @@ const HELP: &[(&str, &str, &str)] = &[
     ("", "", ""),
     ("/effort [level]", "推理强度：minimal…max，越高读得越慢",
         "reasoning effort: minimal…max, higher reads slower"),
-    ("/tts [engine]", "用哪个引擎念；没装的当场装",
-        "which voice reads to you; installs one that is missing"),
-    ("/voice <name>", "换音色", "change voice"),
+    ("/voice [auto|zh|en|音色|引擎]", "谁来念：引擎、音色、语种；没装的当场装",
+        "who reads: engine, voice, language; installs one that is missing"),
     ("/rate <0.5-3>", "改当前强度这一档的倍数", "retune the current effort level"),
     ("/device", "音频输出白名单：只在指定设备上出声",
         "audio output whitelist: only speak on devices you name"),

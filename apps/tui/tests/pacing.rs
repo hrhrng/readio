@@ -19,6 +19,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use ratatui::Terminal;
@@ -28,7 +29,7 @@ use readio::app::App;
 use readio::book::Book;
 use readio::library::Library;
 use readio::store::Store;
-use readio::tts::config::EngineSpec;
+use readio::voice::config::EngineSpec;
 
 /// How long the stand-in engine pretends to spend synthesizing a sentence.
 ///
@@ -51,10 +52,23 @@ const SLOW_SYNTH_MS: u64 = 2_000;
 /// A clip long enough to render the next paragraph's opening sentence inside.
 const LONG_CLIP_MS: u64 = 2_000;
 
-/// These tests share one `config.yaml`, so they take turns.
+/// Paths are process-global, so these tests take turns while each fixture gets
+/// its own home. Sharing one `config.yaml` and speech scratch directory made a
+/// device-gate test that deliberately tears down the pipeline leak timing into
+/// whichever read-aloud test happened to run next.
 fn exclusive() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn fixture_home() -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let home = common::isolated_home()
+        .join("cases")
+        .join(NEXT.fetch_add(1, Ordering::Relaxed).to_string());
+    std::fs::create_dir_all(&home).expect("fixture home");
+    readio::paths::set_home(&home);
+    home
 }
 
 /// A silent mono wav of `ms` milliseconds, which is all the clock needs: the
@@ -146,21 +160,29 @@ fn fixture(book_path: PathBuf) -> (App, Terminal<TestBackend>) {
 
 /// The same, with the engine's timing chosen: slow to render, or slow to speak.
 fn fixture_with(book_path: PathBuf, synth_ms: u64, clip_ms: u64) -> (App, Terminal<TestBackend>) {
-    let home = common::isolated_home();
+    fixture_with_query(book_path, synth_ms, clip_ms, "")
+}
+
+fn fixture_with_query(
+    book_path: PathBuf,
+    synth_ms: u64,
+    clip_ms: u64,
+    output_query: &str,
+) -> (App, Terminal<TestBackend>) {
+    let home = fixture_home();
     let mut config = readio::config::Config::load().0;
-    // Read-aloud is entered below the way a reader enters it, with `/mode tts`,
-    // so the switch itself is part of what these tests cover.
-    config.tts.enabled = false;
-    config.tts.engine = "stand-in".to_string();
-    config.tts.voice.clear();
-    config.tts.prefetch = 2;
-    config.tts.output.allow.clear();
-    config.tts.engines.insert(
+    config.reading.mode = readio::mode::Mode::Manual;
+    config.voice.enabled = false;
+    config.voice.engine = "stand-in".to_string();
+    config.voice.name.clear();
+    config.voice.prefetch = 2;
+    config.voice.output.allow.clear();
+    config.voice.output.query = output_query.to_string();
+    config.voice.engines.insert(
         "stand-in".to_string(),
-        stand_in_engine(home, synth_ms, clip_ms),
+        stand_in_engine(&home, synth_ms, clip_ms),
     );
     config.reading.speed = 46.0;
-    config.reading.auto = false;
     config.effort = readio::config::EffortConfig::default();
     let _ = config.save();
 
@@ -237,19 +259,16 @@ fn type_line(app: &mut App, line: &str) {
     app.on_key(KeyEvent::from(KeyCode::Enter));
 }
 
-/// Settle the opening turn, switch to read-aloud, and wait for book text to
-/// start streaming.
+/// Settle the opening turn, enter read-aloud, and wait for its text to start
+/// streaming.
 fn start_reading_aloud(app: &mut App, terminal: &mut Terminal<TestBackend>) {
     until(app, terminal, "the opening turn", |app| !app.turn.busy());
     type_line(app, "/mode tts");
+    assert_eq!(app.mode(), readio::mode::Mode::Speak);
+    assert!(app.speech_enabled(), "the stand-in voice should start");
     until(app, terminal, "the passage to start", |app| {
         shown(app).is_some()
     });
-    assert_eq!(
-        app.mode(),
-        readio::mode::Mode::Speak,
-        "the stand-in engine should have been good enough to switch"
-    );
 }
 
 /// Characters of the passage now on screen.
@@ -287,6 +306,51 @@ fn a_passage_shows_nothing_until_its_first_clip_exists() {
     });
 }
 
+/// Token reveal is a projection of the playback PTS, not a second pacer.
+///
+/// The opening utterance says `第1章`, whose source prefix is the six-character
+/// heading `## 第1章`. Its clip is exactly two seconds long, so just after one
+/// second exactly half that source belongs on screen. The old independent
+/// character clock clamps itself to four characters per second and has already
+/// run ahead here.
+#[test]
+fn token_reveal_samples_the_global_playback_position() {
+    let _guard = exclusive();
+    let (mut app, mut terminal) = fixture_with(
+        long_chapters(common::isolated_home()),
+        SYNTH_MS,
+        LONG_CLIP_MS,
+    );
+    start_reading_aloud(&mut app, &mut terminal);
+    until(&mut app, &mut terminal, "the playback clock", |app| {
+        app.voice_sounding()
+    });
+
+    until(&mut app, &mut terminal, "half of the opening clip", |app| {
+        app.voice_position()
+            .is_some_and(|position| position.elapsed >= Duration::from_millis(1_050))
+    });
+    let position = app.voice_position().expect("a playback position");
+    let (_, source, _) = app.turn.passage_in_flight().expect("the opening passage");
+    assert_eq!(
+        &source[position.range.0..position.range.1],
+        "第1章",
+        "the fixture's opening utterance changed"
+    );
+    assert_eq!(
+        source[..position.range.1].chars().count(),
+        6,
+        "the fixture's heading prefix changed"
+    );
+    let expected =
+        (6 * position.elapsed.as_millis() / position.duration.as_millis().max(1)) as usize;
+    assert_eq!(
+        shown(&app),
+        Some(expected),
+        "the text clock drifted away from the global playback position"
+    );
+}
+
 /// The pacing itself, measured rather than reasoned about.
 ///
 /// One chapter of twenty sentences is one passage, long enough that eight
@@ -314,7 +378,17 @@ fn the_text_never_gets_ahead_of_the_voice() {
         spoken <= 110,
         "{spoken} characters in eight seconds is faster than anything said them"
     );
-    assert!(spoken > 20, "only {spoken} characters: nothing was read");
+    assert!(
+        spoken > 20,
+        "only {spoken} characters: nothing was read\n\
+         mode={:?} speech={} busy={} sounding={} position={:?}\n{}",
+        app.mode(),
+        app.speech_enabled(),
+        app.turn.busy(),
+        app.voice_sounding(),
+        app.voice_position(),
+        screen(&terminal)
+    );
 }
 
 /// And the hold has to let go. A reveal that waits for a voice is one missed
@@ -328,18 +402,189 @@ fn reading_carries_on_by_itself_when_the_voice_finishes_a_chapter() {
     start_reading_aloud(&mut app, &mut terminal);
     let before = app.turn.session_chars;
 
-    // A chapter is a heading and four sentences: five clips, thirty-four
-    // characters, four and a half seconds of audio.
-    let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(8) {
-        tick(&mut app, &mut terminal);
-    }
+    // This assertion is about liveness, not throughput. Thought/Read/Write
+    // timing and synthesis all share the machine with the test runner, so a
+    // fixed eight-second sample can catch a healthy reader in the transition
+    // between chapters. Wait for proof that some of chapter two was revealed;
+    // `until` still gives a stopped reader a hard deadline.
+    until(
+        &mut app,
+        &mut terminal,
+        "read-aloud to enter chapter two",
+        |app| app.turn.session_chars.saturating_sub(before) > 36,
+    );
     let spoken = app.turn.session_chars - before;
 
     assert!(
         spoken > 36,
         "only {spoken} characters, which is the first chapter and no more: \
-         reading stopped instead of carrying on into the next"
+         reading stopped instead of carrying on into the next\n\
+         mode={:?} speech={} busy={} sounding={} position={:?}\n{}",
+        app.mode(),
+        app.speech_enabled(),
+        app.turn.busy(),
+        app.voice_sounding(),
+        app.voice_position(),
+        screen(&terminal)
+    );
+}
+
+#[test]
+fn read_aloud_continues_without_becoming_auto() {
+    let _guard = exclusive();
+    let (mut app, mut terminal) = fixture(short_chapters(common::isolated_home()));
+    start_reading_aloud(&mut app, &mut terminal);
+    let before = app.turn.session_chars;
+
+    until(&mut app, &mut terminal, "read-aloud to keep going", |app| {
+        app.turn.session_chars.saturating_sub(before) > 36
+    });
+    let spoken = app.turn.session_chars - before;
+
+    assert_eq!(
+        app.mode(),
+        readio::mode::Mode::Speak,
+        "continuous read-aloud is its own mode, not auto with a speaker attached"
+    );
+    assert!(app.speech_enabled());
+    assert!(
+        spoken > 36,
+        "only {spoken} characters: read-aloud stopped after one passage while its voice was healthy\n\
+         speech={} busy={} sounding={} position={:?}\n{}",
+        app.speech_enabled(),
+        app.turn.busy(),
+        app.voice_sounding(),
+        app.voice_position(),
+        screen(&terminal)
+    );
+}
+
+#[test]
+fn losing_the_allowed_audio_device_stops_without_becoming_auto() {
+    let _guard = exclusive();
+    let home = common::isolated_home();
+    let source = long_chapters(home);
+    let query = home.join("current-output");
+    std::fs::write(&query, "#!/bin/sh\necho desk-speakers\n").expect("write output query");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&query, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod output query");
+    }
+    let (mut app, mut terminal) =
+        fixture_with_query(source, SYNTH_MS, CLIP_MS, &query.display().to_string());
+    start_reading_aloud(&mut app, &mut terminal);
+
+    type_line(&mut app, "/device allow headphones");
+    for _ in 0..8 {
+        tick(&mut app, &mut terminal);
+    }
+    let view = screen(&terminal);
+
+    assert_eq!(
+        app.mode(),
+        readio::mode::Mode::Speak,
+        "losing an allowed output must not rewrite read-aloud to auto"
+    );
+    assert!(
+        !app.turn.busy(),
+        "tokens must stop when the selected audio output is unavailable:\n{view}"
+    );
+    assert!(
+        !app.voice_sounding(),
+        "audio queued for the wrong output must be stopped"
+    );
+}
+
+#[test]
+fn resuming_read_aloud_restores_the_voice_clock_before_tokens_move() {
+    let _guard = exclusive();
+    let (mut app, mut terminal) = fixture(long_chapters(common::isolated_home()));
+    start_reading_aloud(&mut app, &mut terminal);
+
+    app.on_key(KeyEvent::from(KeyCode::Char(' ')));
+    assert!(app.turn.paused(), "space should pause the read-aloud turn");
+    app.on_key(KeyEvent::from(KeyCode::Char(' ')));
+
+    assert!(!app.turn.paused(), "space should resume the turn");
+    assert_eq!(app.mode(), readio::mode::Mode::Speak);
+    assert!(
+        app.turn.held() || app.voice_runway() > 0,
+        "resuming must restore a TTS clock before any more tokens can move"
+    );
+}
+
+/// Pause belongs to the audio timeline, not to the sentence queue.
+///
+/// Re-queueing the sentence on resume sounds like a stutter and also pays the
+/// synthesis cost a second time. A long clip with a deliberately slow synth
+/// makes the distinction observable without listening: resuming an existing
+/// audio pointer advances promptly, while synthesizing the sentence again
+/// cannot possibly do so inside this window.
+#[test]
+fn pause_and_resume_keep_the_exact_audio_pointer() {
+    let _guard = exclusive();
+    let source = long_chapters(common::isolated_home());
+    let (mut app, mut terminal) = fixture_with(source, SYNTH_MS, LONG_CLIP_MS);
+    start_reading_aloud(&mut app, &mut terminal);
+    until(
+        &mut app,
+        &mut terminal,
+        "the first spoken character",
+        |app| shown(app).is_some_and(|chars| chars > 0),
+    );
+
+    app.on_key(KeyEvent::from(KeyCode::Char(' ')));
+    assert!(app.turn.paused(), "space should pause the audio timeline");
+    assert!(
+        !app.voice_sounding(),
+        "paused audio must not report itself as audible"
+    );
+    let held = shown(&app).expect("a passage is in flight");
+    let paused_until = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < paused_until {
+        tick(&mut app, &mut terminal);
+        assert_eq!(
+            shown(&app),
+            Some(held),
+            "tokens moved while the audio pointer was paused"
+        );
+    }
+
+    app.on_key(KeyEvent::from(KeyCode::Char(' ')));
+    let resumed = Instant::now();
+    until(
+        &mut app,
+        &mut terminal,
+        "the held audio pointer to move",
+        |app| shown(app).is_some_and(|chars| chars > held),
+    );
+    assert!(
+        resumed.elapsed() < Duration::from_millis(650),
+        "resume waited for the sentence to synthesize again instead of continuing its audio"
+    );
+}
+
+#[test]
+fn read_aloud_exposes_and_obeys_bracket_speed_keys() {
+    let _guard = exclusive();
+    let (mut app, mut terminal) = fixture_with(
+        long_chapters(common::isolated_home()),
+        SYNTH_MS,
+        LONG_CLIP_MS,
+    );
+    start_reading_aloud(&mut app, &mut terminal);
+
+    app.on_key(KeyEvent::from(KeyCode::Char(']')));
+    assert_eq!(app.multiplier(), 1.25, "] should make read-aloud faster");
+    app.on_key(KeyEvent::from(KeyCode::Char('[')));
+    assert_eq!(app.multiplier(), 1.0, "[ should make read-aloud slower");
+
+    let view = screen(&terminal);
+    assert!(
+        view.contains("[ / ]") || view.contains("[ ]"),
+        "read-aloud should print its speed keys where they can be discovered:\n{view}"
     );
 }
 

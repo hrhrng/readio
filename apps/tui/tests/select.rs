@@ -282,46 +282,57 @@ fn import_offers_paths_and_walks_into_directories() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Choosing a voice is a choice among a handful of engines, so it is a select
-/// like every other choice — and the rows have to answer the question a reader
-/// actually has, which is "which of these do I already have".
-///
-/// There is no on and no off in it: read-aloud is a reading mode, and shift+tab
-/// owns that. Nothing here installs anything either — the one engine whose
-/// answer is fixed on every machine is the server, which readio never installs
-/// and says so.
+/// Voice is a workspace rather than another select: model acquisition and
+/// scoped configuration are visible together, but remain independent.
 #[test]
-fn tts_asks_which_voice_and_never_offers_to_install_a_server() {
+fn the_voice_workspace_separates_models_from_configuration() {
     let (mut app, mut terminal) = fixture();
     settle(&mut app, &mut terminal);
 
-    let view = command(&mut app, &mut terminal, "/tts");
-    for engine in ["kokoro", "piper", "supertonic", "openai"] {
-        assert!(view.contains(engine), "{engine} is on offer:\n{view}");
-    }
+    let view = command(&mut app, &mut terminal, "/voice");
     assert!(
-        !view.contains("│❯ /tts"),
-        "and the composer is left alone:\n{view}"
+        view.contains("模型库") && view.contains("Voice 配置"),
+        "both independent dimensions share one workspace:\n{view}"
     );
+    assert!(
+        view.contains("kokoro") && view.contains("openai"),
+        "the model library shows every preset:\n{view}"
+    );
+    assert!(
+        !view.contains("auto"),
+        "sentence-language routing is not offered:\n{view}"
+    );
+}
 
-    // Narrowing to the server shows what readio will not do.
-    type_text(&mut app, "openai");
+/// Nothing in the list installs a server: the one engine whose answer is fixed
+/// on every machine is the one readio never installs, and it says so.
+#[test]
+fn a_server_is_never_offered_for_installing() {
+    let (mut app, mut terminal) = fixture();
+    settle(&mut app, &mut terminal);
+
+    command(&mut app, &mut terminal, "/voice");
+    for _ in 0..3 {
+        app.on_key(key(KeyCode::Down));
+    }
     let view = draw(&mut app, &mut terminal);
     assert!(
-        view.contains("服务端"),
+        view.contains("外部服务"),
         "a server is not a package:\n{view}"
     );
 
-    // ⏎ on it switches engine rather than installing anything.
+    // ⏎ on it neither downloads nor configures anything.
     app.on_key(key(KeyCode::Enter));
     let view = settle(&mut app, &mut terminal);
     assert!(
-        !view.contains("uv tool install") && !view.contains("pipx install"),
+        !view.contains("确认下载")
+            && !view.contains("uv tool install")
+            && !view.contains("pipx install"),
         "nothing was installed:\n{view}"
     );
 }
 
-/// `/tts install openai` reaches the same answer the select gives, and says
+/// `/voice install openai` reaches the same answer the select gives, and says
 /// where to read about the thing readio cannot do for you.
 ///
 /// It is spelled out rather than picked because the menu would otherwise answer
@@ -331,7 +342,7 @@ fn installing_a_server_explains_itself_instead_of_running_a_command() {
     let (mut app, mut terminal) = fixture();
     settle(&mut app, &mut terminal);
 
-    let view = command(&mut app, &mut terminal, "/tts install openai");
+    let view = command(&mut app, &mut terminal, "/voice install openai");
     assert!(
         view.contains("自己起的服务"),
         "it says what openai is:\n{view}"
@@ -348,28 +359,26 @@ fn installing_something_that_is_not_an_engine_is_refused() {
     let (mut app, mut terminal) = fixture();
     settle(&mut app, &mut terminal);
 
-    let view = command(&mut app, &mut terminal, "/tts install nosuchengine");
+    let view = command(&mut app, &mut terminal, "/voice install nosuchengine");
     assert!(
         view.contains("没有这个引擎"),
         "and it lists the ones there are:\n{view}"
     );
 }
 
-/// `/tts on` was a switch once, and muscle memory outlives a rewrite.
+/// `/tts on` was a switch once, and muscle memory outlives a rewrite. So is
+/// `/tts` itself: it is the old name for `/voice`, and both have to land.
 ///
-/// The reply has to teach the gesture that replaced it rather than report a
-/// missing engine called "on", which is true and useless.
+/// The reply has to teach the gesture that replaced the switch rather than
+/// report a missing voice called "on", which is true and useless.
 #[test]
 fn asking_to_switch_speech_on_points_at_the_key_that_does_it() {
     let (mut app, mut terminal) = fixture();
     settle(&mut app, &mut terminal);
 
-    for word in ["/tts on", "/tts off"] {
+    for word in ["/voice on", "/voice off", "/tts on", "/tts off"] {
         let view = command(&mut app, &mut terminal, word);
-        assert!(
-            view.contains("shift+tab"),
-            "{word} should name the key:\n{view}"
-        );
+        assert!(view.contains("^s"), "{word} should name the key:\n{view}");
         assert!(
             !view.contains("没有这个引擎"),
             "{word} is not a misspelled engine:\n{view}"

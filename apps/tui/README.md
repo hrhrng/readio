@@ -52,7 +52,7 @@ src/
     scrollback.rs entries, per-entry line cache, tail-following viewport, pixel layer
     prompt.rs     single-line editor with a grapheme-level cursor
     chrome.rs     top bar, status line, help panel
-  tts/
+  voice/
     config.rs     engine templates and presets
     device.rs     the output allowlist: probing, matching, the mute decision
     sentence.rs   sentence splitting, and the word or character unit highlighting walks
@@ -95,25 +95,25 @@ Progress is cumulative characters over the whole book, the model most readers us
 
 The cover, when a book declares one — EPUB 3's `properties="cover-image"` or EPUB 2's `<meta name="cover">` — is shown when the book is opened, not when it is resumed. A picture that reappears every time the reader presses enter on their history is furniture.
 
-## Three ways to read
+## Reading modes
 
-A reader is doing one of three things, so readio has one setting with three values rather than two switches with four combinations — one of which, "listening while the passages have stopped coming", never made sense.
+Reading has three parallel, persistent modes:
 
-| Mode | Chip | What moves the text |
+| Mode | Control | What it does |
 | --- | --- | --- |
-| Manual | `⏵ manual` | `⏎`, or `↓` `pgdn` and the wheel once you are at the bottom |
-| Auto-scroll | `⏵⏵ auto` | nothing to press: passages follow one another |
-| Read-aloud | `⏵⏵ aloud` | the voice, which brings its own scrolling |
+| Manual | `shift+tab`, `/mode manual` | waits for the reader to request the next passage |
+| Auto | `shift+tab`, `/mode auto` | requests passages continuously and reveals them at the configured text pace |
+| Read-aloud | `shift+tab`, `/mode aloud`, `^s` | requests passages continuously, but makes TTS the token clock |
 
-`shift+tab` cycles them, which is the gesture a coding agent uses for exactly this kind of switch, and `/mode [manual|auto|tts]` says it in words. The chip carries no musical note and never will: a `♪` in the corner of the screen announces a media player, which is the one thing this interface must not look like.
-
-`mode::Mode` is not stored. It is read back from the two flags that already existed — `reading.auto` and `tts.enabled` — through `Mode::of`, and `App::set_mode` is the only thing that writes them, which is what keeps them from disagreeing. Entering read-aloud with no working engine is refused rather than half-applied: `start_speaker` says why, the flags stay where they were, and a `shift+tab` cycle skips the mode instead of trapping the reader in it.
+`shift+tab` cycles Manual → Auto → Read-aloud. `^s` is a shortcut into
+Read-aloud and returns to the previous mode when pressed again. The one mode is
+stored as `reading.mode`; Voice is not a second on/off state.
 
 Three smaller rules came out of using it:
 
-- **A mode is a setting, not a consequence.** `esc` interrupts the turn and `⏎` picks it back up, but neither demotes auto-scroll to manual. Interrupting used to do exactly that, which is how a reader could stop, press enter, and watch the same paragraph arrive twice.
+- **Continuation is a setting, not a consequence.** `esc` interrupts the turn and `⏎` picks it back up, but neither demotes auto-reading to manual. Opening a book does not demote it either.
 - **In manual mode the bottom of the page loads more.** `↓`, `pgdn` and the wheel scroll as usual until there is nothing below, and then they fetch the next passage, the way reaching the end of a list loads the next page.
-- **A mode explains itself once.** The first switch prints a full line — what moves, how to change its speed, how to interrupt it. After that a switch is a flash in the status row, because someone cycling with `shift+tab` does not want the paragraph three times.
+- **Read-aloud has no automatic fallback.** While a clip is spoken, tokens cannot outrun it. Slow synthesis makes the tokens wait. If TTS is missing or fails, reading stops in Read-aloud mode until the reader retries or explicitly chooses another mode; it never becomes Auto.
 
 ## Pace, as reasoning effort
 
@@ -139,7 +139,7 @@ Clips are rendered at a speed rather than resampled at playback, so a level chan
 The menu has two levels, because a value is as hard to remember as a command.
 
 1. `/` and a partial name offers commands: name, argument shape, and a one-line description.
-2. `/name ` offers that command's answers. For a fixed set — `/effort`, `/mode`, `/lang`, `/tts` — those are the levels, modes, languages and engines, each with what it means and `(active)` on the one in force; nobody should have to know that `xhigh` is spelled without a hyphen, or which of their engines the config calls `piper`. For a command whose answers are the reader's own things — `/open`, `/goto`, `/marks`, `/unmark` — they are their books, chapters and bookmarks. For `/import` they are files and directories, read from the disk.
+2. `/name ` offers that command's answers. For a fixed set — `/effort`, `/mode`, `/lang`, `/voice` — those are the levels, modes, languages, voices and engines, each with what it means and `(active)` on the one in force; nobody should have to know that `xhigh` is spelled without a hyphen, or which of their engines the config calls `piper`. For a command whose answers are the reader's own things — `/open`, `/goto`, `/marks`, `/unmark` — they are their books, chapters and bookmarks. For `/import` they are files and directories, read from the disk.
 
 `↑` `↓` move, `tab` completes the highlighted row, `⏎` runs it — or completes it, when the command cannot run without an argument. The bracket in `args` is what decides: `<n>` means `⏎` completes, `[n]` means the bare form does something worth seeing. Value rows are built per frame rather than declared, because half of what they say — which level is active, what multiplier it stands for, which engines are installed — is a fact about the reader's config.
 
@@ -165,7 +165,7 @@ Offsets are the fragile part, and there are two conversions: collapsing whitespa
 
 - **Every occurrence counts, not one per paragraph.** `Book::search` returns `Hits { total, paragraphs, shown }`, so a header reading `pattern: memory · 45 matches · 30 lines · showing 12` is arithmetic rather than decoration.
 - **Matching happens on a folded copy.** `fold()` lowercases and maps full-width forms down to ASCII (U+FF01..FF5E minus 0xFEE0, U+3000 to a space) while recording the original byte index for every folded byte, so highlight ranges land correctly back in the source text. A term typed on an English keyboard finds text typeset in Chinese.
-- **Hits are reachable.** Type a number to jump, `^g` and `^b` to walk the list; wrapping says so. Arriving lights the term deeply inside its lightly washed sentence, sharing the two-level highlight with read-aloud — the sentence comes from `tts::sentence::split`.
+- **Hits are reachable.** Type a number to jump, `^g` and `^b` to walk the list; wrapping says so. Arriving lights the term deeply inside its lightly washed sentence, sharing the two-level highlight with read-aloud — the sentence comes from `voice::sentence::split`.
 - **A question is narrowed before it is searched.** A whole sentence is almost never a term. `candidates()` strips interrogative tails, then tries progressively shorter windows, widest first, and answers for the longest phrase that actually occurs in the book.
 - **No regular expressions.** Deliberately: `/find ^Chapter .$` would tear the coding-agent skin off in one keystroke.
 
@@ -177,21 +177,60 @@ They live in `state.json` beside the reading position, stored as character offse
 
 ## Read-aloud
 
-readio ships no model. It invokes an engine you installed through a command template, which is why the binary is 4 MB and why a better model next month is a config edit rather than a release. Five presets ship, chosen from [tts-bench](https://github.com/5uck1ess/tts-bench):
+readio ships no model and selects no engine in a fresh config. `/voice` opens
+one workspace with two separate panes: the model library downloads and
+validates files; Voice configuration assigns an already available model,
+voice, language and supported parameters to either the global scope or one
+explicitly selected book. Downloading never changes configuration. The
+recommended pair is MOSS for Mandarin and Kokoro for English, and readio never
+switches engines because one sentence happens to contain another language.
 
-| Engine | Size · licence | Why it is here |
+The binary invokes an engine you installed through a command template, which
+is why it stays small and why a better model next month is a config edit rather
+than a release. The built-in presets are:
+
+| Engine | Scale · licence | Recommended language · why it is here |
 | --- | --- | --- |
-| `kokoro` | 82M · Apache-2.0 | default; the best voice here, and it stays loaded |
-| `espeak` | ~4M · GPL-3.0 | instant and robotic; one `brew`/`apt` package, no download |
-| `piper` | ~15M · GPL-3.0 | fastest neural voice to first sound; text on stdin |
-| `supertonic` | 99M · MIT | pure ONNX, no torch, 31 languages |
-| `openai` | — | any OpenAI-compatible `/v1/audio/speech` endpoint |
+| `moss` | 120M · Apache-2.0 | Mandarin Chinese; recommended audiobook voice, Apple Silicon, resident |
+| `kokoro` | 82M · Apache-2.0 | English; recommended `af_heart` voice, resident |
+| `qwen` | 0.6B · Apache-2.0 | Mandarin Chinese; optional alternative, larger and stiffer |
+| `espeak` | non-neural · GPL-3.0 | multilingual; instant and robotic, one system package |
+| `piper` | ~7–32M · GPL-3.0 | voice-specific Chinese or English; fastest neural voice to first sound |
+| `supertonic` | 99M · MIT | multilingual, English strongest; pure ONNX, no torch |
+| `openai` | remote service | configured by the service; any compatible `/v1/audio/speech` endpoint |
+
+MOSS-TTS-Nano is 100M parameters plus its 20M audio tokenizer: the MLX files
+occupy about 318 MB. On the development M-series machine it generated 9.68
+seconds of 48 kHz stereo speech in 3.17 seconds (3.05× real time), with a 1.56
+GB MLX peak. Its audiobook voice comes from a Spark reference encoded once into
+118 × 16 codec tokens. Those 3.9 KB of tokens are carried by the worker, so
+ordinary requests contain only text and never reprocess a reference wav.
+
+Kokoro is retained for English, where `af_heart` remains an excellent result
+for its size. Its Mandarin voices remain available to an edited config, but
+they are not the recommended Chinese path. Qwen3-TTS-0.6B remains an optional
+Apple-Silicon preset for comparison; it is no longer selected by default.
+
+Piper's Chinese is `zh_CN-huayan-medium`, which is the model readio fetches; upstream also has `zh_CN-chaowen-medium`, `zh_CN-xiao_ya-medium` and an `x_low` huayan, and switching is a `model:` line rather than anything readio has to know about.
 
 A word on the speed figures you will find in that benchmark: they measure the models, usually through PyTorch on a GPU. readio drives command-line engines, and those are mostly onnxruntime on the CPU. It is worth knowing which part of that is the model: for `kokoro-tts`, one short sentence through the CLI took 8.4 seconds on an M4 — four times slower than saying it out loud — of which the ONNX inference was 0.5 s. The rest was starting Python, loading the weights, and, once those were fixed, rebuilding an espeak backend inside `phonemizer` for every single sentence. Addressed below, the same sentence takes 0.5–0.8 s, comfortably ahead of a listener. `espeak-ng` takes 0.03 s and always did; it is the preset to reach for on a slow machine, or when you want sound the instant you press a key.
 
 ### The engine stays running
 
-An engine that loads an 82M model per sentence spends all its time loading an 82M model. So a preset may carry a `serve:` line beside its `synth:` one — a command that starts the engine once and speaks a line-delimited JSON protocol over its pipes, one request per sentence, one reply per clip. readio starts it on the first sentence of the session (in fact at boot, under the opening turn, so the wait lands where nobody is listening), keeps it for as long as the app runs, and falls back to the plain `synth:` command line for engines that have no such mode. The worker shipped for Kokoro is `src/tts/worker.py`, compiled into the binary with `include_str!` and written out to `~/.readio/engines/kokoro_worker.py` — atomically, through a staging file, so two readios starting at once cannot hand each other half a script.
+An engine that loads a model per sentence spends all its time loading the
+model. So a preset may carry a `serve:` line beside its `synth:` one — a child
+process started once for this readio session, speaking a line-delimited JSON
+protocol over its pipes, one request per sentence and one reply per clip. It is
+not a port-listening daemon and cannot outlive readio. The workers are
+`src/voice/moss_worker.py`, `kokoro_worker.py`, and `qwen_worker.py`, compiled
+into the binary and written atomically to
+`~/.readio/engines/<engine>_worker.py`.
+
+For both recommended engines residence is the normal path. Kokoro avoids
+reloading ONNX and rebuilding its phonemizer; MOSS loads MLX, the model, codec,
+and cached voice tokens once, then stays over three times ahead of playback.
+
+Qwen's model has one source of truth: `voice.engines.qwen.model`. Both the fallback command and the resident worker consume that value, so changing the Hugging Face model ID changes the process that actually reads the book; it is not shadowed by a second model hidden in the worker.
 
 The profile of what remained is worth recording, because it is not where anyone would look: with the model warm and resident, 2.216 seconds of every 2.752 were still inside `phonemizer.phonemize`, which builds a fresh espeak backend on each call — eight `dlopen`s, 2.189 s — and documents that it has no cache. Caching one backend per language brings a short sentence to 0.5–0.8 s, of which the actual inference is 0.5. That is a 3.6× improvement made without touching the model.
 
@@ -199,9 +238,11 @@ Templates are argument lists with the placeholders `{text} {out} {voice} {rate} 
 
 ### Reading in more than one language
 
-A multilingual model still has to be told which language it is looking at, and the default is rarely yours: `kokoro-tts` assumes `en-us`, so Chinese handed to it unannounced is sounded out with English letter-to-sound rules. The same eighteen-character sentence takes 13.6 seconds that way and 4.1 seconds said properly — slurred, and three times too slow.
-
-So each engine carries a small table of what changes when the page changes language:
+Engine, language and voice are configured manually. A multilingual model still
+has to be told which language it is looking at: `kokoro-tts` assumes `en-us`,
+so Chinese handed to it unannounced is sounded out with English
+letter-to-sound rules. Each engine therefore carries the choices its form may
+offer:
 
 ```yaml
 languages:
@@ -213,66 +254,140 @@ languages:
     lang: --lang en-us
 ```
 
-The voice moves with the language because in Kokoro the two are the same decision — `zf_*` is Mandarin, `af_*` American English — and settings that can be made to disagree eventually will. `lang` holds the flag *and* its value, so an engine that spells it `--language zh` needs no support from readio, and an engine with nothing to say there leaves it empty and is passed no flag at all. Piper's table is empty for a different reason: its language is the model file, so the entry to write is a `model:`, not a flag.
-
-Which entry applies is decided per sentence, from the text: one Han character in eight makes a passage Chinese, so a Chinese page quoting an English term stays Chinese and an English page quoting a single 字 stays English. A bilingual chapter switches voice mid-page without anyone reaching for a setting.
-
-`/voice` is where that is visible, and its first row is `auto`:
-
-```
-❯ auto (active)  match each passage as it comes
-  en             pin this language, read by af_heart
-  zh             pin this language, read by zf_xiaoxiao
-```
-
-Picking a language pins `tts.language` rather than a voice — the voice that belongs to it is recorded beside it, and settings that can be made to disagree eventually are. A name typed instead (`/voice zf_xiaoyi`) goes straight through to the engine and outranks both; one readio recognises brings its language along, so asking for a Mandarin voice is asking for Mandarin. `auto` is a row rather than only a config value because a setting that can only be turned on is a trap: before it existed, `/voice af_heart` was a one-way door that only a text editor could reopen.
+Kokoro's `zf_*` voices are Mandarin and `af_*` voices American English, so the
+form changes them together. `lang` holds the flag and its value; an engine with
+nothing to say contributes no flag. Piper's table is empty for a different
+reason: its language is baked into the model file. Text content never changes
+the selected entry sentence by sentence. A bilingual title that genuinely
+needs two engines should use an explicit per-book configuration, not a hidden
+router.
 
 ### Choosing one, and getting one
 
-`/tts` is the voice, and nothing else: read-aloud is one of the three reading modes, so `shift+tab` and `/mode` turn it on and off, and a switch in this menu as well would be a second control for the same fact. What the menu answers is *which* voice — and, because the honest answer to that depends on the machine, whether you have it at all:
+`/voice` opens a dedicated workspace instead of another slash-command value
+list. Model availability and Voice configuration are two different decisions,
+but putting their panes beside each other makes the dependency visible without
+coupling their actions. `/tts` remains an alias for opening the same workspace.
+
+The workspace decides which available model and parameters Read-aloud uses; it
+does not change the reading mode. Use `shift+tab`, `/mode aloud`, or `^s` to
+enter Read-aloud:
 
 ```
-❯ kokoro (active)  Kokoro-82M · Apache-2.0 · multilingual, best on long passages · ⏎ installs it
-  openai           a server, nothing to install
-  piper            Piper · GPL-3.0 · fastest to first sound · ⏎ installs it
-  supertonic       Supertonic 99M · MIT · pure ONNX, no torch · ⏎ reads with it
+ Voice
+ 2 models ready · global: MOSS · 1 book override
+
+ Models · downloads               Voice configuration
+ ❯ ✓ moss       ready             Scope       ● Global  ○ One book
+   ✓ kokoro     ready             Model       moss
+   ↓ qwen       not downloaded    Voice       audiobook
+                                  Language    zh
+                                  Parameters  Default
+                                  [ Save configuration ]
 ```
 
-Each row checks the engine's program, and for an engine whose voice is a separate download, that file too — so `⏎` either switches and starts reading, or installs and then does that. Nobody has to find out an engine is missing by choosing it and hearing nothing.
+The model pane checks the runtime and every known weight file. A missing model
+requires a second confirmation after readio has shown its estimated download
+and current free space. The completed download becomes `ready`; it does not
+fill or save the form on the right.
 
 Installing shows itself, one `Bash` call per command, streaming:
 
 ```
-● Bash uv tool install --python 3.12 kokoro-tts  1/1  ·  24.8s
+● Bash UV_TOOL_DIR=…/readio/runtime/tools …/readio/runtime/bin/uv
+  tool install --managed-python --python 3.12 kokoro-tts  3/5  ·  24.8s
   Resolved 61 packages in 1.31s
   Installed 61 packages in 3.42s
    + kokoro-tts==0.9.4
 
-○ kokoro is installed (25s). Read-aloud is on: kokoro · zf_xiaobei
+○ kokoro downloaded after 25s. Voice configuration was not changed.
 ```
 
-What it decides, and why each decision cannot be a constant in a release:
+What it owns, and what it deliberately shares:
 
 | Decision | How |
 | --- | --- |
-| Which installer | `uv tool install`, then `pipx install`, then `pip install --user` — whichever this machine has. pip is last because Homebrew and every modern distribution now refuse it outright (PEP 668), and a refusal the reader has to decode is worse than saying up front that nothing suitable is here. |
-| Which Python | From the preset when the package is fussy. `kokoro-tts` declares `>=3.11,<3.13`, so a machine defaulting to 3.13 otherwise fails with a resolver error that never mentions the version. |
+| Which installer | A pinned standalone uv is downloaded from its official release and checked against the release SHA-256. No system Python, uv, pip or pipx is required. |
+| Which Python | uv downloads a managed interpreter into Readio's runtime. The version comes from the preset when the package is fussy: `kokoro-tts` declares `>=3.11,<3.13`, so it gets Python 3.12 even on a machine whose default is 3.13. |
 | The voice model | Neither Kokoro nor Piper ships weights in its wheel, so their model files are fetched as further steps of the same install and written into the engine's command line. Kokoro's `--model` and `--voices` default to `./`, which means an engine installed without them works in exactly one directory: whichever one the files were downloaded into. An engine whose command exists but whose voice does not is not installed, and the menu says so. |
-| Where the command went | `uv` and `pipx` write into `~/.local/bin`, which is on the PATH of the shell that set them up and not necessarily on the one readio inherited. If the program is not on PATH afterwards, the place it actually landed is written into the engine's command line — rather than asking anyone to edit a shell profile and start over. |
+| What is private | uv, its managed Python builds, tool environments and launchers live below the platform user cache (`~/Library/Caches/readio/runtime` on macOS, usually `~/.cache/readio/runtime` on Linux). Readio resolves that bin directory without changing `PATH`. |
+| What is shared | Readio does not override `UV_CACHE_DIR`, `HF_HOME` or `HF_HUB_CACHE`. Existing uv downloads and Hugging Face model snapshots remain cache hits instead of being stored twice. |
 
 Nothing runs through a shell here either; every command is an argv, and every command is printed before it runs, so "install it for me" and "tell me what you would run" are the same feature. A subprocess's output is stripped of escape sequences before it reaches the screen — an installer is not entitled to move readio's cursor — and split on carriage returns as well as newlines, which is the only way a progress bar shows progress rather than arriving in one lump after the download finishes.
 
 `openai` is not installable and says so: it is a server you run yourself, and readio has no business starting it.
 
-Two things change when speech is on. Reveal speed follows the audio — each clip reports its own duration and the pacer runs at `chars / clip_seconds`, so text finishes exactly when sound does and the configured pace steps aside. And highlighting becomes two-level: the sentence being spoken takes a light wash, the word or character being sounded a deep one. Chinese advances by character (there is nothing to break on, and the character is the unit the eye moves in), Latin by word, with punctuation lit alongside the character it follows.
+Speech has one presentation timeline. Built-in presets use readio's embedded
+audio device: a real-time callback reports absolute PCM frames, and both token
+reveal and the two-level highlight sample that one position. Synthesis,
+decoding, device startup and time spent paused do not advance it. Pressing
+space takes effect at the next callback boundary (readio requests a 10 ms
+period), freezes that exact frame position, and resumes from the next frame
+instead of restarting the sentence. A clip that finishes rendering while
+already paused also starts paused.
+
+TTS clips are decoded before the device starts. The audio callback itself only
+clears and copies a preallocated buffer and publishes atomics: it does no
+allocation, locking, logging or filesystem work. A custom `play:` command is
+still supported, but an external process cannot report PCM frames, so that
+explicit compatibility path uses a monotonic duration estimate. Old unedited
+readio defaults (`afplay`, `aplay` and `Media.SoundPlayer`) migrate to the
+embedded player; a command the reader changed is preserved.
+
+The transport is frame-based, but the bundled model protocols still expose no
+word or phoneme timestamps. Within a sentence, Chinese characters and Latin
+words are therefore mapped over the exact clip duration by weight. A future
+model timestamp or forced-alignment protocol can replace only that semantic
+mapping without introducing a second clock.
+
+### One book, its own voice
+
+A shelf is not read in one voice. A Chinese novel and an English manual want different voices as often as they want different engines, and a reader who sets one up per book should not have to set it up again every time they open it. So `voice:` has a `books:` table, keyed by the content id the library and the progress store already use, holding only what a book actually asked for:
+
+```yaml
+voice:
+  engine: moss
+  name: audiobook
+  language: zh
+  params: "temperature=0.8 top_p=0.95"
+  books:
+    3f9a1c7d5e2b4a10:
+      title: 论语         # written for you to read; nothing reads it back
+      engine: kokoro
+      name: af_heart
+      language: en
+```
+
+Scope is the first field in the Voice form: **Global** or **One book**. The
+second choice reveals a book selector containing the open book and the library,
+so scope is never guessed from where `/voice` happened to be opened. A book
+override can be removed with “follow global”.
+
+Three small rules keep the table honest. An entry that ends up saying exactly
+what the default says is deleted rather than stored, because a copy of the
+default stops following it the next time it changes. An entry with nothing left
+in it is deleted too. Downloading never writes either the default or a book
+entry; only the explicit Save action on the configuration pane does.
+
+Opening a book whose voice differs from the one that was reading drops the engine that was running, so the next sentence comes out in the voice that book asked for rather than in the previous book's.
 
 ### Speed and prefetch
 
 Playback speed is the effort multiplier — one control for both worlds, described under [Pace, as reasoning effort](#pace-as-reasoning-effort). While audio plays it sits next to the engine in the status line whenever it is not 1×: `⏵ kokoro · zf_xiaobei 1.5×`.
 
+In Read-aloud, `[` slows down and `]` speeds up through
+`0.75× → 1× → 1.25× → 1.5× → 2×`; the keys stay printed beside the mode chip
+instead of being hidden in help. Space asks the live OS player to pause and
+returns only after the player acknowledges that its audio pointer is frozen.
+The global timeline, token reveal and highlight all hold at that acknowledged
+position. It does not cancel or re-queue the sentence, so another space
+continues from the same audio millisecond without repeating what was already
+heard. `esc` followed by `⏎` uses the same held audio pointer while a
+Read-aloud turn is interrupted.
+
 Speed applies at synthesis, not at playback: resampling would change the voice along with the tempo. The cost is that a speed change invalidates everything already prefetched, so `set_effort` flushes the pipeline, notes where the sentence in progress began, and re-queues from there. A change is heard within a sentence rather than at the next passage.
 
-Sentences are rendered ahead of playback on a thread of their own, `tts.prefetch` of them (two by default), so a sentence boundary is not a hole the length of the engine's synthesis time:
+Sentences are rendered ahead of playback on a thread of their own, `voice.prefetch` of them (two by default), so a sentence boundary is not a hole the length of the engine's synthesis time:
 
 ```
 render thread ──push──▶ queue (capacity = prefetch) ──pop──▶ playback thread
@@ -293,26 +408,26 @@ Measured with a stand-in engine that takes two seconds a sentence, on a book of 
 The failure being prevented is specific: headphones disconnect or go to sleep, the system quietly falls back to the built-in speakers, and the next sentence of the book is read to the whole office. The allowlist makes remembering to check the machine's job — sound only on devices you named, and elsewhere keep reading silently.
 
 ```yaml
-tts:
+voice:
   output:
     allow: ["AirPods", "bluetooth"]   # substring of a name, or a transport type
     poll: 5                           # seconds between checks
     on_mismatch: silence              # silence (default) | play, which reads on with a warning
 ```
 
-Muting is always explained, because silence without explanation is indistinguishable from a broken engine. The notice names the current device, names the allowlist, and offers the three ways out — `/device allow <name>` to add it, `/device any` to stop restricting, `/device` to list everything. Changes take effect at once and are written back to the config file; speech resumes by itself when an allowed device returns.
+Muting is always explained, because silence without explanation is indistinguishable from a broken engine. The notice names the current device, names the allowlist, and offers the three ways out — `/device allow <name>` to add it, `/device any` to stop restricting, `/device` to list everything. Changes take effect at once and are written back to the config file. A blocked device stops the turn without changing Read-aloud into Auto; when an allowed device returns, press enter to retry.
 
 Two rules are worth stating because they are easy to get backwards. A device that cannot be identified counts as not allowed: better silent than audible in the wrong room. And probing never happens on the UI thread — asking macOS for the current output device takes about 200 ms, six frames' worth, so it runs in the background and the interface reads a cache.
 
 ## Configuration
 
-One file, `~/.readio/config.yaml`, written with bilingual comments on first run. **readio reads no environment variables.** `/speed`, `/voice`, `/rate`, `/lang`, `/tts` and `/device` write their changes back to it. The only setting that cannot live there is `--home`, which decides where it is.
+One file, `~/.readio/config.yaml`, written with bilingual comments on first run. **readio reads no environment variables.** `/speed`, `/voice`, `/rate`, `/lang`, `/mode` and `/device` write their changes back to it. The only setting that cannot live there is `--home`, which decides where it is.
 
 ```yaml
 language: en              # en or zh
 reading:
   speed: 46               # characters per second at effort high; the multiplier scales it
-  auto: false             # auto-scroll: the mode shift+tab cycles into
+  mode: manual            # manual | auto | aloud; shift+tab cycles all three
 effort:
   level: high             # minimal | low | medium | high | xhigh | max
   multipliers:            # more effort reads more slowly; /rate retunes one
@@ -325,16 +440,21 @@ effort:
 images:
   enabled: true
   max_rows: 16            # tallest an illustration may be drawn
-tts:
-  enabled: false
-  engine: kokoro
-  voice: ""
-  language: auto          # or zh / en, to stop readio guessing per sentence
+voice:
+  engine: moss
+  name: audiobook         # a voice the downloaded model knows
+  language: zh            # explicit; text never switches it per sentence
+  params: ""              # model-specific parameters; empty keeps defaults
   prefetch: 2             # sentences rendered ahead of the one playing
+  books:                  # only the books that asked for something else
+    3f9a1c7d5e2b4a10:
+      title: 论语         # written for you to read; nothing reads it back
+      engine: espeak
+      name: cmn
 # input_log: /tmp/keys.log   # every terminal event appended, for debugging input
 ```
 
-The `engines:` block below that is settings for the engines themselves, and it is the one part of the file readio maintains as well as reads. On startup each built-in engine is reconciled with the binary, in three categories: what the package *is* — the description, the docs link, the PyPI name, the Python it needs — always follows the release, because nobody writes those by hand and a file written before those fields existed would otherwise freeze them empty forever. How to *run* it — the command, the player, whether the text goes on stdin, the language table — is yours, and is replaced only when what is saved is a default readio itself shipped and has since corrected. Which *voice* — `voice`, `model`, `extra` — is never touched.
+The `engines:` block below that is settings for the engines themselves, and it is the one part of the file readio maintains as well as reads. On startup each built-in engine is reconciled with the binary, in three categories: what the package *is* — the description, the docs link, the PyPI name, the Python it needs — always follows the release, because nobody writes those by hand and a file written before those fields existed would otherwise freeze them empty forever. How to *run* it — the command, the player, whether the text goes on stdin, the language table — is yours, and is replaced only when what is saved is a default readio itself shipped and has since corrected. The exact historical OS player defaults are upgraded to the embedded frame-clock player; anything customised remains yours. Which *voice* — `voice`, `model`, `extra` — is never touched.
 
 This is not hypothetical tidiness: every local preset shipped before v0.2.0 had a command line that did not match its engine's actual CLI, and the one shipped in v0.2.0-beta.3 ran but never passed a language, so it read Chinese with English phonemes. Without reconciliation an upgrade would leave read-aloud broken, or quietly bad, on exactly the machines that had used it longest.
 
@@ -359,20 +479,22 @@ The host directory:
 | `⏎` | load the next passage; in the library, open the last book |
 | `⏎` while streaming | rush this turn to its end |
 | `esc` | interrupt the turn, keeping your place; `⏎` carries on |
-| `shift+tab` | cycle manual → auto-scroll → read-aloud |
+| `space` | pause / resume at the same audio position |
+| `[` · `]` | slower · faster Read-aloud |
+| `shift+tab` | cycle Manual → Auto → Read-aloud |
 | `/` | the command menu: `↑ ↓` to choose, `tab` completes, `⏎` runs |
 | `↑ ↓`, wheel, `pgup` `pgdn`, `home` `end` | scroll; at the bottom in manual mode, load more |
 | `^t` · `^o` | fold reasoning · tool calls |
-| `^s` · `^r` | read-aloud on or off · next reasoning effort |
+| `^s` · `^r` | enter Read-aloud / return to the previous mode · next reasoning effort |
 | `^g` · `^b` | next · previous search hit |
 | `^p` `^n` · `^l` · `^c` `^d` | input history · clear the screen · discard the turn, then quit |
 
 | Area | Commands |
 | --- | --- |
 | Library | `/lib` `/open <n>` `/import <path> [--copy\|--link\|--move]` `/forget <n>` `/sample` |
-| Reading | `/mode [manual\|auto\|tts]` `/effort [level]` `/toc` `/goto <n>` `/next` `/prev` `/find <term>` `/auto` `/plan` `/context` `/progress` `/speed <n>` |
+| Reading | `/mode [manual\|auto\|aloud]` `/effort [level]` `/toc` `/goto <n>` `/next` `/prev` `/find <term>` `/auto` `/plan` `/context` `/progress` `/speed <n>` |
 | Bookmarks | `/mark [note]` `/marks [n]` `/unmark <n>` |
-| Read-aloud | `/tts [<engine>\|install <engine>\|test\|config]` `/voice [auto\|zh\|en\|<name>]` `/rate <0.5-3.0>` `/device` |
+| Read-aloud | `/voice` `/rate <0.5-3.0>` `/device` |
 | Interface | `/lang en\|zh` `/help` `/quit` |
 
 `/forget` removes only the library's own copy. A file imported with `-l` stays where it is, and one imported with `-m` is not deleted from the library either.
@@ -380,18 +502,18 @@ The host directory:
 ## Testing
 
 ```sh
-cargo test          # 333: wrapping, pacing, parsing, import modes, reading, whole frames,
+cargo test          # wrapping, pacing, parsing, import modes, reading, whole frames,
                     # illustrations, read-aloud, the device allowlist, search and jumps,
-                    # chapter shape, emphasis, bookmarks, the three modes, effort levels
+                    # chapter shape, emphasis, bookmarks, three reading modes, effort levels
 ```
 
 - `tests/render.rs` draws a real `App` through ratatui's `TestBackend` and asserts on the screen, so "is the library offered", "did typing 2 open the second book", "does esc interrupt without discarding" and "does `^c` discard" all have regression cover.
 - `tests/select.rs` pins the two rules the select lives by: it keeps its narrowing text out of the composer, a `/` always escapes it into a command, a filter that would empty the list is refused, choosing a row records the result rather than the command, and a bare `/import` opens the filesystem at `~/` and walks into directories.
 - `tests/effort.rs` holds the pace honest: `^r` walks the ladder and the pacer slows with it, a level names what it is worth, `/rate` retunes only the level in force and writes it back, and `/speed` moves the base the multiplier scales.
-- `tests/mode.rs` drives the modes the way a reader does: `shift+tab` into auto-scroll and the text starts moving, two passages arrive with nobody pressing anything, manual mode then sits still, `↓` at the bottom fetches more, and an interruption does not silently change the mode.
+- `tests/mode.rs` verifies the three-mode `shift+tab` cycle, the `^s` shortcut back to the previous mode, persistence, and that unavailable TTS stops in Read-aloud without falling back to Auto.
 - `tests/find.rs` walks search → jump by number → the term deeply washed, asserts the counts are true counts, that `^g` says so when it wraps, and that `^g` with no search points back at `/find`.
 - `tests/library.rs` covers the filesystem consequences of each import mode, that a second import of the same book adds no second entry, and that `/forget` never deletes a file the reader owns.
-- `tests/audio_device.rs` runs the allowlist end to end — blocked, warned, `/device allow`, restored — while `src/tts/device.rs` simulates sleeping headphones through an injected probe and asserts the decision flips once rather than every frame.
+- `tests/audio_device.rs` runs the allowlist end to end — blocked, warned, `/device allow`, restored — while `src/voice/device.rs` simulates sleeping headphones through an injected probe and asserts the decision flips once rather than every frame.
 - `tests/illustration.rs` generates a PNG and an EPUB on the spot and checks that coloured half-blocks reach the screen, so there is no fixture to go stale.
 - Every test runs against a temporary host directory (`paths::set_home`) and cannot touch a real library.
 
@@ -414,7 +536,7 @@ CI (`.github/workflows/tui-ci.yml`, at the repository root) runs fmt, clippy wit
 ## Build and release
 
 ```sh
-cargo build --release     # 4.0 MB, thin LTO, one codegen unit, symbols stripped
+cargo build --release     # about 5 MB, thin LTO, one codegen unit, symbols stripped
 ```
 
 Install it by rename, not by copying over the old one:
@@ -425,7 +547,12 @@ mv target/release/readio ~/.local/bin/readio.new && mv ~/.local/bin/readio.new ~
 
 On macOS, `cp` over an existing binary leaves the old inode with a signature that no longer matches its contents, and the kernel answers by killing the process — an upgrade that "installed fine" and then dies with signal 9 and no message. A rename gives the new binary its own inode, and it also means a half-written download can never be left behind under a name someone is about to run. `install.sh` does exactly this, which is why it never had the problem.
 
-Nothing in the dependency tree compiles C. `zip` is reduced to `default-features = false, features = ["deflate"]`, which drops `zstd-sys` and bzip2 — EPUB only needs store and deflate — and leaves the tree pure Rust. Static musl builds are then a target away rather than a cross toolchain, and one Linux archive runs on any distribution.
+The only bundled C is miniaudio, compiled from the source shipped by `maudio`
+using pregenerated bindings, so release builds need an ordinary C compiler but
+not libclang, bindgen, ALSA development headers or a system audio SDK. `zip` is
+still reduced to `default-features = false, features = ["deflate"]`, because
+EPUB needs only store and deflate. Linux releases use musl's compiler and
+linker to keep the result self-contained across distributions.
 
 Four archives are published: `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`. Pushing a `tui-v*` tag builds all four, writes `SHA256SUMS`, and creates the release (`.github/workflows/tui-release.yml`). Windows and anything else builds from source; see the repository README.
 

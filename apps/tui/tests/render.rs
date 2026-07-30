@@ -63,6 +63,7 @@ fn fixture() -> (App, Terminal<TestBackend>) {
 
 fn fixture_sized(width: u16, height: u16) -> (App, Terminal<TestBackend>) {
     common::isolated_home();
+    pin_manual();
     let book = Book::load(None).expect("sample book");
     let app = App::new(
         Library::ephemeral(),
@@ -74,9 +75,21 @@ fn fixture_sized(width: u16, height: u16) -> (App, Terminal<TestBackend>) {
     (app, terminal)
 }
 
+/// Start every test in manual mode.
+///
+/// The mode is a setting that survives a restart, and all the tests in this
+/// binary share one config file: without this, a test that switches to
+/// auto-scroll leaves the next one reading by itself.
+fn pin_manual() {
+    let mut config = readio::config::Config::load().0;
+    config.reading.mode = readio::mode::Mode::Manual;
+    let _ = config.save();
+}
+
 /// An app that starts with no book open, the way a bare `readio` launch does.
 fn library_fixture(entries: usize) -> (App, Terminal<TestBackend>) {
     common::isolated_home();
+    pin_manual();
     let mut library = Library::ephemeral();
     for i in 0..entries {
         library.entries.push(readio::library::Entry {
@@ -574,7 +587,7 @@ fn out_of_range_selection_is_explained() {
 #[test]
 fn reading_commands_need_a_book_first() {
     let (mut app, mut terminal) = library_fixture(1);
-    for command in ["/toc", "/find 注意力", "/goto 2", "/auto", "/progress"] {
+    for command in ["/toc", "/find 注意力", "/goto 2", "/progress"] {
         type_line(&mut app, command);
         let view = run_until_idle(&mut app, &mut terminal);
         assert!(
@@ -582,6 +595,27 @@ fn reading_commands_need_a_book_first() {
             "{command} should ask for a book first:\n{view}"
         );
     }
+}
+
+/// `/auto` is not one of those: a mode is a setting, and setting one before
+/// opening a book is a reasonable thing to do — the mode is remembered, so it is
+/// how a reader says "read the next one to me by yourself". What it must not do
+/// is start reading a book that is not open.
+#[test]
+fn a_mode_can_be_chosen_before_a_book_is() {
+    let (mut app, mut terminal) = library_fixture(1);
+    type_line(&mut app, "/auto");
+    run_until_idle(&mut app, &mut terminal);
+    assert_eq!(app.mode(), readio::mode::Mode::Auto);
+    assert!(app.book.is_none(), "and nothing was opened by saying so");
+
+    type_line(&mut app, "/auto");
+    run_until_idle(&mut app, &mut terminal);
+    assert_eq!(
+        app.mode(),
+        readio::mode::Mode::Manual,
+        "and it toggles back"
+    );
 }
 
 #[test]
@@ -761,7 +795,7 @@ fn the_word_highlight_survives_a_line_wrap() {
 
     // Walk a word cursor across the whole passage; at every step exactly one
     // unit is deeply washed, no matter where the wrap falls.
-    let units = readio::tts::sentence::units(passage);
+    let units = readio::voice::sentence::units(passage);
     assert!(
         units.len() > 20,
         "the fixture should be long: {}",

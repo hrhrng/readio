@@ -23,12 +23,16 @@ Every other rule in this document is downstream of that one. Where reader comfor
 | Time since launch | session clock | `12:03` |
 | An interrupted turn | a turn the user stopped | `❙ 已中断` above the prompt |
 | Reading pace | **reasoning effort** | `readio-1 (high)` |
-| Unattended reading | the mode `shift+tab` cycles | `⏵⏵ auto` |
+| Unattended text reading | auto-reading, selected with `shift+tab` | `⏵⏵ auto` |
+| Spoken reading | read-aloud, selected with `shift+tab` or `^s` | `⏵⏵ aloud` |
 | Latin words inside Chinese prose | identifiers, tinted | body text |
 
 Two things are deliberately *not* disguised: the book's own words, and any number a reader might act on. A fake line range would make the costume a lie the moment someone opened the file.
 
-There is no musical note anywhere. A `♪` in the corner announces a media player, which is the one thing the interface must never look like; read-aloud is `⏵⏵ aloud` and the engine name appears where a model name would.
+There is no musical note anywhere. A `♪` in the corner announces a media player,
+which is the one thing the interface must never look like; Read-aloud has the
+same mode chip treatment as Manual and Auto, while its engine name appears
+beside the activity.
 
 ## Screen anatomy
 
@@ -52,24 +56,19 @@ The status row is the only permanent teacher. Its left half says what to do next
 
 ## Reading modes
 
-Three, because a reader is doing one of three things.
+Manual, Auto and Read-aloud are three parallel TUI states:
 
-| Mode | Chip | What advances the text |
+| Mode | Control | Effect |
 | --- | --- | --- |
-| Manual | `⏵ manual` | `⏎`, or `↓` `pgdn` wheel once at the bottom |
-| Auto-scroll | `⏵⏵ auto` | nothing — passages follow one another |
-| Read-aloud | `⏵⏵ aloud` | the voice, which brings its own scrolling |
+| Manual | `shift+tab`, `/mode manual` | waits for an explicit request for the next passage |
+| Auto | `shift+tab`, `/mode auto` | continuously requests passages and uses the text reveal clock |
+| Read-aloud | `shift+tab`, `/mode aloud`, `^s` | continuously requests passages and uses TTS as the token clock |
 
-`shift+tab` cycles them, which is the gesture a coding agent uses for exactly this kind of switch. `/mode` says the same thing in words, and the second level of its menu offers the three with the current one marked.
-
-Rules that follow from calling it a mode:
-
-- **A mode is a setting, not a consequence.** `esc` interrupts the turn and `⏎` picks it back up; neither demotes auto-scroll to manual.
-- **Read-aloud implies auto-scroll.** Turning the voice off lands in auto-scroll, not manual — silence is all the reader asked for.
-- **A mode that cannot work is skipped, not entered.** No speech engine means `shift+tab` steps past read-aloud, having said why once.
-- **A mode explains itself the first time and flashes afterwards.** Cycling should not reprint a paragraph.
-- **The voice follows the page, not the session.** Which language a sentence is in is read off the sentence, and the engine is given the matching voice and phonemes; a bilingual chapter switches mid-page with nothing to set. A reader who wants one voice throughout pins `tts.language`.
-- **In read-aloud the voice is the clock.** The text may not go past the sentence being spoken, and the engine is kept a paragraph ahead so the voice is not waiting on it. See below.
+- **There is one persisted mode.** `reading.mode` is `manual`, `auto` or `aloud`; Voice is not an independent boolean.
+- **`^s` is a mode shortcut.** It enters Read-aloud, and pressing it again returns to the mode used immediately before it.
+- **TTS failure stops in place.** Missing, slow or failed TTS never silently turns Read-aloud into Auto. Slow synthesis makes tokens wait; unavailable or failed synthesis stops the turn while the mode remains Read-aloud.
+- **The voice follows explicit configuration, not sentence detection.** The Voice workspace saves a model, voice and language globally or for one selected book. A bilingual sentence never causes an engine switch behind the reader's back.
+- **Voice is the token clock.** The text may not go past the sentence being spoken. See below.
 
 ## Pace, as reasoning effort
 
@@ -136,11 +135,20 @@ A path is the exception that proves the rule: `/import` leaves it in the compose
 Two levels, because a value is as hard to remember as a command.
 
 1. `/` and a partial name → commands, filtered by prefix first and then by containment, each with a one-line description.
-2. `/name ` for a command with a fixed set of answers — `/effort`, `/mode`, `/lang`, `/tts` — → those answers, each with what it means, and `(active)` on the one in force. For a command whose answers are the reader's own things — `/open`, `/toc`, `/marks` — the answers are their books, chapters and bookmarks. For `/import` they are files and directories, read from disk.
+2. `/name ` for a command with a fixed set of answers — `/effort`, `/mode`, `/lang` — → those answers, each with what it means, and `(active)` on the one in force. For a command whose answers are the reader's own things — `/open`, `/toc`, `/marks` — the answers are their books, chapters and bookmarks. For `/import` they are files and directories, read from disk. `/voice` opens a dedicated workspace because model management plus scoped configuration no longer fits honestly in a completion list.
 
-A row is allowed to know things about the machine, and the speech engines are where that matters. `/tts` checks whether each engine's program is actually there — and, for an engine whose voice is a separate download, whether that file is there too — so a row reads `⏎ reads with it` or `⏎ installs it`, and points `⏎` at the command that matches what it says. Nobody has to find out that an engine is missing by choosing it and hearing nothing.
+The Voice workspace has two separate panes. The model pane checks runtimes,
+weights, download size and disk space; it never modifies Voice configuration.
+The configuration pane offers ready models and saves an explicit global or
+per-book scope; it never starts a hidden download.
 
-That menu also shows where the line between a command and a mode is drawn. `/tts` has no on and no off: read-aloud is one of the three reading modes, `shift+tab` cycles them, and two controls for one fact are interesting only in the state where they disagree.
+The workspace chooses the model and scope, but never changes reading mode.
+`shift+tab` cycles all three modes; `^s` is the direct Read-aloud shortcut.
+
+The same rule is why there is one workspace rather than separate model and
+configuration commands. The two panes stay visibly independent, while scope,
+model, voice, language and supported parameters are saved together. Scope is a
+form field, never inferred from whether a book happens to be open.
 
 A chapter number or a search term suggests nothing: there is nothing to suggest, and a menu in the way of typing one is worse than no menu.
 
@@ -179,7 +187,7 @@ The same key may mean different things in different states, but never two things
 | `esc` | close the menu | cancel the question | interrupt the turn | — | clear the prompt, else to the tail | as idle |
 | `↑` `↓` | move the selection | move the selection | scroll | scroll | scroll; `↓` at the tail loads more in manual mode | scroll |
 | `tab` | complete the row | confirm the row | — | — | — | — |
-| `shift+tab` | cycle the mode | cycle the mode | cycle the mode | cycle the mode | cycle the mode | cycle the mode |
+| `shift+tab` | toggle auto-reading | toggle auto-reading | toggle auto-reading | toggle auto-reading | toggle auto-reading | toggle auto-reading |
 | `/` | filter further | close it, start a command | — | — | open the menu | open the menu |
 | digits | filter | narrow the rows | — | — | jump to a search hit | pick that book |
 | other text | filter | narrow the rows | — | — | nothing, with a hint | narrow the rows |
@@ -197,7 +205,7 @@ Text that is not a command does nothing. It used to be read as a question and se
 
 A reader should be able to learn readio without reading anything, in this order:
 
-1. **The status row** always names the next useful key: `⏎ 继续 · shift+tab 换模式 · /help 更多` when idle, `esc 中断 · ↑↓ 滚动` while streaming, `⏎ 继续` once interrupted.
+1. **The status row** always names the next useful key: `⏎ 继续 · shift+tab 切自动 · /help 更多` when idle, `esc 中断 · ↑↓ 滚动` while streaming, `⏎ 继续` once interrupted.
 2. **The prompt placeholder** repeats the three that matter: enter, `/`, esc.
 3. **`/`** shows every command with a description, and one more keystroke shows every value.
 4. **`/help`** is the reference: keys, commands, and what the disguised readouts actually mean.

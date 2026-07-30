@@ -49,8 +49,8 @@ fn fixture() -> (App, Terminal<TestBackend>) {
 fn configured(edit: impl FnOnce(&mut readio::config::Config)) -> (App, Terminal<TestBackend>) {
     common::isolated_home();
     let mut config = readio::config::Config::load().0;
-    config.tts.output.allow.clear();
-    config.tts.output.query.clear();
+    config.voice.output.allow.clear();
+    config.voice.output.query.clear();
     edit(&mut config);
     let _ = config.save();
     let book = Book::load(None).expect("sample book");
@@ -123,7 +123,7 @@ fn an_unlisted_output_is_named_and_the_fix_is_offered() {
 fn an_unreadable_device_list_still_offers_the_way_out() {
     let _guard = exclusive();
     let (mut app, mut terminal) = configured(|config| {
-        config.tts.output.query = "readio-no-such-probe-command".into();
+        config.voice.output.query = "readio-no-such-probe-command".into();
     });
     settle(&mut app, &mut terminal);
 
@@ -219,12 +219,12 @@ fn the_whitelist_survives_a_restart() {
     let (config, note) = readio::config::Config::load();
     assert!(note.is_none(), "the file we wrote should parse: {note:?}");
     assert_eq!(
-        config.tts.output.allow,
+        config.voice.output.allow,
         vec!["airpods".to_string()],
         "the rule should come back after a restart"
     );
-    assert!(config.tts.output.is_active());
-    assert_eq!(config.tts.output.poll, 5, "defaults come along unchanged");
+    assert!(config.voice.output.is_active());
+    assert_eq!(config.voice.output.poll, 5, "defaults come along unchanged");
 
     // And clean up, so the other tests in this binary start from no whitelist.
     type_line(&mut app, "/device any");
