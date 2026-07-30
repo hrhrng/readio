@@ -1,8 +1,8 @@
-//! Just enough WAV parsing to learn how long a clip is.
+//! Just enough WAV parsing to learn a clip's exact PCM frame count.
 //!
-//! The duration is what lets the text follow the audio: characters per second
-//! becomes `chars / clip_seconds`, so a sentence finishes on screen exactly
-//! when the speaker stops saying it.
+//! The embedded player reports those frames as it presents them. Duration in
+//! milliseconds remains for custom command players, which cannot expose an
+//! audio cursor.
 
 use anyhow::{Result, anyhow};
 
@@ -16,13 +16,25 @@ pub struct Info {
 }
 
 impl Info {
-    pub fn ms(&self) -> u64 {
+    pub fn frames(&self) -> u64 {
         let bytes_per_frame = (self.channels as u32) * (self.bits_per_sample as u32 / 8);
-        if bytes_per_frame == 0 || self.sample_rate == 0 {
+        if bytes_per_frame == 0 {
             return 0;
         }
-        let frames = self.data_bytes / bytes_per_frame;
-        (frames as u64 * 1000) / self.sample_rate as u64
+        (self.data_bytes / bytes_per_frame) as u64
+    }
+
+    pub fn ms(&self) -> u64 {
+        if self.sample_rate == 0 {
+            return 0;
+        }
+        let frames = self.frames();
+        if frames == 0 {
+            return 0;
+        }
+        frames
+            .saturating_mul(1000)
+            .div_ceil(self.sample_rate as u64)
     }
 }
 
@@ -172,7 +184,35 @@ mod tests {
         bytes[fmt_at + 14..fmt_at + 16].copy_from_slice(&24u16.to_le_bytes()); // 24-bit
         let info = info(&bytes).expect("header");
         // Same bytes, but each frame is now 6 bytes instead of 2.
-        assert_eq!(info.ms(), 1_000 / 3);
+        assert_eq!(info.ms(), 334, "duration rounds up, never down to zero");
+    }
+
+    /// A playback clock consumes frames, not rounded milliseconds. In
+    /// particular, a valid clip shorter than one millisecond must not become a
+    /// zero-duration clip and bypass reveal/highlight synchronization.
+    #[test]
+    fn preserves_the_exact_pcm_frame_count() {
+        let bytes = silence(1, 48_000);
+        let parsed = info(&bytes).expect("header");
+        assert_eq!(parsed.frames(), 48);
+
+        let one_frame = info(&silence(1, 1_000)).expect("one frame");
+        assert_eq!(one_frame.frames(), 1);
+
+        let mut sub_millisecond = silence(1, 48_000);
+        let data_at = sub_millisecond
+            .windows(4)
+            .position(|window| window == b"data")
+            .expect("data chunk");
+        sub_millisecond.truncate(data_at + 8 + 2);
+        sub_millisecond[data_at + 4..data_at + 8].copy_from_slice(&2u32.to_le_bytes());
+        let one_fast_frame = info(&sub_millisecond).expect("one fast frame");
+        assert_eq!(one_fast_frame.frames(), 1);
+        assert_eq!(
+            one_fast_frame.ms(),
+            1,
+            "a real frame became a zero-duration clip"
+        );
     }
 
     #[test]

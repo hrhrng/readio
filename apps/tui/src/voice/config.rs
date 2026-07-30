@@ -4,7 +4,7 @@
 //! (`~/.readio/config.yaml`); this module only describes how to drive an engine.
 //!
 //! readio ships presets for small local models rather than a bundled model:
-//! the binary stays ~2 MB, and swapping in whatever is state of the art next
+//! the binary stays small, and swapping in whatever is state of the art next
 //! month is a one-line edit instead of a release. Every preset is just a
 //! command template, so an engine readio has never heard of works too.
 
@@ -29,8 +29,9 @@ pub struct EngineSpec {
     /// a resident process loads it once at startup.
     #[serde(default)]
     pub serve: String,
-    /// Command that plays a file, `{file}` being the clip. Empty means the
-    /// synth command played it itself.
+    /// How to play a clip. `@readio` uses the embedded callback player and its
+    /// PCM-frame clock; a command may use `{file}` for compatibility. Empty
+    /// means the synth command played the audio itself.
     #[serde(default)]
     pub play: String,
     /// Default voice when the config leaves `voice` empty.
@@ -603,7 +604,7 @@ pub fn reconcile(engines: &mut BTreeMap<String, EngineSpec>) -> bool {
         if superseded {
             saved.synth = preset.synth;
             saved.serve = preset.serve.clone();
-            saved.play = preset.play;
+            saved.play = preset.play.clone();
             saved.stdin = preset.stdin;
             saved.fetch = preset.fetch;
             saved.languages = preset.languages;
@@ -642,6 +643,9 @@ pub fn reconcile(engines: &mut BTreeMap<String, EngineSpec>) -> bool {
                 saved.model = preset.model.clone();
             }
         }
+        if is_legacy_default_player(&saved.play) {
+            saved.play = preset.play.clone();
+        }
 
         changed |= *saved != before;
     }
@@ -657,21 +661,18 @@ fn same_command(a: &str, b: &str) -> bool {
     a.split_whitespace().eq(b.split_whitespace())
 }
 
+fn is_legacy_default_player(command: &str) -> bool {
+    const PLAYERS: &[&str] = &[
+        "afplay {file}",
+        "aplay -q {file}",
+        "powershell -NoProfile -Command \"(New-Object Media.SoundPlayer '{file}').PlaySync()\"",
+    ];
+    PLAYERS.iter().any(|player| same_command(command, player))
+}
+
 /// Player command for this platform, chosen from what is normally present.
 fn default_player() -> String {
-    if cfg!(target_os = "macos") {
-        "afplay {file}".to_string()
-    } else if cfg!(target_os = "windows") {
-        // The whole language is one quoted argument and the path is quoted inside
-        // it, because `C:\Users\John Doe\...` is an ordinary Windows path and an
-        // unquoted one would be read as two arguments.
-        "powershell -NoProfile -Command \"(New-Object Media.SoundPlayer '{file}').PlaySync()\""
-            .to_string()
-    } else {
-        // ALSA is the most common; ffplay is the usual fallback and is quiet
-        // enough with these flags.
-        "aplay -q {file}".to_string()
-    }
+    super::output::INTERNAL_PLAYER.to_string()
 }
 
 #[cfg(test)]
@@ -691,7 +692,7 @@ mod tests {
             );
             assert!(!spec.about.is_empty(), "{name} has no description");
             assert!(
-                spec.play.contains("{file}"),
+                spec.play == crate::voice::output::INTERNAL_PLAYER || spec.play.contains("{file}"),
                 "{name} needs a player for its clip"
             );
         }
@@ -778,13 +779,31 @@ mod tests {
     #[test]
     fn the_player_is_platform_appropriate() {
         let player = default_player();
-        assert!(
-            player.contains("{file}"),
-            "the player needs the clip: {player}"
+        assert_eq!(player, crate::voice::output::INTERNAL_PLAYER);
+    }
+
+    /// A platform command written by readio is implementation history, not a
+    /// user preference. It should move to the callback player so an upgraded
+    /// reader gets frame PTS, while an actual custom command remains theirs.
+    #[test]
+    fn upgrades_our_old_player_without_overwriting_a_custom_one() {
+        let mut shipped = presets();
+        let old_player = "afplay {file}";
+        shipped.get_mut("kokoro").unwrap().play = old_player.to_string();
+        reconcile(&mut shipped);
+        assert_eq!(
+            shipped["kokoro"].play, "@readio",
+            "the old default stayed on its estimated process clock"
         );
-        if cfg!(target_os = "macos") {
-            assert!(player.starts_with("afplay"), "got: {player}");
-        }
+
+        let mut customised = presets();
+        customised.get_mut("kokoro").unwrap().play = format!("{old_player} --reader-chose-this");
+        reconcile(&mut customised);
+        assert_eq!(
+            customised["kokoro"].play,
+            format!("{old_player} --reader-chose-this"),
+            "a reader's player command was overwritten"
+        );
     }
 
     /// Every language a preset offers has to actually change something, and an

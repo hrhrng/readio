@@ -1,9 +1,8 @@
 name: tui-release
 
-# Tag `tui-vX.Y.Z` and the binaries appear. Nothing here is macOS-specific
-# except the two Apple targets, and nothing needs a C compiler: the dependency
-# tree is pure Rust, which is why the musl builds are a one-liner rather than a
-# cross toolchain.
+# Tag `tui-vX.Y.Z` and the binaries appear. Miniaudio is the only bundled C;
+# it uses pregenerated bindings, so Apple has a compiler already and Linux only
+# needs musl's compiler/linker. No system audio development package is linked.
 on:
   push:
     tags: ["tui-v*"]
@@ -49,8 +48,7 @@ jobs:
           rustup update stable --no-self-update
           rustup target add ${{ matrix.target }}
 
-      # musl-tools provides the linker; there is no C to compile, but the
-      # linker name is still what rustc looks for.
+      # musl-tools compiles bundled miniaudio and links the static binary.
       - name: Install musl tooling
         if: contains(matrix.target, 'linux-musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools

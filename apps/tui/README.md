@@ -317,19 +317,28 @@ Nothing runs through a shell here either; every command is an argv, and every co
 
 `openai` is not installable and says so: it is a server you run yourself, and readio has no business starting it.
 
-Speech has one presentation timeline. It begins only after the player has
-accepted the clip; synthesis and process startup do not advance it. Token
-reveal and the two-level highlight both sample its absolute position on every
-frame, so they cannot drift apart by integrating their own timers. The
-sentence being spoken takes a light wash and the word or character being
-sounded a deep one. Chinese advances by character, Latin by word, with
-punctuation lit alongside the character it follows.
+Speech has one presentation timeline. Built-in presets use readio's embedded
+audio device: a real-time callback reports absolute PCM frames, and both token
+reveal and the two-level highlight sample that one position. Synthesis,
+decoding, device startup and time spent paused do not advance it. Pressing
+space takes effect at the next callback boundary (readio requests a 10 ms
+period), freezes that exact frame position, and resumes from the next frame
+instead of restarting the sentence. A clip that finishes rendering while
+already paused also starts paused.
 
-The bundled command players expose clip duration and pause/resume
-acknowledgements, not word timestamps. Their within-sentence highlight is
-therefore a duration-weighted estimate. A model protocol that returns word or
-phoneme timestamps can replace that mapping without changing the global
-timeline; that is the path to semantic, sample-accurate alignment.
+TTS clips are decoded before the device starts. The audio callback itself only
+clears and copies a preallocated buffer and publishes atomics: it does no
+allocation, locking, logging or filesystem work. A custom `play:` command is
+still supported, but an external process cannot report PCM frames, so that
+explicit compatibility path uses a monotonic duration estimate. Old unedited
+readio defaults (`afplay`, `aplay` and `Media.SoundPlayer`) migrate to the
+embedded player; a command the reader changed is preserved.
+
+The transport is frame-based, but the bundled model protocols still expose no
+word or phoneme timestamps. Within a sentence, Chinese characters and Latin
+words are therefore mapped over the exact clip duration by weight. A future
+model timestamp or forced-alignment protocol can replace only that semantic
+mapping without introducing a second clock.
 
 ### One book, its own voice
 
@@ -445,7 +454,7 @@ voice:
 # input_log: /tmp/keys.log   # every terminal event appended, for debugging input
 ```
 
-The `engines:` block below that is settings for the engines themselves, and it is the one part of the file readio maintains as well as reads. On startup each built-in engine is reconciled with the binary, in three categories: what the package *is* — the description, the docs link, the PyPI name, the Python it needs — always follows the release, because nobody writes those by hand and a file written before those fields existed would otherwise freeze them empty forever. How to *run* it — the command, the player, whether the text goes on stdin, the language table — is yours, and is replaced only when what is saved is a default readio itself shipped and has since corrected. Which *voice* — `voice`, `model`, `extra` — is never touched.
+The `engines:` block below that is settings for the engines themselves, and it is the one part of the file readio maintains as well as reads. On startup each built-in engine is reconciled with the binary, in three categories: what the package *is* — the description, the docs link, the PyPI name, the Python it needs — always follows the release, because nobody writes those by hand and a file written before those fields existed would otherwise freeze them empty forever. How to *run* it — the command, the player, whether the text goes on stdin, the language table — is yours, and is replaced only when what is saved is a default readio itself shipped and has since corrected. The exact historical OS player defaults are upgraded to the embedded frame-clock player; anything customised remains yours. Which *voice* — `voice`, `model`, `extra` — is never touched.
 
 This is not hypothetical tidiness: every local preset shipped before v0.2.0 had a command line that did not match its engine's actual CLI, and the one shipped in v0.2.0-beta.3 ran but never passed a language, so it read Chinese with English phonemes. Without reconciliation an upgrade would leave read-aloud broken, or quietly bad, on exactly the machines that had used it longest.
 
@@ -527,7 +536,7 @@ CI (`.github/workflows/tui-ci.yml`, at the repository root) runs fmt, clippy wit
 ## Build and release
 
 ```sh
-cargo build --release     # 4.0 MB, thin LTO, one codegen unit, symbols stripped
+cargo build --release     # about 5 MB, thin LTO, one codegen unit, symbols stripped
 ```
 
 Install it by rename, not by copying over the old one:
@@ -538,7 +547,12 @@ mv target/release/readio ~/.local/bin/readio.new && mv ~/.local/bin/readio.new ~
 
 On macOS, `cp` over an existing binary leaves the old inode with a signature that no longer matches its contents, and the kernel answers by killing the process — an upgrade that "installed fine" and then dies with signal 9 and no message. A rename gives the new binary its own inode, and it also means a half-written download can never be left behind under a name someone is about to run. `install.sh` does exactly this, which is why it never had the problem.
 
-Nothing in the dependency tree compiles C. `zip` is reduced to `default-features = false, features = ["deflate"]`, which drops `zstd-sys` and bzip2 — EPUB only needs store and deflate — and leaves the tree pure Rust. Static musl builds are then a target away rather than a cross toolchain, and one Linux archive runs on any distribution.
+The only bundled C is miniaudio, compiled from the source shipped by `maudio`
+using pregenerated bindings, so release builds need an ordinary C compiler but
+not libclang, bindgen, ALSA development headers or a system audio SDK. `zip` is
+still reduced to `default-features = false, features = ["deflate"]`, because
+EPUB needs only store and deflate. Linux releases use musl's compiler and
+linker to keep the result self-contained across distributions.
 
 Four archives are published: `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`. Pushing a `tui-v*` tag builds all four, writes `SHA256SUMS`, and creates the release (`.github/workflows/tui-release.yml`). Windows and anything else builds from source; see the repository README.
 

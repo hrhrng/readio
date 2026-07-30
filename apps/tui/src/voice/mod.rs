@@ -30,6 +30,7 @@ pub mod command;
 pub mod config;
 pub mod device;
 pub mod install;
+mod output;
 pub mod resident;
 pub mod sentence;
 pub mod wav;
@@ -339,10 +340,14 @@ impl PlaybackControl {
     /// Commit the only start that matters: the player has accepted the clip
     /// and its presentation timestamp is now advancing.
     pub fn started(&self) {
-        if self
-            .clock
-            .start(self.id, self.range, self.chars, self.ms, self.era)
-        {
+        if self.clock.start(
+            self.id,
+            self.range,
+            self.chars,
+            self.ms,
+            self.era,
+            self.paused(),
+        ) {
             let _ = self.events.send(SpeechEvent::Started {
                 id: self.id,
                 range: self.range,
@@ -350,6 +355,31 @@ impl PlaybackControl {
                 ms: self.ms,
             });
         }
+    }
+
+    /// Start a callback-driven clip whose position is measured in PCM frames.
+    pub fn started_frames(&self, total_frames: u64, sample_rate: u32) {
+        if self.clock.start_frames(
+            self.id,
+            self.range,
+            total_frames,
+            sample_rate,
+            self.era,
+            self.paused(),
+        ) {
+            let duration = frames_duration(total_frames, sample_rate);
+            let _ = self.events.send(SpeechEvent::Started {
+                id: self.id,
+                range: self.range,
+                chars: self.chars,
+                ms: duration.as_millis().min(u64::MAX as u128) as u64,
+            });
+        }
+    }
+
+    /// Publish an absolute audio-callback-boundary frame position.
+    pub fn presented_frames(&self, frames: u64) {
+        self.clock.present_frames(self.era, frames);
     }
 
     /// The player has actually stopped advancing its audio pointer.
@@ -386,10 +416,51 @@ struct ClockClip {
     id: u64,
     range: (usize, usize),
     era: u64,
-    elapsed: Duration,
-    running_since: Option<Instant>,
+    source: ClockSource,
     duration: Duration,
     finished: bool,
+}
+
+enum ClockSource {
+    /// Compatibility path for a configured OS player command, which cannot
+    /// report frames and therefore advances from a monotonic start instant.
+    Estimated {
+        elapsed: Duration,
+        running_since: Option<Instant>,
+    },
+    /// An embedded audio callback is authoritative. Wall time never advances
+    /// this source; only an absolute presented-frame report can move it.
+    Frames {
+        elapsed: Duration,
+        sample_rate: u32,
+        paused: bool,
+    },
+}
+
+impl ClockClip {
+    fn elapsed(&self) -> Duration {
+        match self.source {
+            ClockSource::Estimated {
+                elapsed,
+                running_since,
+            } => running_since
+                .map(|started| elapsed + started.elapsed())
+                .unwrap_or(elapsed),
+            ClockSource::Frames { elapsed, .. } => elapsed,
+        }
+        .min(self.duration)
+    }
+
+    fn paused(&self) -> bool {
+        match self.source {
+            ClockSource::Estimated { running_since, .. } => running_since.is_none(),
+            ClockSource::Frames { paused, .. } => paused,
+        }
+    }
+
+    fn advancing(&self) -> bool {
+        !self.finished && !self.paused()
+    }
 }
 
 #[derive(Default)]
@@ -405,11 +476,19 @@ impl PlaybackClock {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn start(&self, id: u64, range: (usize, usize), _chars: usize, ms: u64, era: u64) -> bool {
+    fn start(
+        &self,
+        id: u64,
+        range: (usize, usize),
+        _chars: usize,
+        ms: u64,
+        era: u64,
+        paused: bool,
+    ) -> bool {
         let mut slot = self.lock();
         if slot
             .as_ref()
-            .is_some_and(|clip| clip.era == era && clip.running_since.is_some())
+            .is_some_and(|clip| clip.era == era && !clip.finished)
         {
             return false;
         }
@@ -417,8 +496,10 @@ impl PlaybackClock {
             id,
             range,
             era,
-            elapsed: Duration::ZERO,
-            running_since: Some(Instant::now()),
+            source: ClockSource::Estimated {
+                elapsed: Duration::ZERO,
+                running_since: (!paused).then(Instant::now),
+            },
             duration: Duration::from_millis(ms),
             finished: false,
         });
@@ -427,13 +508,71 @@ impl PlaybackClock {
         true
     }
 
+    fn start_frames(
+        &self,
+        id: u64,
+        range: (usize, usize),
+        total_frames: u64,
+        sample_rate: u32,
+        era: u64,
+        paused: bool,
+    ) -> bool {
+        let mut slot = self.lock();
+        if sample_rate == 0
+            || slot
+                .as_ref()
+                .is_some_and(|clip| clip.era == era && !clip.finished)
+        {
+            return false;
+        }
+        *slot = Some(ClockClip {
+            id,
+            range,
+            era,
+            source: ClockSource::Frames {
+                elapsed: Duration::ZERO,
+                sample_rate,
+                paused,
+            },
+            duration: frames_duration(total_frames, sample_rate),
+            finished: false,
+        });
+        drop(slot);
+        self.changed.notify_all();
+        true
+    }
+
+    fn present_frames(&self, era: u64, frames: u64) {
+        let mut slot = self.lock();
+        let Some(clip) = slot.as_mut().filter(|clip| clip.era == era) else {
+            return;
+        };
+        let ClockSource::Frames {
+            elapsed,
+            sample_rate,
+            ..
+        } = &mut clip.source
+        else {
+            return;
+        };
+        *elapsed = frames_duration(frames, *sample_rate).min(clip.duration);
+    }
+
     fn pause(&self, era: u64) {
         let mut slot = self.lock();
         let Some(clip) = slot.as_mut().filter(|clip| clip.era == era) else {
             return;
         };
-        if let Some(started) = clip.running_since.take() {
-            clip.elapsed = (clip.elapsed + started.elapsed()).min(clip.duration);
+        match &mut clip.source {
+            ClockSource::Estimated {
+                elapsed,
+                running_since,
+            } => {
+                if let Some(started) = running_since.take() {
+                    *elapsed = (*elapsed + started.elapsed()).min(clip.duration);
+                }
+            }
+            ClockSource::Frames { paused, .. } => *paused = true,
         }
         drop(slot);
         self.changed.notify_all();
@@ -444,8 +583,15 @@ impl PlaybackClock {
         let Some(clip) = slot.as_mut().filter(|clip| clip.era == era) else {
             return;
         };
-        if !clip.finished && clip.running_since.is_none() {
-            clip.running_since = Some(Instant::now());
+        if !clip.finished {
+            match &mut clip.source {
+                ClockSource::Estimated { running_since, .. } => {
+                    if running_since.is_none() {
+                        *running_since = Some(Instant::now());
+                    }
+                }
+                ClockSource::Frames { paused, .. } => *paused = false,
+            }
         }
         drop(slot);
         self.changed.notify_all();
@@ -456,8 +602,21 @@ impl PlaybackClock {
         let Some(clip) = slot.as_mut().filter(|clip| clip.era == era) else {
             return;
         };
-        clip.elapsed = clip.duration;
-        clip.running_since = None;
+        match &mut clip.source {
+            ClockSource::Estimated {
+                elapsed,
+                running_since,
+            } => {
+                *elapsed = clip.duration;
+                *running_since = None;
+            }
+            ClockSource::Frames {
+                elapsed, paused, ..
+            } => {
+                *elapsed = clip.duration;
+                *paused = false;
+            }
+        }
         clip.finished = true;
         drop(slot);
         self.changed.notify_all();
@@ -471,27 +630,19 @@ impl PlaybackClock {
     fn position(&self) -> Option<PlaybackPosition> {
         let slot = self.lock();
         let clip = slot.as_ref()?;
-        let elapsed = clip
-            .running_since
-            .map(|started| clip.elapsed + started.elapsed())
-            .unwrap_or(clip.elapsed)
-            .min(clip.duration);
         Some(PlaybackPosition {
             id: clip.id,
             range: clip.range,
-            elapsed,
+            elapsed: clip.elapsed(),
             duration: clip.duration,
-            paused: clip.running_since.is_none() && !clip.finished,
+            paused: clip.paused() && !clip.finished,
             finished: clip.finished,
         })
     }
 
     fn wait_until_paused(&self) {
         let mut slot = self.lock();
-        while slot
-            .as_ref()
-            .is_some_and(|clip| clip.running_since.is_some() && !clip.finished)
-        {
+        while slot.as_ref().is_some_and(ClockClip::advancing) {
             slot = self
                 .changed
                 .wait(slot)
@@ -503,7 +654,7 @@ impl PlaybackClock {
         let mut slot = self.lock();
         while slot
             .as_ref()
-            .is_some_and(|clip| clip.running_since.is_none() && !clip.finished)
+            .is_some_and(|clip| clip.paused() && !clip.finished)
         {
             slot = self
                 .changed
@@ -511,6 +662,14 @@ impl PlaybackClock {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
     }
+}
+
+fn frames_duration(frames: u64, sample_rate: u32) -> Duration {
+    if sample_rate == 0 {
+        return Duration::ZERO;
+    }
+    let nanos = (frames as u128 * 1_000_000_000u128) / sample_rate as u128;
+    Duration::from_nanos(nanos.min(u64::MAX as u128) as u64)
 }
 
 /// Background speech: one thread rendering, one playing, `prefetch` clips of
@@ -1250,6 +1409,62 @@ mod tests {
         speaker.resume();
         drop(speaker);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pause requested while the OS player is starting belongs to that clip,
+    /// even though there is no audio cursor to acknowledge yet. Starting the
+    /// global clock as running would let text move under a paused reader and
+    /// makes resume jump by the whole process-start delay.
+    #[test]
+    fn a_clip_that_starts_during_pause_enters_the_clock_paused() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let dir = scratch("pause-during-start");
+        let fake = Fake::new(&log, 5, 400).starting_after(180);
+        let mut speaker = Speaker::spawn(Box::new(fake), dir.clone(), 1);
+        speaker.speak(13, "a sentence.", (0, 11));
+        assert_eq!(count_at_least(&log, "render-end", 1), 1);
+
+        speaker.pause();
+        assert_eq!(count_at_least(&log, "play-start", 1), 1);
+        let first = speaker.position().expect("the started clip");
+        assert!(first.paused, "the clip ignored the pending pause");
+        std::thread::sleep(Duration::from_millis(60));
+        let later = speaker.position().expect("the same clip");
+        assert_eq!(
+            later.elapsed, first.elapsed,
+            "the clock advanced while the player was paused"
+        );
+
+        speaker.resume();
+        drop(speaker);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Once a device callback owns the timeline, wall time is irrelevant. The
+    /// position is exactly the number of frames the output layer has reported,
+    /// and remains stable between callbacks even if the UI thread sleeps.
+    #[test]
+    fn a_frame_clock_advances_only_when_audio_frames_are_presented() {
+        let clock = PlaybackClock::default();
+        assert!(clock.start_frames(21, (2, 9), 48_000, 48_000, 7, false));
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(
+            clock.position().expect("frame clock").elapsed,
+            Duration::ZERO,
+            "wall time advanced a callback-driven clock"
+        );
+
+        clock.present_frames(7, 12_000);
+        assert_eq!(
+            clock.position().expect("frame clock").elapsed,
+            Duration::from_millis(250)
+        );
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(
+            clock.position().expect("frame clock").elapsed,
+            Duration::from_millis(250),
+            "the clock integrated a second, independent timer"
+        );
     }
 
     /// A speed change throws away everything rendered at the old speed. The

@@ -121,6 +121,9 @@ impl Synthesizer for CommandSynth {
     }
 
     fn play(&self, clip: &Clip, control: &PlaybackControl) -> Result<()> {
+        if self.spec.play.trim() == super::output::INTERNAL_PLAYER {
+            return super::output::play(&clip.path, control);
+        }
         if self.spec.play.trim().is_empty() {
             // The synth command played it itself; wait out its duration so the
             // caller's pacing still lines up.
