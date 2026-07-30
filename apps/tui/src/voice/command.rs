@@ -126,6 +126,12 @@ impl Synthesizer for CommandSynth {
             // caller's pacing still lines up.
             return sleep_controlled(clip.ms, control);
         }
+        while control.paused() && !control.cancelled() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if control.cancelled() {
+            return Ok(());
+        }
         let args = self.build(&self.spec.play, "", &clip.path, Some(&clip.path));
         let Some((program, rest)) = args.split_first() else {
             return Err(anyhow!("{}", t("synth.empty_play")));
@@ -139,6 +145,7 @@ impl Synthesizer for CommandSynth {
             .stderr(Stdio::piped())
             .spawn()
             .with_context(|| tf("synth.cannot_play", &[&program]))?;
+        control.started();
 
         // Poll so pause can hold the player's own audio cursor and an interrupt
         // can cut it off mid-sentence.
@@ -152,6 +159,11 @@ impl Synthesizer for CommandSynth {
             if control.paused() != paused {
                 paused = control.paused();
                 set_process_paused(child.id(), paused)?;
+                if paused {
+                    control.pause_applied();
+                } else {
+                    control.resume_applied();
+                }
             }
             match child.try_wait()? {
                 Some(status) if status.success() => return Ok(()),
@@ -481,12 +493,30 @@ fn run(args: &[String], input: Option<&str>, timeout: Duration) -> Result<()> {
 fn sleep_controlled(ms: u64, control: &PlaybackControl) -> Result<()> {
     let mut remaining = Duration::from_millis(ms);
     let mut sampled = std::time::Instant::now();
+    let mut paused = control.paused();
+    while paused && !control.cancelled() {
+        std::thread::sleep(Duration::from_millis(5));
+        paused = control.paused();
+        sampled = std::time::Instant::now();
+    }
+    if control.cancelled() {
+        return Ok(());
+    }
+    control.started();
     while !remaining.is_zero() {
         if control.cancelled() {
             return Ok(());
         }
+        if control.paused() != paused {
+            paused = control.paused();
+            if paused {
+                control.pause_applied();
+            } else {
+                control.resume_applied();
+            }
+        }
         let now = std::time::Instant::now();
-        if !control.paused() {
+        if !paused {
             remaining = remaining.saturating_sub(now.saturating_duration_since(sampled));
         }
         sampled = now;

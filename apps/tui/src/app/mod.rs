@@ -31,7 +31,9 @@ use crate::ui::scrollback::Scrollback;
 use crate::ui::voice as voice_ui;
 use crate::voice::device::{self, Gate, Verdict};
 use crate::voice::sentence::Unit;
-use crate::voice::{self, Speaker, SpeechEvent, command::CommandSynth, install, sentence};
+use crate::voice::{
+    self, PlaybackPosition, Speaker, SpeechEvent, command::CommandSynth, install, sentence,
+};
 
 use flow::Pos;
 use turn::{Effect, Step, Turn};
@@ -222,37 +224,11 @@ struct Cursor {
     sentence: (usize, usize),
     /// Words or characters, in passage coordinates.
     units: Vec<Unit>,
-    started: Instant,
-    /// When present, elapsed audio time is held at this instant. Resume moves
-    /// `started` forward by the pause duration so the visual cursor and the OS
-    /// player's audio cursor continue from the same millisecond.
-    paused: Option<Instant>,
-    /// Clip duration, which is what the cursor's speed is derived from.
-    ms: u64,
+    /// Character positions the clip owns on the passage reveal timeline:
+    /// what was visible when it began, and its sentence-end ceiling.
+    reveal: (usize, usize),
     /// Last unit shown, so the scrollback is only touched when it changes.
     shown: Option<(usize, usize)>,
-    /// The worker says this clip is done. The highlight still waits for the
-    /// clip's own duration: some players hand the audio to a daemon and return
-    /// immediately, and the highlight has to follow the sound, not the process.
-    done: bool,
-}
-
-impl Cursor {
-    fn pause(&mut self) {
-        self.paused.get_or_insert_with(Instant::now);
-    }
-
-    fn resume(&mut self) {
-        if let Some(paused) = self.paused.take() {
-            self.started += paused.elapsed();
-        }
-    }
-
-    fn elapsed(&self) -> std::time::Duration {
-        self.paused
-            .map(|paused| paused.saturating_duration_since(self.started))
-            .unwrap_or_else(|| self.started.elapsed())
-    }
 }
 
 impl App {
@@ -487,6 +463,7 @@ impl App {
             self.enqueue_speech(id, &text);
         }
         self.pump_speech();
+        self.sync_reveal_to_audio();
         self.pump_install();
         self.advance_cursor();
         // Last line of defence: a hold belongs to a voice, and a voice that has
@@ -571,6 +548,11 @@ impl App {
     /// queued" but "is anything playing". The pacing tests count frames on it.
     pub fn voice_sounding(&self) -> bool {
         self.speaker.as_ref().is_some_and(Speaker::sounding)
+    }
+
+    /// Current presentation timestamp of the read-aloud player.
+    pub fn voice_position(&self) -> Option<PlaybackPosition> {
+        self.speaker.as_ref().and_then(Speaker::position)
     }
 
     /// Path for the opt-in input trace, straight from the config file.
@@ -1018,11 +1000,7 @@ impl App {
                     self.cursor = self.build_cursor(id, range, ms);
                     self.follow_clip(id, range, chars, ms);
                 }
-                SpeechEvent::Finished { .. } => {
-                    if let Some(cursor) = self.cursor.as_mut() {
-                        cursor.done = true;
-                    }
-                }
+                SpeechEvent::Finished { .. } => {}
                 SpeechEvent::Idle => self.idle = true,
                 SpeechEvent::Failed { message } => self.lose_the_voice(&message),
             }
@@ -1097,16 +1075,13 @@ impl App {
         self.interrupt();
     }
 
-    /// Let the text out as far as the sentence now being spoken, at the speed
-    /// that sentence is being spoken at.
+    /// Give the sentence now being spoken ownership of the reveal ceiling.
     ///
-    /// Two things happen here, and they are the whole of read-aloud's pacing.
-    /// The **ceiling** is the end of this clip's sentence: nothing past it may
-    /// appear, so a synthesis wait stalls the reveal instead of handing it a
-    /// head start it can never give back. The **pace** is whatever is left to
-    /// show divided by however long the clip runs, which means a reveal that
-    /// fell behind during that wait catches up over the next sentence rather
-    /// than trailing the voice for the rest of the chapter.
+    /// Nothing past the ceiling may appear, so a synthesis wait stalls the
+    /// reveal instead of handing it a head start it can never give back. The
+    /// calculated pace remains useful after speech releases the passage, but
+    /// while the clip is live [`Self::sync_reveal_to_audio`] projects the
+    /// player's absolute timestamp and has the final word.
     fn follow_clip(&mut self, id: u64, range: (usize, usize), chars: usize, ms: u64) {
         if ms == 0 {
             return;
@@ -1158,20 +1133,51 @@ impl App {
         if units.is_empty() || ms == 0 {
             return None;
         }
+        let reveal_to = text[..range.1].chars().count();
+        let reveal_from = self
+            .turn
+            .streaming_passage()
+            .filter(|(streaming, _)| *streaming == id)
+            .map(|(_, released)| released.min(reveal_to))
+            .unwrap_or_else(|| text[..range.0].chars().count());
         Some(Cursor {
             id,
             sentence: range,
             units,
-            started: Instant::now(),
-            paused: self.turn.paused().then(Instant::now),
-            ms,
+            reveal: (reveal_from, reveal_to),
             shown: None,
-            done: false,
         })
+    }
+
+    /// Make the visible passage an exact projection of the player's PTS.
+    fn sync_reveal_to_audio(&mut self) {
+        let position = self.speaker.as_ref().and_then(Speaker::position);
+        let Some(position) = position else {
+            return;
+        };
+        let Some(cursor) = self
+            .cursor
+            .as_ref()
+            .filter(|cursor| cursor.id == position.id && cursor.sentence == position.range)
+        else {
+            return;
+        };
+        let span = cursor.reveal.1.saturating_sub(cursor.reveal.0);
+        let elapsed = position.elapsed.as_nanos();
+        let duration = position.duration.as_nanos().max(1);
+        let advanced = if position.finished {
+            span
+        } else {
+            ((span as u128 * elapsed) / duration).min(span as u128) as usize
+        };
+        let target = cursor.reveal.0 + advanced;
+        self.turn
+            .reveal_passage_to(position.id, target, &mut self.sb);
     }
 
     /// Walk the word highlight along with the audio. Called once per frame.
     fn advance_cursor(&mut self) {
+        let position = self.speaker.as_ref().and_then(Speaker::position);
         let Some(cursor) = self.cursor.as_mut() else {
             // Nothing playing: honour a pending "everything has been said".
             if self.idle {
@@ -1180,9 +1186,14 @@ impl App {
             }
             return;
         };
+        let Some(position) = position
+            .filter(|position| position.id == cursor.id && position.range == cursor.sentence)
+        else {
+            return;
+        };
         // A clip that has played out: drop the word, keep the sentence lit until
         // the next one starts, and only then admit to being idle.
-        if cursor.done && cursor.elapsed().as_millis() as u64 >= cursor.ms {
+        if position.finished {
             let (id, sentence) = (cursor.id, cursor.sentence);
             self.cursor = None;
             self.sb.set_highlight(id, Some(Highlight::new(sentence)));
@@ -1192,7 +1203,8 @@ impl App {
             }
             return;
         }
-        let progress = cursor.elapsed().as_millis() as f32 / cursor.ms as f32;
+        let progress =
+            position.elapsed.as_secs_f32() / position.duration.as_secs_f32().max(f32::EPSILON);
         let Some(unit) = sentence::unit_at(&cursor.units, progress) else {
             return;
         };
@@ -1826,7 +1838,7 @@ impl App {
     }
 
     fn pause(&mut self) {
-        if !self.turn.pause() {
+        if !self.turn.busy() || self.turn.paused() {
             return;
         }
         // The mode is a setting, not a consequence: pausing holds the place
@@ -1837,25 +1849,20 @@ impl App {
             if let Some(speaker) = self.speaker.as_ref() {
                 speaker.pause();
             }
-            if let Some(cursor) = self.cursor.as_mut() {
-                cursor.pause();
-            }
         }
+        self.turn.pause();
     }
 
     fn resume_turn(&mut self) {
         if !self.turn.paused() {
             return;
         }
-        self.turn.resume();
         if self.speech {
-            if let Some(cursor) = self.cursor.as_mut() {
-                cursor.resume();
-            }
             if let Some(speaker) = self.speaker.as_ref() {
                 speaker.resume();
             }
         }
+        self.turn.resume();
     }
 
     // ── reading mode ─────────────────────────────────────────────────────────

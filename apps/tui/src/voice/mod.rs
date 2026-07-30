@@ -41,6 +41,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
@@ -318,6 +319,12 @@ pub struct PlaybackControl {
     pipeline: Arc<Pipeline>,
     era: u64,
     paused: Arc<AtomicBool>,
+    clock: Arc<PlaybackClock>,
+    events: Sender<SpeechEvent>,
+    id: u64,
+    range: (usize, usize),
+    chars: usize,
+    ms: u64,
 }
 
 impl PlaybackControl {
@@ -328,6 +335,182 @@ impl PlaybackControl {
     pub fn paused(&self) -> bool {
         self.paused.load(Ordering::SeqCst)
     }
+
+    /// Commit the only start that matters: the player has accepted the clip
+    /// and its presentation timestamp is now advancing.
+    pub fn started(&self) {
+        if self
+            .clock
+            .start(self.id, self.range, self.chars, self.ms, self.era)
+        {
+            let _ = self.events.send(SpeechEvent::Started {
+                id: self.id,
+                range: self.range,
+                chars: self.chars,
+                ms: self.ms,
+            });
+        }
+    }
+
+    /// The player has actually stopped advancing its audio pointer.
+    pub fn pause_applied(&self) {
+        self.clock.pause(self.era);
+    }
+
+    /// The player has actually resumed its audio pointer.
+    pub fn resume_applied(&self) {
+        self.clock.resume(self.era);
+    }
+
+    fn finished(&self) {
+        self.clock.finish(self.era);
+    }
+}
+
+/// One sample from the global read-aloud presentation timeline.
+///
+/// Every visual consumer receives this same position. `elapsed` advances only
+/// while the player says it is advancing; synthesis, process startup and pause
+/// are deliberately absent from the timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaybackPosition {
+    pub id: u64,
+    pub range: (usize, usize),
+    pub elapsed: Duration,
+    pub duration: Duration,
+    pub paused: bool,
+    pub finished: bool,
+}
+
+struct ClockClip {
+    id: u64,
+    range: (usize, usize),
+    era: u64,
+    elapsed: Duration,
+    running_since: Option<Instant>,
+    duration: Duration,
+    finished: bool,
+}
+
+#[derive(Default)]
+struct PlaybackClock {
+    clip: Mutex<Option<ClockClip>>,
+    changed: Condvar,
+}
+
+impl PlaybackClock {
+    fn lock(&self) -> MutexGuard<'_, Option<ClockClip>> {
+        self.clip
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn start(&self, id: u64, range: (usize, usize), _chars: usize, ms: u64, era: u64) -> bool {
+        let mut slot = self.lock();
+        if slot
+            .as_ref()
+            .is_some_and(|clip| clip.era == era && clip.running_since.is_some())
+        {
+            return false;
+        }
+        *slot = Some(ClockClip {
+            id,
+            range,
+            era,
+            elapsed: Duration::ZERO,
+            running_since: Some(Instant::now()),
+            duration: Duration::from_millis(ms),
+            finished: false,
+        });
+        drop(slot);
+        self.changed.notify_all();
+        true
+    }
+
+    fn pause(&self, era: u64) {
+        let mut slot = self.lock();
+        let Some(clip) = slot.as_mut().filter(|clip| clip.era == era) else {
+            return;
+        };
+        if let Some(started) = clip.running_since.take() {
+            clip.elapsed = (clip.elapsed + started.elapsed()).min(clip.duration);
+        }
+        drop(slot);
+        self.changed.notify_all();
+    }
+
+    fn resume(&self, era: u64) {
+        let mut slot = self.lock();
+        let Some(clip) = slot.as_mut().filter(|clip| clip.era == era) else {
+            return;
+        };
+        if !clip.finished && clip.running_since.is_none() {
+            clip.running_since = Some(Instant::now());
+        }
+        drop(slot);
+        self.changed.notify_all();
+    }
+
+    fn finish(&self, era: u64) {
+        let mut slot = self.lock();
+        let Some(clip) = slot.as_mut().filter(|clip| clip.era == era) else {
+            return;
+        };
+        clip.elapsed = clip.duration;
+        clip.running_since = None;
+        clip.finished = true;
+        drop(slot);
+        self.changed.notify_all();
+    }
+
+    fn clear(&self) {
+        *self.lock() = None;
+        self.changed.notify_all();
+    }
+
+    fn position(&self) -> Option<PlaybackPosition> {
+        let slot = self.lock();
+        let clip = slot.as_ref()?;
+        let elapsed = clip
+            .running_since
+            .map(|started| clip.elapsed + started.elapsed())
+            .unwrap_or(clip.elapsed)
+            .min(clip.duration);
+        Some(PlaybackPosition {
+            id: clip.id,
+            range: clip.range,
+            elapsed,
+            duration: clip.duration,
+            paused: clip.running_since.is_none() && !clip.finished,
+            finished: clip.finished,
+        })
+    }
+
+    fn wait_until_paused(&self) {
+        let mut slot = self.lock();
+        while slot
+            .as_ref()
+            .is_some_and(|clip| clip.running_since.is_some() && !clip.finished)
+        {
+            slot = self
+                .changed
+                .wait(slot)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn wait_until_running(&self) {
+        let mut slot = self.lock();
+        while slot
+            .as_ref()
+            .is_some_and(|clip| clip.running_since.is_none() && !clip.finished)
+        {
+            slot = self
+                .changed
+                .wait(slot)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
 }
 
 /// Background speech: one thread rendering, one playing, `prefetch` clips of
@@ -336,6 +519,7 @@ pub struct Speaker {
     commands: Sender<Command>,
     events: Receiver<SpeechEvent>,
     paused: Arc<AtomicBool>,
+    clock: Arc<PlaybackClock>,
     pipeline: Arc<Pipeline>,
     /// Sentences accepted but not yet finished playing. Zero means the reader
     /// can go back to timed reading.
@@ -362,6 +546,7 @@ impl Speaker {
         let (commands, command_rx) = channel::<Command>();
         let (event_tx, events) = channel::<SpeechEvent>();
         let paused = Arc::new(AtomicBool::new(false));
+        let clock = Arc::new(PlaybackClock::default());
         let pipeline = Arc::new(Pipeline::new(prefetch.max(1)));
         let inflight = Arc::new(AtomicUsize::new(0));
 
@@ -382,7 +567,8 @@ impl Speaker {
                 let pipeline = Arc::clone(&pipeline);
                 let inflight = Arc::clone(&inflight);
                 let paused = Arc::clone(&paused);
-                move || play_loop(synth, event_tx, pipeline, inflight, paused)
+                let clock = Arc::clone(&clock);
+                move || play_loop(synth, event_tx, pipeline, inflight, paused, clock)
             })
             .ok();
 
@@ -390,6 +576,7 @@ impl Speaker {
             commands,
             events,
             paused,
+            clock,
             pipeline,
             inflight,
             render,
@@ -436,17 +623,25 @@ impl Speaker {
     /// Freeze the current clip at its audio cursor, leaving the queue intact.
     pub fn pause(&self) {
         self.paused.store(true, Ordering::SeqCst);
+        self.clock.wait_until_paused();
     }
 
     /// Continue the same clip from the audio cursor held by [`Speaker::pause`].
     pub fn resume(&self) {
         self.paused.store(false, Ordering::SeqCst);
+        self.clock.wait_until_running();
+    }
+
+    /// The single presentation timestamp sampled by text and highlighting.
+    pub fn position(&self) -> Option<PlaybackPosition> {
+        self.clock.position()
     }
 
     /// Drop everything queued and silence the current clip.
     pub fn stop(&mut self) {
         self.pipeline.flush();
         self.paused.store(false, Ordering::SeqCst);
+        self.clock.clear();
         self.pending = 0;
         self.sounding = false;
         self.inflight.store(0, Ordering::SeqCst);
@@ -611,6 +806,7 @@ fn play_loop(
     pipeline: Arc<Pipeline>,
     inflight: Arc<AtomicUsize>,
     paused: Arc<AtomicBool>,
+    clock: Arc<PlaybackClock>,
 ) {
     while let Some(Rendered { job, clip }) = pipeline.pop() {
         if pipeline.is_stale(job.era) {
@@ -619,18 +815,19 @@ fn play_loop(
             continue;
         }
 
-        let _ = events.send(SpeechEvent::Started {
-            id: job.id,
-            range: job.range,
-            chars: job.text.chars().count(),
-            ms: clip.ms,
-        });
         let control = PlaybackControl {
             pipeline: Arc::clone(&pipeline),
             era: job.era,
             paused: Arc::clone(&paused),
+            clock: Arc::clone(&clock),
+            events: events.clone(),
+            id: job.id,
+            range: job.range,
+            chars: job.text.chars().count(),
+            ms: clip.ms,
         };
         let played = synth.play(&clip, &control);
+        control.finished();
         let _ = std::fs::remove_file(&clip.path);
         let _ = events.send(SpeechEvent::Finished { id: job.id });
         if let Err(err) = played
@@ -691,8 +888,10 @@ mod tests {
     /// can tell a pipeline from a queue.
     struct Fake {
         log: Arc<Mutex<Vec<(&'static str, Instant)>>>,
+        start: Duration,
         synth: Duration,
         play: Duration,
+        control_tick: Duration,
         /// While this stays true, `play` does not return. Parking the player
         /// inside a clip lets a test reason about the pipeline's shape without
         /// depending on how fast the machine happens to be.
@@ -703,10 +902,22 @@ mod tests {
         fn new(log: &Arc<Mutex<Vec<(&'static str, Instant)>>>, synth: u64, play: u64) -> Self {
             Self {
                 log: Arc::clone(log),
+                start: Duration::ZERO,
                 synth: Duration::from_millis(synth),
                 play: Duration::from_millis(play),
+                control_tick: Duration::from_millis(2),
                 hold: None,
             }
+        }
+
+        fn starting_after(mut self, ms: u64) -> Self {
+            self.start = Duration::from_millis(ms);
+            self
+        }
+
+        fn checking_controls_every(mut self, ms: u64) -> Self {
+            self.control_tick = Duration::from_millis(ms);
+            self
         }
 
         fn parked(mut self, hold: &Arc<AtomicBool>) -> Self {
@@ -735,16 +946,27 @@ mod tests {
         }
 
         fn play(&self, _clip: &Clip, control: &PlaybackControl) -> Result<()> {
+            std::thread::sleep(self.start);
             self.note("play-start");
+            control.started();
             let mut remaining = self.play;
             let mut sampled = Instant::now();
+            let mut paused = control.paused();
             while !remaining.is_zero() && !control.cancelled() {
+                if control.paused() != paused {
+                    paused = control.paused();
+                    if paused {
+                        control.pause_applied();
+                    } else {
+                        control.resume_applied();
+                    }
+                }
                 let now = Instant::now();
-                if !control.paused() {
+                if !paused {
                     remaining = remaining.saturating_sub(now.saturating_duration_since(sampled));
                 }
                 sampled = now;
-                std::thread::sleep(Duration::from_millis(2));
+                std::thread::sleep(self.control_tick);
             }
             if let Some(hold) = &self.hold {
                 // The deadline is a safety net, not part of the contract: a bug
@@ -964,6 +1186,68 @@ mod tests {
             1,
             "resume rendered the same sentence a second time"
         );
+        drop(speaker);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The UI clock must begin when the player does, not when a rendered file
+    /// merely leaves the queue. Process startup is normally small, but it is
+    /// still real time in which advancing tokens or highlights would put the
+    /// page ahead of the sound.
+    #[test]
+    fn playback_started_is_reported_only_when_the_player_really_starts() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let dir = scratch("player-start");
+        let fake = Fake::new(&log, 10, 80).starting_after(180);
+        let mut speaker = Speaker::spawn(Box::new(fake), dir.clone(), 1);
+        speaker.speak(5, "a sentence.", (3, 14));
+        assert_eq!(count_at_least(&log, "render-end", 1), 1);
+
+        std::thread::sleep(Duration::from_millis(70));
+        assert!(
+            !speaker
+                .poll()
+                .iter()
+                .any(|event| matches!(event, SpeechEvent::Started { .. })),
+            "the global playback clock started while the OS player was still starting"
+        );
+
+        assert_eq!(count_at_least(&log, "play-start", 1), 1);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut started = false;
+        while !started && Instant::now() < deadline {
+            started = speaker
+                .poll()
+                .iter()
+                .any(|event| matches!(event, SpeechEvent::Started { .. }));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(started, "the real player start was never reported");
+        drop(speaker);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Returning from pause before the player has frozen means the UI and the
+    /// audio cursor record two different pause instants. The global clock's
+    /// pause boundary is the player's acknowledgement, even when that player
+    /// takes a noticeable polling interval to apply it.
+    #[test]
+    fn pause_returns_only_after_the_global_clock_is_frozen() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let dir = scratch("pause-ack");
+        let fake = Fake::new(&log, 5, 600).checking_controls_every(120);
+        let mut speaker = Speaker::spawn(Box::new(fake), dir.clone(), 1);
+        speaker.speak(8, "a sentence.", (0, 11));
+        assert_eq!(count_at_least(&log, "play-start", 1), 1);
+
+        speaker.pause();
+        let position = speaker.position().expect("the active playback clock");
+        assert!(
+            position.paused,
+            "pause returned while the global playback clock was still advancing"
+        );
+
+        speaker.resume();
         drop(speaker);
         let _ = std::fs::remove_dir_all(&dir);
     }

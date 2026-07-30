@@ -317,7 +317,19 @@ Nothing runs through a shell here either; every command is an argv, and every co
 
 `openai` is not installable and says so: it is a server you run yourself, and readio has no business starting it.
 
-Two things change when speech is on. Reveal speed follows the audio — each clip reports its own duration and the pacer runs at `chars / clip_seconds`, so text finishes exactly when sound does and the configured pace steps aside. And highlighting becomes two-level: the sentence being spoken takes a light wash, the word or character being sounded a deep one. Chinese advances by character (there is nothing to break on, and the character is the unit the eye moves in), Latin by word, with punctuation lit alongside the character it follows.
+Speech has one presentation timeline. It begins only after the player has
+accepted the clip; synthesis and process startup do not advance it. Token
+reveal and the two-level highlight both sample its absolute position on every
+frame, so they cannot drift apart by integrating their own timers. The
+sentence being spoken takes a light wash and the word or character being
+sounded a deep one. Chinese advances by character, Latin by word, with
+punctuation lit alongside the character it follows.
+
+The bundled command players expose clip duration and pause/resume
+acknowledgements, not word timestamps. Their within-sentence highlight is
+therefore a duration-weighted estimate. A model protocol that returns word or
+phoneme timestamps can replace that mapping without changing the global
+timeline; that is the path to semantic, sample-accurate alignment.
 
 ### One book, its own voice
 
@@ -356,8 +368,10 @@ Playback speed is the effort multiplier — one control for both worlds, describ
 
 In Read-aloud, `[` slows down and `]` speeds up through
 `0.75× → 1× → 1.25× → 1.5× → 2×`; the keys stay printed beside the mode chip
-instead of being hidden in help. Space pauses the live OS player and the reveal
-clock together. It does not cancel or re-queue the sentence, so another space
+instead of being hidden in help. Space asks the live OS player to pause and
+returns only after the player acknowledges that its audio pointer is frozen.
+The global timeline, token reveal and highlight all hold at that acknowledged
+position. It does not cancel or re-queue the sentence, so another space
 continues from the same audio millisecond without repeating what was already
 heard. `esc` followed by `⏎` uses the same held audio pointer while a
 Read-aloud turn is interrupted.

@@ -292,6 +292,51 @@ fn a_passage_shows_nothing_until_its_first_clip_exists() {
     });
 }
 
+/// Token reveal is a projection of the playback PTS, not a second pacer.
+///
+/// The opening utterance says `第1章`, whose source prefix is the six-character
+/// heading `## 第1章`. Its clip is exactly two seconds long, so just after one
+/// second exactly half that source belongs on screen. The old independent
+/// character clock clamps itself to four characters per second and has already
+/// run ahead here.
+#[test]
+fn token_reveal_samples_the_global_playback_position() {
+    let _guard = exclusive();
+    let (mut app, mut terminal) = fixture_with(
+        long_chapters(common::isolated_home()),
+        SYNTH_MS,
+        LONG_CLIP_MS,
+    );
+    start_reading_aloud(&mut app, &mut terminal);
+    until(&mut app, &mut terminal, "the playback clock", |app| {
+        app.voice_sounding()
+    });
+
+    until(&mut app, &mut terminal, "half of the opening clip", |app| {
+        app.voice_position()
+            .is_some_and(|position| position.elapsed >= Duration::from_millis(1_050))
+    });
+    let position = app.voice_position().expect("a playback position");
+    let (_, source, _) = app.turn.passage_in_flight().expect("the opening passage");
+    assert_eq!(
+        &source[position.range.0..position.range.1],
+        "第1章",
+        "the fixture's opening utterance changed"
+    );
+    assert_eq!(
+        source[..position.range.1].chars().count(),
+        6,
+        "the fixture's heading prefix changed"
+    );
+    let expected =
+        (6 * position.elapsed.as_millis() / position.duration.as_millis().max(1)) as usize;
+    assert_eq!(
+        shown(&app),
+        Some(expected),
+        "the text clock drifted away from the global playback position"
+    );
+}
+
 /// The pacing itself, measured rather than reasoned about.
 ///
 /// One chapter of twenty sentences is one passage, long enough that eight
