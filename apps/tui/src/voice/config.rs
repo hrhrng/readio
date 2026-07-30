@@ -51,11 +51,9 @@ pub struct EngineSpec {
     pub about: String,
     /// PyPI distribution that provides this engine's command, if it has one.
     ///
-    /// readio does not bundle a model and will not vendor an installer either.
-    /// This is the one fact it needs to offer `/voice install`: the package name.
-    /// Everything else — whether to use `uv`, `pipx` or `pip`, and which of them
-    /// this machine actually has — is worked out at the moment of installing,
-    /// because the answer differs per machine and changes over time.
+    /// Readio does not bundle a model or Python. This package name is installed
+    /// with its pinned standalone uv into a managed tool environment in the
+    /// user's cache, independent of whatever Python the machine has.
     #[serde(default)]
     pub pip: String,
     /// Package name for the operating system's package manager, for engines

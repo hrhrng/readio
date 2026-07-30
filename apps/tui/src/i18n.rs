@@ -505,8 +505,10 @@ The short forms -c / -l / -m work too."),
         "{0} is not something readio can install: it is a server you run yourself. See {1}"),
     ("install.no_recipe_bare", "{0} 不是 readio 能装的东西——那条命令是你自己写的，得你自己备齐",
         "{0} is not something readio can install: that command line is yours, so its program is too"),
-    ("install.no_installer", "这台机器上没找到 uv、pipx 或 pip，装不了。装一个再来：https://docs.astral.sh/uv/",
-        "No uv, pipx or pip on this machine, so there is nothing to install with. Get one first: https://docs.astral.sh/uv/"),
+    ("install.no_installer", "这台机器上没找到支持的系统包管理器，无法安装这个非 Python 引擎。",
+        "No supported system package manager was found for this non-Python engine."),
+    ("install.unsupported_runtime", "Readio 暂无适用于 {0} 的自管理 Python 运行时。",
+        "Readio does not yet provide a managed Python runtime for {0}."),
 
     // ── what a speech engine says when it fails ──
     //

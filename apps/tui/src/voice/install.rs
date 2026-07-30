@@ -1,12 +1,10 @@
 //! Installing a speech engine from inside readio.
 //!
-//! readio ships no model and no bundled installer, and it is not about to grow
-//! a package manager. What it does know is the one fact that turns "find the
-//! project, read its README, work out which Python you have" into a keypress:
-//! the PyPI distribution behind each preset. Everything else — which of `uv`,
-//! `pipx` and `pip` this machine has, whether the package pins a Python — is
-//! decided here, at the moment of installing, because the answer differs per
-//! machine and goes stale in a release.
+//! readio ships no model or Python in its small native binary. When a Python
+//! model is requested it bootstraps a pinned, checksum-verified uv binary into
+//! the user's cache. uv then owns the Python and tool environments below that
+//! cache, while retaining its ordinary shared download cache. The result needs
+//! no system Python and does not contaminate one when it exists.
 //!
 //! Nothing runs through a shell. Every command is an argv, so a package name is
 //! a package name even when it contains something exciting.
@@ -17,6 +15,8 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::Instant;
 
+use sha2::{Digest, Sha256};
+
 use crate::app::expand_tilde;
 use crate::voice::config::EngineSpec;
 
@@ -24,8 +24,14 @@ use crate::voice::config::EngineSpec;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Step {
     pub argv: Vec<String>,
+    /// Environment belonging to this command. Runtime location is explicit,
+    /// while cache variables are intentionally absent so uv and Hugging Face
+    /// can reuse the reader's standard caches.
+    pub env: Vec<(String, String)>,
     /// Where the output of a download goes, so the directory can be made first.
     pub creates: Option<PathBuf>,
+    /// Expected digest for a downloaded executable archive.
+    pub sha256: Option<String>,
     /// Resolve the Python interpreter from this installed launcher before
     /// running `argv`. Used for Hugging Face downloads that need the package
     /// environment installed by the preceding step.
@@ -37,15 +43,31 @@ impl Step {
     /// that "install it for me" and "tell me what you would run" are the same
     /// feature.
     pub fn line(&self) -> String {
-        self.argv.join(" ")
+        self.env
+            .iter()
+            .map(|(key, value)| format!("{key}={}", shell_word(value)))
+            .chain(self.argv.iter().cloned())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
+}
+
+fn shell_word(word: &str) -> String {
+    if !word.is_empty()
+        && word
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || "/._-:".contains(ch))
+    {
+        return word.to_string();
+    }
+    format!("'{}'", word.replace('\'', "'\"'\"'"))
 }
 
 /// Everything readio would do to make one engine work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
     pub engine: String,
-    /// `uv`, `pipx` or `pip`: which installer this machine turned out to have.
+    /// The managed runtime, or the system package manager for a native engine.
     pub via: &'static str,
     pub steps: Vec<Step>,
 }
@@ -61,8 +83,10 @@ impl Plan {
 pub enum Blocked {
     /// The engine is a server or something else readio has no recipe for.
     NoRecipe { docs: String },
-    /// There is a package, but nothing on this machine to install it with.
+    /// A native engine needs a system package manager this machine lacks.
     NoInstaller,
+    /// Readio has no verified uv build for this OS and CPU combination.
+    UnsupportedRuntime { platform: String },
 }
 
 /// Disk-space facts shown before a model download begins.
@@ -156,8 +180,15 @@ pub fn profile(engine: &str) -> Option<ModelProfile> {
 /// `df -Pk` is available on both supported host families (macOS and Linux) and
 /// reports bytes without adding another platform-specific native dependency.
 pub fn space(engine: &str) -> Option<Space> {
-    let home = crate::paths::home();
-    let probe = home
+    // MOSS/Qwen weights and Supertonic's self-fetched weights live in the
+    // user's cache; direct model files live with readio's data. Probe the
+    // filesystem that will actually receive the large part of the download.
+    let destination = if matches!(engine, "moss" | "qwen" | "supertonic") {
+        hf_cache_dir()
+    } else {
+        crate::paths::home()
+    };
+    let probe = destination
         .ancestors()
         .find(|path| path.exists())
         .unwrap_or_else(|| std::path::Path::new("."));
@@ -204,14 +235,9 @@ pub fn bytes(bytes: u64) -> String {
 /// Work out how to install `spec` on this machine.
 ///
 /// An engine named under `system` is not a Python package at all and goes to
-/// the machine's own package manager; everything else is a wheel.
-///
-/// For wheels the order is deliberate. `uv tool` and `pipx` both give a CLI its
-/// own environment, which is what these packages are — command-line tools, not
-/// libraries to import. Plain `pip install --user` is last because on any
-/// modern distribution or Homebrew Python it now refuses outright
-/// (PEP 668, "externally managed environment"), and a refusal the reader has
-/// to decode is worse than saying up front that nothing suitable is here.
+/// the machine's package manager. Every wheel uses the same readio-owned uv,
+/// tool directory and managed Python directory. No cache directory is set:
+/// uv's user cache is deliberately shared with the rest of the machine.
 pub fn plan(engine: &str, spec: &EngineSpec) -> Result<Plan, Blocked> {
     if spec.pip.is_empty() && spec.system.is_empty() {
         return Err(Blocked::NoRecipe {
@@ -219,11 +245,16 @@ pub fn plan(engine: &str, spec: &EngineSpec) -> Result<Plan, Blocked> {
         });
     }
 
-    let (via, mut argv) = if !spec.system.is_empty() {
+    let runtime_ready = {
+        let program = program_of(spec);
+        !program.is_empty() && locate(&program).is_some()
+    };
+    let mut steps = Vec::new();
+    let via = if !spec.system.is_empty() {
         // Not everything readio can drive is a Python package. espeak-ng is a C
         // program, and the machine's own package manager is the only sensible
         // way to get it: no wheel, no environment, nothing to keep on a path.
-        if have("brew") {
+        let (via, mut argv) = if have("brew") {
             ("brew", vec!["brew".to_string(), "install".into()])
         } else if have("apt-get") {
             // Non-interactive because this runs inside readio, where there is
@@ -239,47 +270,44 @@ pub fn plan(engine: &str, spec: &EngineSpec) -> Result<Plan, Blocked> {
             )
         } else {
             return Err(Blocked::NoInstaller);
+        };
+        argv.push(spec.system.clone());
+        if !runtime_ready {
+            steps.push(Step {
+                argv,
+                env: Vec::new(),
+                creates: None,
+                sha256: None,
+                interpreter_for: None,
+            });
         }
-    } else if have("uv") {
-        let mut argv = vec!["uv".into(), "tool".into(), "install".into()];
-        if !spec.python.is_empty() {
-            argv.push("--python".into());
-            argv.push(spec.python.clone());
+        via
+    } else {
+        if !runtime_ready {
+            let uv = uv_program();
+            if !uv.is_file() {
+                steps.extend(uv_bootstrap()?);
+            }
+            let mut argv = vec![
+                uv.to_string_lossy().into_owned(),
+                "tool".into(),
+                "install".into(),
+                "--managed-python".into(),
+            ];
+            if !spec.python.is_empty() {
+                argv.push("--python".into());
+                argv.push(spec.python.clone());
+            }
+            argv.push(spec.pip.clone());
+            steps.push(Step {
+                argv,
+                env: runtime_env(),
+                creates: None,
+                sha256: None,
+                interpreter_for: None,
+            });
         }
-        ("uv", argv)
-    } else if have("pipx") {
-        let mut argv = vec!["pipx".into(), "install".into()];
-        if !spec.python.is_empty() {
-            argv.push("--python".into());
-            argv.push(format!("python{}", spec.python));
-        }
-        ("pipx", argv)
-    } else if let Some(pip) = ["pip3", "pip"].iter().find(|p| have(p)) {
-        (
-            "pip",
-            vec![(*pip).to_string(), "install".into(), "--user".into()],
-        )
-    } else {
-        return Err(Blocked::NoInstaller);
-    };
-    argv.push(if spec.system.is_empty() {
-        spec.pip.clone()
-    } else {
-        spec.system.clone()
-    });
-
-    let runtime_ready = {
-        let program = program_of(spec);
-        !program.is_empty() && locate(&program).is_some()
-    };
-    let mut steps = if runtime_ready {
-        Vec::new()
-    } else {
-        vec![Step {
-            argv,
-            creates: None,
-            interpreter_for: None,
-        }]
+        "readio uv"
     };
 
     // Voice models the engine does not ship. `curl` is assumed rather than
@@ -296,7 +324,9 @@ pub fn plan(engine: &str, spec: &EngineSpec) -> Result<Plan, Blocked> {
                 to.to_string_lossy().into_owned(),
                 fetch.url.clone(),
             ],
+            env: Vec::new(),
             creates: Some(to),
+            sha256: None,
             interpreter_for: None,
         });
     }
@@ -321,7 +351,9 @@ pub fn plan(engine: &str, spec: &EngineSpec) -> Result<Plan, Blocked> {
         );
         steps.push(Step {
             argv: vec!["python".into(), "-c".into(), code],
+            env: Vec::new(),
             creates: None,
+            sha256: None,
             interpreter_for: Some(program_of(spec)),
         });
     }
@@ -331,6 +363,126 @@ pub fn plan(engine: &str, spec: &EngineSpec) -> Result<Plan, Blocked> {
         via,
         steps,
     })
+}
+
+/// The runtime paths uv owns. Cache variables are conspicuously absent: the
+/// global uv cache is content-addressed and safe to share, so a wheel or Python
+/// archive already fetched by another project should be a cache hit here.
+fn runtime_env() -> Vec<(String, String)> {
+    [
+        ("UV_TOOL_DIR", crate::paths::runtime_tools_dir()),
+        ("UV_TOOL_BIN_DIR", crate::paths::runtime_bin_dir()),
+        ("UV_PYTHON_INSTALL_DIR", crate::paths::runtime_python_dir()),
+    ]
+    .into_iter()
+    .map(|(name, path)| (name.to_string(), path.to_string_lossy().into_owned()))
+    .collect()
+}
+
+const UV_VERSION: &str = "0.12.0";
+
+fn uv_program() -> PathBuf {
+    crate::paths::runtime_dir()
+        .join("uv")
+        .join(UV_VERSION)
+        .join("bin/uv")
+}
+
+struct UvRelease {
+    target: &'static str,
+    sha256: &'static str,
+}
+
+/// A fixed release per supported host. The digest comes from the matching
+/// `.sha256` asset published in astral-sh/uv's GitHub release.
+fn uv_release() -> Option<UvRelease> {
+    let release = match (
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        std::env::consts::FAMILY,
+    ) {
+        ("macos", "aarch64", _) => UvRelease {
+            target: "aarch64-apple-darwin",
+            sha256: "2b9e582af54f84fa50c115427451a6c13e80f43b52f8282b8af5791077317bbf",
+        },
+        ("macos", "x86_64", _) => UvRelease {
+            target: "x86_64-apple-darwin",
+            sha256: "d41593beaefc54bab7d062af0ef6ca093bfb81d001d58ebbef39e44423f9c496",
+        },
+        ("linux", "aarch64", _) => UvRelease {
+            target: if cfg!(target_env = "musl") {
+                "aarch64-unknown-linux-musl"
+            } else {
+                "aarch64-unknown-linux-gnu"
+            },
+            sha256: if cfg!(target_env = "musl") {
+                "936fbbf20188a2b1c66bce3dca3f4009a5c9cdf12bb2bbd084e71926f75d6a15"
+            } else {
+                "2c5d6e3092cc5223b10ff403880cc75121bf64e84644e7a0c69f643b0d89ac95"
+            },
+        },
+        ("linux", "x86_64", _) => UvRelease {
+            target: if cfg!(target_env = "musl") {
+                "x86_64-unknown-linux-musl"
+            } else {
+                "x86_64-unknown-linux-gnu"
+            },
+            sha256: if cfg!(target_env = "musl") {
+                "3340a9d8cffc4d801bc1a7459ebfaf5790c79400720d9b6963d806f058526684"
+            } else {
+                "eaf842262aa1c418d8ecc5605f02ee1ebfd369124fa48548e85f9481a47831a9"
+            },
+        },
+        _ => return None,
+    };
+    Some(release)
+}
+
+fn uv_bootstrap() -> Result<Vec<Step>, Blocked> {
+    let release = uv_release().ok_or_else(|| Blocked::UnsupportedRuntime {
+        platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+    })?;
+    let archive_name = format!("uv-{}.tar.gz", release.target);
+    let archive = crate::paths::runtime_dir()
+        .join("downloads")
+        .join(&archive_name);
+    let uv = uv_program();
+    let bin = uv
+        .parent()
+        .expect("managed uv always has a bin directory")
+        .to_path_buf();
+    let url =
+        format!("https://github.com/astral-sh/uv/releases/download/{UV_VERSION}/{archive_name}");
+    Ok(vec![
+        Step {
+            argv: vec![
+                "curl".into(),
+                "-fL".into(),
+                "--progress-bar".into(),
+                "-o".into(),
+                archive.to_string_lossy().into_owned(),
+                url,
+            ],
+            env: Vec::new(),
+            creates: Some(archive.clone()),
+            sha256: Some(release.sha256.to_string()),
+            interpreter_for: None,
+        },
+        Step {
+            argv: vec![
+                "tar".into(),
+                "-xzf".into(),
+                archive.to_string_lossy().into_owned(),
+                "-C".into(),
+                bin.to_string_lossy().into_owned(),
+                "--strip-components=1".into(),
+            ],
+            env: Vec::new(),
+            creates: Some(uv),
+            sha256: None,
+            interpreter_for: None,
+        },
+    ])
 }
 
 /// Is `program` on the PATH?
@@ -384,16 +536,29 @@ pub fn model_is_ready(engine: &str, spec: &EngineSpec) -> bool {
 }
 
 fn hf_cached(model: &str) -> bool {
-    let Some(home) = dirs::home_dir() else {
-        return false;
-    };
-    let snapshots = home
-        .join(".cache/huggingface/hub")
+    let snapshots = hf_cache_dir()
         .join(format!("models--{}", model.replace('/', "--")))
         .join("snapshots");
     std::fs::read_dir(snapshots)
         .ok()
         .is_some_and(|mut entries| entries.next().is_some())
+}
+
+/// Hugging Face's own cache precedence. The downloader inherits these same
+/// variables, so readiness has to look in the same place it writes.
+fn hf_cache_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("HF_HUB_CACHE") {
+        return PathBuf::from(path);
+    }
+    if let Some(path) = std::env::var_os("HF_HOME") {
+        return PathBuf::from(path).join("hub");
+    }
+    if let Some(path) = std::env::var_os("XDG_CACHE_HOME") {
+        return PathBuf::from(path).join("huggingface/hub");
+    }
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".cache/huggingface/hub")
 }
 
 /// Resolve a program against PATH, the way a shell would.
@@ -411,14 +576,16 @@ pub fn which(program: &str) -> Option<PathBuf> {
 
 /// Where a just-installed program is, PATH or no PATH.
 ///
-/// `uv tool install` and `pipx install` both drop their commands in
-/// `~/.local/bin`, and `pip install --user` uses `~/Library/Python/3.x/bin` on
-/// macOS. None of those is necessarily on the PATH readio inherited, and an
-/// install that ends in "command not found" is not an install. So the places
-/// those tools are known to write to are searched too, and what turns up is
-/// recorded in the config as an absolute path — which beats telling a reader to
-/// edit their shell profile and start again.
+/// Readio's managed bin directory comes first. Legacy locations remain
+/// searchable so an existing installation made by an older release is not
+/// thrown away merely because the installer has become self-contained.
 pub fn locate(program: &str) -> Option<PathBuf> {
+    if !program.contains('/') {
+        let managed = crate::paths::runtime_bin_dir().join(program);
+        if managed.is_file() {
+            return Some(managed);
+        }
+    }
     if let Some(found) = which(program) {
         return Some(found);
     }
@@ -461,7 +628,7 @@ impl Running {
     pub fn start(plan: Plan) -> Self {
         let (tx, rx) = channel();
         let steps = plan.steps.clone();
-        // Detached on purpose: killing a half-finished `pip install` leaves a
+        // Detached on purpose: killing a half-finished tool install leaves a
         // broken environment behind, which is worse than letting it end.
         std::thread::Builder::new()
             .name("readio-install".into())
@@ -539,6 +706,7 @@ fn run_step(step: &Step, tx: &std::sync::mpsc::Sender<Progress>) -> bool {
     };
     let child = Command::new(program)
         .args(args)
+        .envs(step.env.iter().map(|(key, value)| (key, value)))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -572,7 +740,57 @@ fn run_step(step: &Step, tx: &std::sync::mpsc::Sender<Progress>) -> bool {
     for reader in readers {
         let _ = reader.join();
     }
-    matches!(status, Ok(status) if status.success())
+    if !matches!(status, Ok(status) if status.success()) {
+        return false;
+    }
+    if let Some(target) = step.creates.as_deref()
+        && !target.exists()
+    {
+        let _ = tx.send(Progress::Line(format!(
+            "{} did not create {}",
+            step.argv.first().map(String::as_str).unwrap_or("command"),
+            target.display()
+        )));
+        return false;
+    }
+    if let (Some(expected), Some(target)) = (step.sha256.as_deref(), step.creates.as_deref()) {
+        match sha256(target) {
+            Ok(actual) if actual == expected => {}
+            Ok(actual) => {
+                let _ = tx.send(Progress::Line(format!(
+                    "checksum mismatch for {}: expected {expected}, got {actual}",
+                    target.display()
+                )));
+                return false;
+            }
+            Err(err) => {
+                let _ = tx.send(Progress::Line(format!(
+                    "cannot verify {}: {err}",
+                    target.display()
+                )));
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn sha256(path: &std::path::Path) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buf = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buf[..read]);
+    }
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn interpreter_for(launcher: &str) -> Option<PathBuf> {
@@ -693,18 +911,69 @@ mod tests {
         }
     }
 
-    /// The plan is worked out from what is on the machine, so this asserts the
-    /// shape rather than the exact tool: CI has `pip`, a developer's laptop
-    /// usually has `uv`, and both are correct.
+    /// A Python-backed engine is still installable when the machine has no
+    /// Python, pip or uv of its own. Readio owns the interpreter and tool
+    /// environment, while uv's ordinary user cache remains shared with any
+    /// other uv installation on the machine.
+    #[test]
+    fn python_engines_use_a_private_runtime_but_the_users_cache() {
+        let mut spec = presets()["kokoro"].clone();
+        // A name no real machine has makes the runtime install step mandatory,
+        // without mutating PATH or depending on what CI happens to provide.
+        spec.synth = "readio-runtime-contract-test --output {out} --voice {voice}".to_string();
+
+        let plan = plan("runtime-contract", &spec)
+            .expect("a Python model needs no system Python or package installer");
+        assert_eq!(plan.via, "readio uv");
+
+        let install = plan
+            .steps
+            .iter()
+            .find(|step| step.argv.last().is_some_and(|arg| arg == "kokoro-tts"))
+            .expect("the private runtime installs the model command");
+        let line = install.line();
+        let managed_uv = dirs::cache_dir()
+            .unwrap_or_else(|| crate::paths::home().join("cache"))
+            .join(format!("readio/runtime/uv/{UV_VERSION}/bin/uv"));
+        assert!(
+            line.contains(managed_uv.to_string_lossy().as_ref()),
+            "the installer itself belongs to readio: {line}"
+        );
+        assert!(
+            line.contains("UV_TOOL_DIR=")
+                && line.contains("UV_TOOL_BIN_DIR=")
+                && line.contains("UV_PYTHON_INSTALL_DIR="),
+            "tools and interpreters must stay under readio's runtime: {line}"
+        );
+        assert!(
+            line.contains("--managed-python") && line.contains("3.12"),
+            "the requested Python is downloaded and managed by uv: {line}"
+        );
+        assert!(
+            !line.contains("UV_CACHE_DIR")
+                && !line.contains("HF_HOME")
+                && !line.contains("HF_HUB_CACHE"),
+            "user package and model caches must remain reusable: {line}"
+        );
+
+        if !managed_uv.exists() {
+            assert!(
+                plan.lines()
+                    .iter()
+                    .any(|line| line.contains("github.com/astral-sh/uv/releases/download/")),
+                "a fresh machine needs a complete uv bootstrap: {:?}",
+                plan.lines()
+            );
+        }
+    }
+
+    /// The runtime bootstrap is conditional, so this asserts the stable shape:
+    /// one private tool environment followed by the model files it needs.
     #[test]
     fn a_plan_installs_the_package_and_then_fetches_what_it_needs() {
         let presets = presets();
-        let Ok(plan) = plan("piper", &presets["piper"]) else {
-            // No installer at all on this machine: nothing to assert, and
-            // failing here would only mean "CI has no Python".
-            return;
-        };
-        assert!(matches!(plan.via, "uv" | "pipx" | "pip"));
+        let plan = plan("piper", &presets["piper"]).expect("piper has a managed install");
+        assert_eq!(plan.via, "readio uv");
         let package = plan
             .steps
             .iter()
@@ -715,10 +984,14 @@ mod tests {
             plan.lines()
         );
         assert_eq!(
-            plan.steps.len(),
-            if package.is_some() { 3 } else { 2 },
-            "piper needs its voice fetched as well: {:?}",
-            plan.lines()
+            plan.steps
+                .iter()
+                .filter(|step| step.argv.first().is_some_and(|arg| arg == "curl")
+                    && step.line().contains("huayan"))
+                .count(),
+            2,
+            "piper needs both of its voice files: {:?}",
+            plan.lines(),
         );
         assert!(
             plan.steps.iter().any(|step| step.line().contains(".onnx")),
@@ -783,6 +1056,21 @@ mod tests {
             }
             .enough()
         );
+    }
+
+    #[test]
+    fn runtime_archives_are_verified_with_sha256() {
+        let path = std::env::temp_dir().join(format!(
+            "readio-sha256-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, b"abc").expect("fixture");
+        assert_eq!(
+            sha256(&path).expect("digest"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     /// An installer's output lands in a terminal readio is drawing on, so what

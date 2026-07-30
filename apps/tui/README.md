@@ -294,7 +294,8 @@ fill or save the form on the right.
 Installing shows itself, one `Bash` call per command, streaming:
 
 ```
-● Bash uv tool install --python 3.12 kokoro-tts  1/1  ·  24.8s
+● Bash UV_TOOL_DIR=…/readio/runtime/tools …/readio/runtime/bin/uv
+  tool install --managed-python --python 3.12 kokoro-tts  3/5  ·  24.8s
   Resolved 61 packages in 1.31s
   Installed 61 packages in 3.42s
    + kokoro-tts==0.9.4
@@ -302,14 +303,15 @@ Installing shows itself, one `Bash` call per command, streaming:
 ○ kokoro downloaded after 25s. Voice configuration was not changed.
 ```
 
-What it decides, and why each decision cannot be a constant in a release:
+What it owns, and what it deliberately shares:
 
 | Decision | How |
 | --- | --- |
-| Which installer | `uv tool install`, then `pipx install`, then `pip install --user` — whichever this machine has. pip is last because Homebrew and every modern distribution now refuse it outright (PEP 668), and a refusal the reader has to decode is worse than saying up front that nothing suitable is here. |
-| Which Python | From the preset when the package is fussy. `kokoro-tts` declares `>=3.11,<3.13`, so a machine defaulting to 3.13 otherwise fails with a resolver error that never mentions the version. |
+| Which installer | A pinned standalone uv is downloaded from its official release and checked against the release SHA-256. No system Python, uv, pip or pipx is required. |
+| Which Python | uv downloads a managed interpreter into Readio's runtime. The version comes from the preset when the package is fussy: `kokoro-tts` declares `>=3.11,<3.13`, so it gets Python 3.12 even on a machine whose default is 3.13. |
 | The voice model | Neither Kokoro nor Piper ships weights in its wheel, so their model files are fetched as further steps of the same install and written into the engine's command line. Kokoro's `--model` and `--voices` default to `./`, which means an engine installed without them works in exactly one directory: whichever one the files were downloaded into. An engine whose command exists but whose voice does not is not installed, and the menu says so. |
-| Where the command went | `uv` and `pipx` write into `~/.local/bin`, which is on the PATH of the shell that set them up and not necessarily on the one readio inherited. If the program is not on PATH afterwards, the place it actually landed is written into the engine's command line — rather than asking anyone to edit a shell profile and start over. |
+| What is private | uv, its managed Python builds, tool environments and launchers live below the platform user cache (`~/Library/Caches/readio/runtime` on macOS, usually `~/.cache/readio/runtime` on Linux). Readio resolves that bin directory without changing `PATH`. |
+| What is shared | Readio does not override `UV_CACHE_DIR`, `HF_HOME` or `HF_HUB_CACHE`. Existing uv downloads and Hugging Face model snapshots remain cache hits instead of being stored twice. |
 
 Nothing runs through a shell here either; every command is an argv, and every command is printed before it runs, so "install it for me" and "tell me what you would run" are the same feature. A subprocess's output is stripped of escape sequences before it reaches the screen — an installer is not entitled to move readio's cursor — and split on carriage returns as well as newlines, which is the only way a progress bar shows progress rather than arriving in one lump after the download finishes.
 

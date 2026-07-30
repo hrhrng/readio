@@ -13,6 +13,11 @@
 //!   books/          copies of imported books (-c and -m)
 //!   speech/         scratch audio clips, deleted as they play
 //! ```
+//!
+//! Optional language runtimes are rebuildable rather than library data. They
+//! live in the platform's user cache (`~/Library/Caches/readio` on macOS,
+//! usually `~/.cache/readio` on Linux), beside the caches uv and Hugging Face
+//! already share across applications.
 
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
@@ -75,6 +80,28 @@ pub fn speech_dir() -> PathBuf {
 /// to open and, if they like, change — the same bargain the config file offers.
 pub fn engines_dir() -> PathBuf {
     home().join("engines")
+}
+
+/// Rebuildable, readio-owned runtimes for optional model engines.
+pub fn runtime_dir() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| home().join("cache"))
+        .join("readio/runtime")
+}
+
+/// Model launchers installed by the managed runtime.
+pub fn runtime_bin_dir() -> PathBuf {
+    runtime_dir().join("bin")
+}
+
+/// Isolated environments created by `uv tool install`.
+pub fn runtime_tools_dir() -> PathBuf {
+    runtime_dir().join("tools")
+}
+
+/// Python builds downloaded by uv for model environments.
+pub fn runtime_python_dir() -> PathBuf {
+    runtime_dir().join("python")
 }
 
 /// Create the host directory tree if it does not exist yet.

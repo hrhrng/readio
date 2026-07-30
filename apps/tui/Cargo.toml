@@ -23,6 +23,7 @@ ratatui = { version = "0.29", features = ["crossterm", "unstable-widget-ref"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serde_yaml_ng = "0.10.0"
+sha2 = "0.10.9"
 textwrap = "0.16.2"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 unicode-segmentation = "1.13.3"

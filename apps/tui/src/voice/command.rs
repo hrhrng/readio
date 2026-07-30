@@ -130,8 +130,9 @@ impl Synthesizer for CommandSynth {
         let Some((program, rest)) = args.split_first() else {
             return Err(anyhow!("{}", t("synth.empty_play")));
         };
+        let executable = resolve(program).unwrap_or_else(|| PathBuf::from(program));
 
-        let mut child = Command::new(program)
+        let mut child = Command::new(executable)
             .args(rest)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -415,7 +416,8 @@ fn run(args: &[String], input: Option<&str>, timeout: Duration) -> Result<()> {
     let Some((program, rest)) = args.split_first() else {
         return Err(anyhow!("{}", t("synth.empty_command")));
     };
-    let mut child = Command::new(program)
+    let executable = resolve(program).unwrap_or_else(|| PathBuf::from(program));
+    let mut child = Command::new(executable)
         .args(rest)
         .stdin(if input.is_some() {
             Stdio::piped()
@@ -481,19 +483,37 @@ fn sleep_cancellable(ms: u64, cancel: &AtomicBool) -> Result<()> {
     Ok(())
 }
 
-/// Whether a program is on `PATH` (or is an existing absolute path).
-pub fn which(program: &str) -> bool {
+/// Resolve a program from an explicit path, readio's managed runtime, or PATH.
+///
+/// The runtime comes before PATH so a model configured by name keeps using the
+/// environment readio installed even if another copy later appears globally.
+pub fn resolve(program: &str) -> Option<PathBuf> {
     let path = PathBuf::from(expand_tilde(program));
     if path.components().count() > 1 {
-        return path.exists();
+        return path.exists().then_some(path);
     }
-    let Some(paths) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&paths).any(|dir| {
-        let candidate = dir.join(program);
-        candidate.is_file() || candidate.with_extension("exe").is_file()
+    let managed = crate::paths::runtime_bin_dir().join(program);
+    if managed.is_file() || managed.with_extension("exe").is_file() {
+        return Some(managed);
+    }
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths).find_map(|dir| {
+            let candidate = dir.join(program);
+            if candidate.is_file() {
+                Some(candidate)
+            } else {
+                candidate
+                    .with_extension("exe")
+                    .is_file()
+                    .then(|| candidate.with_extension("exe"))
+            }
+        })
     })
+}
+
+/// Whether a program can be run now.
+pub fn which(program: &str) -> bool {
+    resolve(program).is_some()
 }
 
 fn expand_tilde(path: &str) -> String {
@@ -684,6 +704,22 @@ mod tests {
     fn which_finds_real_programs_only() {
         assert!(which("sh") || which("cmd"), "a shell should be on PATH");
         assert!(!which("readio-nonexistent-binary-xyz"));
+    }
+
+    #[test]
+    fn which_finds_a_readio_managed_engine_without_changing_path() {
+        let name = format!("readio-managed-engine-test-{}", std::process::id());
+        let bin = crate::paths::runtime_bin_dir();
+        std::fs::create_dir_all(&bin).expect("runtime bin");
+        let launcher = bin.join(&name);
+        std::fs::write(&launcher, "#!/bin/sh\n").expect("managed launcher");
+
+        assert!(
+            which(&name),
+            "a managed model command must work even though its cache is not on PATH"
+        );
+
+        let _ = std::fs::remove_file(launcher);
     }
 
     /// No shell runs these commands, so `~` in a config file has to be expanded

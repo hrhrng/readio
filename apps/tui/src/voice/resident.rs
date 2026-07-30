@@ -291,15 +291,7 @@ pub fn interpreter_behind(program: &str) -> Option<PathBuf> {
 
 /// `which`, without the crate.
 fn which(program: &str) -> Option<PathBuf> {
-    if program.contains('/') {
-        let path = PathBuf::from(program);
-        return path.is_file().then_some(path);
-    }
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|dir| dir.join(program))
-            .find(|candidate| candidate.is_file())
-    })
+    crate::voice::command::resolve(program)
 }
 
 #[cfg(test)]

@@ -2572,12 +2572,11 @@ impl App {
 
     /// Install the program and model behind one engine.
     ///
-    /// readio ships no model and is not about to become a package manager. What
-    /// this does is the thing a reader would otherwise do by hand: find whichever
-    /// of `uv`, `pipx` and `pip` this machine has, install the distribution, and
-    /// fetch the voice file the engine does not ship. Every command is shown
-    /// before it runs and reports itself as it goes, so "install it for me" and
-    /// "tell me what you would run" are the same feature.
+    /// Readio ships no model or Python. A pinned uv and its managed Python/tool
+    /// environments are created in the user cache as needed, then any separate
+    /// voice files are fetched. Every command is shown before it runs and
+    /// reports itself as it goes, so "install it for me" and "tell me what you
+    /// would run" are the same feature.
     fn install_engine(&mut self, engine: &str) {
         if let Some(running) = &self.installing {
             self.notice(&tf("install.busy", &[&running.engine]));
@@ -2622,6 +2621,10 @@ impl App {
             }
             Err(install::Blocked::NoInstaller) => {
                 self.system(t("install.no_installer"));
+                return;
+            }
+            Err(install::Blocked::UnsupportedRuntime { platform }) => {
+                self.system(&tf("install.unsupported_runtime", &[&platform]));
                 return;
             }
         };
@@ -2708,12 +2711,10 @@ impl App {
 
     /// Record where the program actually landed.
     ///
-    /// `uv` and `pipx` install into `~/.local/bin`, which is on the PATH of the
-    /// shell that set them up but not necessarily on the one readio inherited —
-    /// and an install that ends in "command not found" is not an install. If the
-    /// program is somewhere findable, the engine's command line is rewritten to
-    /// point straight at it, which beats asking a reader to edit their shell
-    /// profile and start over.
+    /// Managed tools deliberately live outside PATH in the user's cache. If the
+    /// program is somewhere findable, the engine command is rewritten to point
+    /// straight at it. That keeps a saved configuration reproducible without
+    /// asking the reader to edit their shell profile.
     fn pin_program(&mut self, engine: &str) {
         let Some(spec) = self.cfg.spec(engine) else {
             return;
