@@ -14,7 +14,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use futures::StreamExt;
 use ratatui::Terminal;
@@ -89,8 +89,14 @@ async fn run(mut app: App) -> Result<()> {
     // alternate screen is active and before EventStream starts reading. A
     // Halfblocks result is rejected by Scrollback: unsupported terminals get
     // an honest placeholder instead of a pixelated approximation.
-    app.sb
-        .set_image_picker(Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks()));
+    let picker = match std::env::var("READIO_IMAGE_PROTOCOL").as_deref() {
+        // Headless ptys cannot answer terminal capability queries. Halfblocks
+        // is deliberately rejected by Scrollback, so this produces the same
+        // honest placeholder as any unsupported terminal, never pixel art.
+        Ok("none") => Picker::halfblocks(),
+        _ => Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks()),
+    };
+    app.sb.set_image_picker(picker);
 
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(FRAME);
@@ -144,7 +150,8 @@ fn setup() -> Result<Tui> {
         stdout,
         EnterAlternateScreen,
         EnableMouseCapture,
-        EnableBracketedPaste
+        EnableBracketedPaste,
+        Clear(ClearType::All)
     )?;
 
     // A panic in raw mode leaves an unusable terminal; always undo first.
@@ -163,7 +170,6 @@ fn setup() -> Result<Tui> {
 
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.hide_cursor()?;
-    terminal.clear()?;
     Ok(terminal)
 }
 

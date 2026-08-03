@@ -51,6 +51,10 @@ if pid == 0:
     os.environ["TERM"] = "xterm-256color"
     os.environ["COLORTERM"] = "truecolor"
     os.environ["COLUMNS"], os.environ["LINES"] = str(COLS), str(ROWS)
+    # This emulator verifies terminal lifecycle and text rendering, but it
+    # does not answer graphics/font capability queries. Tell readio not to
+    # wait for replies that can never arrive.
+    os.environ["READIO_IMAGE_PROTOCOL"] = "none"
     # crossterm honours NO_COLOR by dropping every SGR colour, so a shell that
     # sets it turns this probe colour-blind. The point here is to see what a
     # normal terminal receives.
@@ -123,7 +127,13 @@ drain(0.4)
 # quit keystrokes (which would close overlays).
 cut = len(captured)
 
-os.write(fd, KEYS["ctrl-d"])
+try:
+    os.write(fd, KEYS["ctrl-d"])
+except OSError:
+    # The child may already have exited with an error. Preserve its terminal
+    # output and status below instead of hiding the useful failure in a Python
+    # traceback.
+    pass
 deadline = time.time() + 3.0
 status = None
 while time.time() < deadline:
