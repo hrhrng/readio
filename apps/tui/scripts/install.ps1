@@ -128,7 +128,9 @@ try {
     $staged = Join-Path $InstallDir "readio.exe.new"
     Copy-Item -LiteralPath $source -Destination $staged -Force
     if (Test-Path -LiteralPath $destination -PathType Leaf) {
-        [System.IO.File]::Replace($staged, $destination, $null)
+        $backup = Join-Path $InstallDir "readio.exe.old"
+        [System.IO.File]::Replace($staged, $destination, $backup)
+        Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
     } else {
         Move-Item -LiteralPath $staged -Destination $destination
     }
