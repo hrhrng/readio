@@ -40,7 +40,17 @@ Download a local voice on the left, then configure it globally or for one book o
 curl -fsSL https://raw.githubusercontent.com/hrhrng/readio/main/apps/tui/scripts/install.sh | sh
 ```
 
-The installer detects your platform, downloads the release archive, verifies it against the release's `SHA256SUMS`, and installs a single file to `~/.local/bin/readio`. It needs no sudo, no compiler and no Rust toolchain; it writes nothing outside the install directory. To uninstall, delete that file and `~/.readio`.
+Windows PowerShell:
+
+```powershell
+$installer = Join-Path $env:TEMP "readio-install.ps1"
+Invoke-WebRequest https://raw.githubusercontent.com/hrhrng/readio/main/apps/tui/scripts/install.ps1 -OutFile $installer
+& $installer
+```
+
+Agents can follow the repository-bundled [setup-readio skill](skills/setup-readio/SKILL.md) for verified installation, PATH setup, configuration, voice selection, and safe uninstall on all supported platforms.
+
+Both installers download the matching release archive and verify it against the release's `SHA256SUMS`. The Unix script installs `~/.local/bin/readio`; PowerShell installs `%USERPROFILE%\.local\bin\readio.exe`. Neither needs sudo, a compiler, or Rust, and neither changes the library or configuration. To uninstall the program, delete that executable; remove `~/.readio` only if you also want to erase books, settings, and progress.
 
 From source, with Rust 1.90 or newer:
 
@@ -48,14 +58,16 @@ From source, with Rust 1.90 or newer:
 cargo install --git https://github.com/hrhrng/readio readio
 ```
 
-Prebuilt archives are published for `aarch64`/`x86_64` macOS and `aarch64`/`x86_64` Linux (musl, statically
-linked). They are a convenience, not the only path: anything else — Windows, a BSD, an architecture nobody
+Prebuilt archives are published for `aarch64`/`x86_64` macOS, `aarch64`/`x86_64` Linux (musl, statically
+linked), and Windows x64. They are a convenience, not the only path: anything else — a BSD, an architecture nobody
 packages — builds from source with the command above, since the dependency tree is pure Rust and needs no C
-toolchain. Windows in particular is untested rather than unsupported.
+toolchain.
 
-## Building on Windows
+Every pull request runs the actual release matrix for all five targets, launches each binary on its native runner, creates the final archives, and verifies their names and root contents. Pull-request runs cannot publish a GitHub Release.
 
-Windows has no prebuilt archive and no installer script — it is untested rather than unsupported. The dependency tree is pure Rust, so a build needs Rust and a linker, nothing else.
+## Windows notes
+
+Windows x64 has a prebuilt ZIP and verified PowerShell installer. Every pull request builds the binary, installs from a fake release, checks the SHA-256 failure path, and launches the installed executable on a clean Windows runner. Building from source remains available:
 
 1. **Install Rust** with [rustup](https://rustup.rs). Keep the default `x86_64-pc-windows-msvc` host and let it install the Visual Studio Build Tools it asks for (*Desktop development with C++*). readio contains no C, but the MSVC linker is still what `rustc` invokes. If you would rather not install Visual Studio, `rustup default stable-x86_64-pc-windows-gnu` works with MinGW-w64 instead.
 
@@ -76,9 +88,9 @@ Windows has no prebuilt archive and no installer script — it is untested rathe
 
 6. **Read-aloud** needs no extra player: the default `play` command is a PowerShell one-liner using `Media.SoundPlayer`. You still supply the speech engine yourself and point `tts.engines.<name>.synth` at its Windows command line.
 
-Two things do not come along. `scripts/install.sh` is POSIX sh, and `scripts/pty_probe.py` needs a POSIX pty, so neither runs here — build and run the binary directly. The audio-output whitelist also has no built-in device probe on Windows: set `tts.output.query` to a command that prints the current output device (PowerShell with the `AudioDeviceCmdlets` module, for instance), and until you do, `/device` will say it cannot read the list and that the whitelist keeps speech muted.
+The POSIX-only `scripts/pty_probe.py` does not run here. The audio-output whitelist also has no built-in device probe on Windows: set `tts.output.query` to a command that prints the current output device (PowerShell with the `AudioDeviceCmdlets` module, for instance), and until you do, `/device` will say it cannot read the list and that the whitelist keeps speech muted.
 
-`cargo test` should work — the frame tests render through ratatui's `TestBackend` rather than a real terminal — but nobody has run the suite on Windows, so treat a failure there as a bug worth reporting rather than a surprise.
+The release binary and installer are exercised by Windows CI. Some managed local-voice setup tests remain POSIX-specific; text reading and the packaged executable do not depend on them.
 
 ## Usage
 

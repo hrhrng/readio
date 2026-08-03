@@ -568,13 +568,15 @@ still reduced to `default-features = false, features = ["deflate"]`, because
 EPUB needs only store and deflate. Linux releases use musl's compiler and
 linker to keep the result self-contained across distributions.
 
-Four archives are published: `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`. Pushing a `tui-v*` tag builds all four, writes `SHA256SUMS`, and creates the release (`.github/workflows/tui-release.yml`). Windows and anything else builds from source; see the repository README.
+Five archives are published: `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, and `x86_64-pc-windows-msvc`. Every pull request runs that exact release matrix, launches each built binary on its native runner, packages all five archives, and verifies their root contents without publishing. Pushing a `tui-v*` tag additionally writes `SHA256SUMS`, creates the release, then installs and runs the published Windows artifact on a clean runner (`.github/workflows/tui-release.yml`).
 
 Releases are on a beta channel: tags look like `tui-v0.Y.0-beta.N` and anything with `-beta` or `-rc` is flagged as a prerelease. `install.sh` therefore reads the releases *list* rather than `/releases/latest`, which skips prereleases and would find nothing while the newest release is a beta.
 
 It asks twice, because the first way has a quota. The unauthenticated API answers 403 once a machine has made around sixty requests in an hour — which a developer with `gh` open manages easily, and which used to surface as "no release found", blaming the repository for the caller's rate limit. When the API says nothing useful the script reads `releases.atom` instead: the same list, on github.com, with no quota. Only if both come back empty does it give up, and then it says what actually happened and how to name a version by hand.
 
 `install.sh` is POSIX `sh`. It detects the platform, downloads the archive, **verifies it against the release's `SHA256SUMS`**, unpacks, and replaces the binary with a `mv` so an upgrade cannot disturb a running readio. It uses no sudo, writes nothing outside the install directory, never edits a shell profile, and leaves no half-installed binary behind on failure; a checksum mismatch prints both hashes and refuses.
+
+`install.ps1` provides the same contract for Windows x64: ZIP at the root, mandatory `SHA256SUMS`, a staged executable and atomic replacement on reinstall. Its CI fixture exercises latest-version resolution, a first install, an idempotent reinstall, executable launch, and refusal of a deliberately corrupted checksum.
 
 ```sh
 sh scripts/install.sh --version tui-v0.2.0-beta.2   # a specific release
