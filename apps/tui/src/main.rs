@@ -19,6 +19,7 @@ use crossterm::terminal::{
 use futures::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui_image::picker::Picker;
 
 use readio::app::{self, App};
 use readio::cli::{self, Parsed};
@@ -83,6 +84,13 @@ fn main() -> Result<()> {
 
 async fn run(mut app: App) -> Result<()> {
     let mut terminal = setup()?;
+
+    // The query temporarily owns terminal input, so it must happen after the
+    // alternate screen is active and before EventStream starts reading. A
+    // Halfblocks result is rejected by Scrollback: unsupported terminals get
+    // an honest placeholder instead of a pixelated approximation.
+    app.sb
+        .set_image_picker(Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks()));
 
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(FRAME);

@@ -1,13 +1,11 @@
-//! Raster images drawn into ratatui's own buffer.
+//! Image geometry, placeholders, and the former half-block renderer.
 //!
-//! The trick is the upper-half block `▀`: its foreground paints the top half of
+//! Production scrollback rendering uses Kitty, iTerm2, or Sixel through
+//! `ratatui-image`. [`TermImage`] remains as an isolated, deterministic
+//! renderer for tests and embedders that explicitly call it; readio itself no
+//! longer selects it. Its upper-half block `▀` paints the top half of
 //! the cell and its background the bottom half, so one cell carries two
-//! vertically stacked pixels. Everything therefore stays inside `Buffer`, which
-//! means image cells diff, scroll and get overdrawn exactly like text — no
-//! out-of-band escape sequences that the renderer cannot see and cannot erase.
-//!
-//! Higher-fidelity terminal graphics protocols (Kitty, iTerm2) are *detected*
-//! here but deliberately not implemented; see [`Protocol`].
+//! vertically stacked pixels.
 
 use std::io::Cursor;
 use std::path::Path;
@@ -50,12 +48,9 @@ impl Fit {
     }
 }
 
-/// Terminal graphics protocol a backend could use.
-///
-/// Only [`Protocol::HalfBlock`] is implemented. Detection exists so that a
-/// pixel-accurate Kitty or iTerm2 backend can be slotted in later without
-/// touching the callers: they already ask which protocol the terminal speaks,
-/// and today every answer routes to the half-block renderer.
+/// Legacy environment-only protocol detection, retained for API compatibility.
+/// Production uses `ratatui_image::picker::Picker`, which actively queries the
+/// terminal and provides its real cell dimensions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
     /// Kitty graphics protocol — also spoken by WezTerm and Ghostty.
@@ -69,9 +64,8 @@ pub enum Protocol {
 
 /// Guess what the host terminal can draw, from the environment alone.
 ///
-/// Nothing is queried over the wire: a terminal that fails to answer a device
-/// query would leave the reader staring at a frozen screen, and a wrong guess
-/// here costs nothing because the caller still renders half blocks.
+/// Nothing is queried over the wire; readio's production path does not call
+/// this helper.
 pub fn detect_protocol() -> Protocol {
     let term = std::env::var("TERM").unwrap_or_default();
     if term.contains("kitty") || std::env::var_os("KITTY_WINDOW_ID").is_some() {

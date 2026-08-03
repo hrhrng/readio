@@ -1,5 +1,5 @@
-//! Illustrations, end to end: a book with a picture in it must put coloured
-//! half-blocks on the screen, not a row of question marks.
+//! Illustrations, end to end: a book with a picture in it must put a native
+//! terminal image on the screen, not a Unicode mosaic.
 //!
 //! The pictures are generated here rather than committed, so the test proves
 //! the whole path — parse, extract, resolve, decode, draw — with no fixtures to
@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui_image::picker::{Picker, ProtocolType};
 use readio::app::App;
 use readio::book::{Book, Para};
 use readio::library::Library;
@@ -121,14 +122,20 @@ fn screen_text(terminal: &Terminal<TestBackend>) -> String {
         .join("\n")
 }
 
-/// Cells that were painted as image pixels: a half block with a real colour.
-fn pixel_cells(terminal: &Terminal<TestBackend>) -> usize {
+/// Rows carrying Kitty's Unicode image placeholders.
+fn native_image_rows(terminal: &Terminal<TestBackend>) -> usize {
     let buffer = terminal.backend().buffer();
     buffer
         .content()
         .iter()
-        .filter(|cell| cell.symbol() == "▀")
+        .filter(|cell| cell.symbol().contains('\u{10eeee}'))
         .count()
+}
+
+fn enable_kitty_images(app: &mut App) {
+    let mut picker = Picker::halfblocks();
+    picker.set_protocol_type(ProtocolType::Kitty);
+    app.sb.set_image_picker(picker);
 }
 
 fn read_until(app: &mut App, terminal: &mut Terminal<TestBackend>, frames: usize) {
@@ -200,13 +207,14 @@ fn the_picture_is_actually_painted_on_the_screen() {
     let book = Book::load(Some(&path)).expect("load epub");
 
     let mut app = App::new(Library::ephemeral(), Store::ephemeral(), Some(book), None);
+    enable_kitty_images(&mut app);
     let mut terminal = Terminal::new(TestBackend::new(80, 30)).expect("terminal");
 
     // Fast enough to get through the passage inside the frame budget below.
     app.turn.set_cps(4_000.0);
     settle(&mut app, &mut terminal);
     assert_eq!(
-        pixel_cells(&terminal),
+        native_image_rows(&terminal),
         0,
         "nothing is drawn before the reading turn reaches the image"
     );
@@ -214,30 +222,22 @@ fn the_picture_is_actually_painted_on_the_screen() {
     // Enter starts reading; the turn contains the illustration.
     press_enter(&mut app);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while pixel_cells(&terminal) == 0 && std::time::Instant::now() < deadline {
+    while native_image_rows(&terminal) == 0 && std::time::Instant::now() < deadline {
         read_until(&mut app, &mut terminal, 1);
     }
 
-    let painted = pixel_cells(&terminal);
+    let painted = native_image_rows(&terminal);
     assert!(
-        painted > 40,
-        "the illustration should cover a block of cells, got {painted}"
+        painted > 1,
+        "the illustration should cover several native image rows, got {painted}"
     );
 
-    // Those cells carry two distinct colours: the picture's red on top, and
-    // whatever is below it. A monochrome result would mean we drew a box.
+    // The buffer carries the terminal's image protocol, never the old
+    // half-block approximation.
     let buffer = terminal.backend().buffer();
-    let coloured = buffer
-        .content()
-        .iter()
-        .filter(|cell| cell.symbol() == "▀")
-        .filter(|cell| {
-            matches!(cell.fg, ratatui::style::Color::Rgb(r, g, b) if r > g && r > b && r > 100)
-        })
-        .count();
     assert!(
-        coloured > 40,
-        "the pixels should carry the image's red, got {coloured} of {painted}"
+        buffer.content().iter().all(|cell| cell.symbol() != "▀"),
+        "native image rendering must not paint a half-block mosaic"
     );
 
     // The caption is on screen too, above the pixels.
@@ -295,7 +295,7 @@ fn images_can_be_turned_off_in_the_config() {
     settle(&mut app, &mut terminal);
 
     assert_eq!(
-        pixel_cells(&terminal),
+        native_image_rows(&terminal),
         0,
         "with images off, nothing should be painted"
     );

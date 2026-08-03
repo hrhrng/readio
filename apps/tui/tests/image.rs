@@ -11,9 +11,12 @@ use image::{ImageFormat, Rgba, RgbaImage};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
+use ratatui_image::picker::{Picker, ProtocolType};
 use readio::book::media;
 use readio::theme::theme;
+use readio::ui::block::Block;
 use readio::ui::image::{TermImage, fit_in, placeholder};
+use readio::ui::scrollback::Scrollback;
 
 /// Per-test scratch directory, named after the caller so tests never collide.
 fn scratch(name: &str) -> PathBuf {
@@ -51,6 +54,52 @@ fn buffer(w: u16, h: u16) -> Buffer {
 
 fn theme_bg() -> Color {
     theme().bg_base
+}
+
+/// A graphics-capable terminal must receive the source image through its
+/// native protocol. Unicode half blocks are only the compatibility fallback:
+/// enlarging that grid still produces the mosaic the protocol is meant to
+/// avoid.
+#[test]
+fn scrollback_uses_the_selected_native_image_protocol() {
+    let dir = scratch("native-protocol");
+    let path = write_png(&dir, "cover.png", 64, 96, [225, 180, 70, 255]);
+    let mut picker = Picker::halfblocks();
+    picker.set_protocol_type(ProtocolType::Kitty);
+
+    let mut scrollback = Scrollback::new();
+    scrollback.set_image_picker(picker);
+    scrollback.push(Block::image(path, "cover", 6));
+
+    let mut buf = buffer(30, 12);
+    scrollback.render(Rect::new(0, 0, 30, 12), &mut buf, 0);
+
+    assert!(
+        buf.content()
+            .iter()
+            .any(|cell| cell.symbol().contains("\x1b_G")),
+        "Kitty-capable terminals should receive an encoded image, not a half-block mosaic"
+    );
+    assert!(
+        buf.content().iter().all(|cell| cell.symbol() != "▀"),
+        "native rendering must not paint the compatibility glyph grid"
+    );
+
+    // Scroll until the top of the picture is outside the viewport. The native
+    // protocol must remain active instead of switching formats mid-scroll.
+    let mut clipped = buffer(30, 4);
+    scrollback.render(Rect::new(0, 0, 30, 4), &mut clipped, 1);
+    assert!(
+        clipped
+            .content()
+            .iter()
+            .any(|cell| cell.symbol().contains('\u{10eeee}')),
+        "a partially visible image should still use native protocol slices"
+    );
+    assert!(
+        clipped.content().iter().all(|cell| cell.symbol() != "▀"),
+        "scrolling must never switch the picture back to half blocks"
+    );
 }
 
 // ── half-block rendering ─────────────────────────────────────────────────────

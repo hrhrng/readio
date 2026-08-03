@@ -2,7 +2,7 @@
 name = "readio"
 version = "0.2.0-beta.12"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.90"
 description = "A terminal ebook reader that reads like a coding agent at work"
 repository = "https://github.com/hrhrng/readio"
 license = "MIT"
@@ -13,7 +13,7 @@ exclude = ["docs/", "scripts/", "images/"]
 
 [dependencies]
 anyhow = "1.0.104"
-crossterm = { version = "0.28", features = ["event-stream", "bracketed-paste"] }
+crossterm = { version = "0.29", features = ["event-stream", "bracketed-paste"] }
 dirs = "6.0.0"
 futures = "0.3.33"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
@@ -29,7 +29,8 @@ maudio = { version = "0.1.7", default-features = false, features = [
 ] }
 pdf-extract = "0.12.0"
 quick-xml = "0.41.0"
-ratatui = { version = "0.29", features = ["crossterm", "unstable-widget-ref"] }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "unstable-widget-ref"] }
+ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serde_yaml_ng = "0.10.0"

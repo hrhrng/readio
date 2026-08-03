@@ -3,13 +3,17 @@
 
 use std::collections::HashMap;
 
+use image::ImageReader;
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Rect, Size};
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget};
+use ratatui_image::Resize;
+use ratatui_image::picker::{Picker, ProtocolType};
+use ratatui_image::sliced::{SignedPosition, SlicedImage, SlicedProtocol};
 
 use super::block::{Block, Ctx, Highlight, ImagePlan, Mode};
-use super::image::{TermImage, placeholder};
+use super::image::placeholder;
 
 /// Rendered lines for one entry, keyed by the inputs that produced them.
 struct Cache {
@@ -78,7 +82,11 @@ pub struct Scrollback {
     /// Decoded illustrations, keyed by entry and the size they were fitted to.
     /// Decoding is the expensive part, so it happens once per size, not once
     /// per frame.
-    images: HashMap<(u64, u16, u16), Option<TermImage>>,
+    images: HashMap<(u64, u16, u16), Option<SlicedProtocol>>,
+    /// Terminal graphics protocol plus the terminal's real character-cell
+    /// dimensions. `None` deliberately means no image: readio no longer turns
+    /// covers into a Unicode mosaic when native image rendering is unavailable.
+    image_picker: Option<Picker>,
 }
 
 impl Default for Scrollback {
@@ -98,7 +106,17 @@ impl Scrollback {
             viewport: 0,
             expand_tools: false,
             images: HashMap::new(),
+            image_picker: None,
         }
+    }
+
+    /// Select the exact terminal image protocol detected at startup.
+    ///
+    /// Halfblocks are ratatui-image's generic fallback, not an exact image
+    /// protocol, so they are intentionally rejected here.
+    pub fn set_image_picker(&mut self, picker: Picker) {
+        self.images.clear();
+        self.image_picker = (picker.protocol_type() != ProtocolType::Halfblocks).then_some(picker);
     }
 
     pub fn push(&mut self, block: Block) -> u64 {
@@ -400,7 +418,6 @@ impl Scrollback {
             if bottom <= first || picture.top >= last {
                 continue;
             }
-            let skip = first.saturating_sub(picture.top) as u16;
             let y = area.y + (picture.top.saturating_sub(first)) as u16;
             let height = (bottom.min(last) - picture.top.max(first)) as u16;
             let target = Rect {
@@ -418,13 +435,28 @@ impl Scrollback {
                 continue;
             }
 
+            let Some(picker) = self.image_picker.as_ref() else {
+                placeholder(target, buf, super::block::PLACEHOLDER_LABEL);
+                continue;
+            };
             let key = (picture.id, picture.plan.cols, picture.plan.rows);
             let decoded = self.images.entry(key).or_insert_with(|| {
-                TermImage::open(&picture.plan.path, picture.plan.cols, picture.plan.rows).ok()
+                let image = ImageReader::open(&picture.plan.path).ok()?.decode().ok()?;
+                SlicedProtocol::new_with_resize(
+                    picker,
+                    image,
+                    Size::new(picture.plan.cols, picture.plan.rows),
+                    Resize::Fit(None),
+                )
+                .ok()
             });
             match decoded {
                 Some(image) => {
-                    image.render_clipped(target, buf, skip);
+                    let relative_y = (picture.top as i64 - first as i64)
+                        .clamp(i16::MIN as i64, i16::MAX as i64)
+                        as i16;
+                    SlicedImage::new(image, SignedPosition::from((2, relative_y)))
+                        .render(area, buf);
                 }
                 // Decoding failed after the header read succeeded: the frame is
                 // the honest answer, not a blank hole.
