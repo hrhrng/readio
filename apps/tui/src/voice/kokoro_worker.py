@@ -31,9 +31,24 @@ model would be the same file with those changed.
 
 import argparse
 import json
+import os
+import signal
 import sys
 import threading
 import wave
+
+
+class Cancelled(BaseException):
+    """Unwind one inference without letting broad model errors swallow it."""
+
+
+def install_cancel_handler():
+    if hasattr(signal, "SIGUSR1"):
+        signal.signal(signal.SIGUSR1, cancel_request)
+
+
+def cancel_request(_signum, _frame):
+    raise Cancelled()
 
 
 def reply(**fields):
@@ -190,6 +205,7 @@ def main():
             daemon=True,
         ).start()
 
+    install_cancel_handler()
     reply(ready=True)
 
     for line in sys.stdin:
@@ -206,6 +222,12 @@ def main():
             )
             write_wav(job["out"], samples, rate)
             reply(ok=True)
+        except Cancelled:
+            try:
+                os.remove(job["out"])
+            except FileNotFoundError:
+                pass
+            reply(cancelled=True)
         except Exception as err:  # noqa: BLE001
             # One sentence failing is not the worker failing: report it and
             # stay up, so a single odd line does not end the chapter.

@@ -71,6 +71,13 @@ pub trait Synthesizer: Send + Sync {
         Ok(())
     }
 
+    /// Abandon synthesis that belongs to a route the reader has invalidated.
+    ///
+    /// Implementations that cannot interrupt their engine may keep the default
+    /// no-op. Playback cancellation is still handled by [`PlaybackControl`];
+    /// this hook exists so a slow renderer cannot block the replacement route.
+    fn cancel(&self) {}
+
     /// Play a clip, blocking until it finishes or is cancelled.
     ///
     /// Pause is deliberately separate from cancellation. A pause keeps the
@@ -879,6 +886,7 @@ fn playback_rate(rate: &AtomicU32) -> f32 {
 /// Background speech: one thread rendering, one playing, `prefetch` clips of
 /// slack between them.
 pub struct Speaker {
+    synth: Arc<dyn Synthesizer>,
     commands: Sender<Command>,
     events: Receiver<SpeechEvent>,
     paused: Arc<AtomicBool>,
@@ -950,6 +958,7 @@ impl Speaker {
         let player = std::thread::Builder::new()
             .name("readio-tts-play".to_string())
             .spawn({
+                let synth = Arc::clone(&synth);
                 let pipeline = Arc::clone(&pipeline);
                 let inflight = Arc::clone(&inflight);
                 let paused = Arc::clone(&paused);
@@ -960,6 +969,7 @@ impl Speaker {
             .ok();
 
         Self {
+            synth,
             commands,
             events,
             paused,
@@ -1043,6 +1053,9 @@ impl Speaker {
     /// Drop everything queued and silence the current clip.
     pub fn stop(&mut self) {
         let era = self.pipeline.flush();
+        // Invalidate first, then interrupt: any error produced while the old
+        // engine unwinds belongs to the stale era and must not stop read-aloud.
+        self.synth.cancel();
         self.paused.store(false, Ordering::SeqCst);
         self.clock.clear();
         self.pending = 0;
@@ -1111,6 +1124,7 @@ impl Speaker {
 impl Drop for Speaker {
     fn drop(&mut self) {
         self.pipeline.flush();
+        self.synth.cancel();
         self.pipeline.close();
         let _ = self.commands.send(Command::Stop);
         if let Some(render) = self.render.take() {
@@ -1210,9 +1224,11 @@ fn render_loop(
                 }
             }
             Err(err) => {
-                let _ = events.send(SpeechEvent::Failed {
-                    message: format!("{err:#}"),
-                });
+                if !pipeline.is_stale(job.era) {
+                    let _ = events.send(SpeechEvent::Failed {
+                        message: format!("{err:#}"),
+                    });
+                }
                 inflight.finish(job.era);
             }
         }
@@ -2153,5 +2169,78 @@ mod tests {
         );
         drop(speaker);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A seek invalidates the synthesis that was preparing the old route, not
+    /// only the audio already queued. With a heavyweight command engine the
+    /// obsolete process can occupy the sole render thread for seconds, making
+    /// the replacement route look permanently silent even though its first
+    /// clip is cheap.
+    #[test]
+    fn stopping_cancels_obsolete_synthesis_before_starting_the_replacement() {
+        let dir = scratch("cancel-obsolete-render");
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let source = dir.join("source.wav");
+        std::fs::write(&source, wav::silence(120, 24_000)).expect("source wav");
+        let active = dir.join("active");
+        let script = dir.join("synth");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf active > '{}'
+if [ \"$2\" = stale ]; then sleep 3; fi\ncp '{}' \"$1\"\n",
+                active.display(),
+                source.display()
+            ),
+        )
+        .expect("synth script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("executable synth");
+        }
+
+        let spec = config::EngineSpec {
+            synth: format!("{} {{out}} {{text}}", script.display()),
+            about: "cancellable command".to_string(),
+            ..config::EngineSpec::default()
+        };
+        let synth = command::CommandSynth::new("cancellable", spec, String::new(), 1.0);
+        let mut speaker = Speaker::spawn(Box::new(synth), dir.clone(), 2);
+        speaker.speak(1, "stale", (0, 5));
+
+        let render_deadline = Instant::now() + Duration::from_secs(3);
+        while !active.exists() && Instant::now() < render_deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(active.exists(), "the obsolete render never started");
+
+        speaker.stop();
+        speaker.speak(2, "replacement", (0, 11));
+        let resume_deadline = Instant::now() + Duration::from_millis(800);
+        let mut replacement_started = false;
+        let mut stale_failure = false;
+        while Instant::now() < resume_deadline {
+            for event in speaker.poll() {
+                replacement_started |= matches!(event, SpeechEvent::Started { id: 2, .. });
+                stale_failure |= matches!(event, SpeechEvent::Failed { .. });
+            }
+            if replacement_started {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(
+            replacement_started,
+            "the replacement waited behind the obsolete three-second synthesis"
+        );
+        assert!(
+            !stale_failure,
+            "cancelling obsolete synthesis reported a live read-aloud failure"
+        );
+        drop(speaker);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

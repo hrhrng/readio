@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -27,6 +27,9 @@ pub struct CommandSynth {
     /// The reading speed, as f32 bits, because it changes under the render
     /// thread's feet: `^r` retunes a running engine rather than replacing it.
     rate: AtomicU32,
+    /// Every invalidated route advances this generation. A per-sentence child
+    /// captures it and exits as soon as it no longer matches.
+    generation: AtomicU64,
     /// Set when the engine can stay running, which is how it stops being
     /// slower than the speech it produces.
     resident: Option<resident::Resident>,
@@ -43,6 +46,7 @@ impl CommandSynth {
             voice,
             language: String::new(),
             rate: AtomicU32::new(rate.to_bits()),
+            generation: AtomicU64::new(0),
             resident,
         }
     }
@@ -88,25 +92,42 @@ impl Synthesizer for CommandSynth {
         }
     }
 
+    fn cancel(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        if let Some(resident) = self.resident.as_ref() {
+            resident.cancel();
+        }
+    }
+
     fn synthesize(&self, text: &str, out: &Path) -> Result<Clip> {
+        let generation = self.generation.load(Ordering::SeqCst);
         if let Some(engine) = self.resident.as_ref() {
             let language = self.language_for(text);
             let voice = self.voice_for(language);
             engine
-                .render(resident::Request {
-                    text,
-                    out,
-                    voice: &voice,
-                    lang: language_code(language),
-                    speed: self.speed(),
-                    params: &self.spec.extra,
-                })
+                .render_at(
+                    resident::Request {
+                        text,
+                        out,
+                        voice: &voice,
+                        lang: language_code(language),
+                        speed: self.speed(),
+                        params: &self.spec.extra,
+                    },
+                    generation,
+                )
                 .with_context(|| tf("synth.failed", &[&self.name]))?;
         } else {
             let args = self.build(&self.spec.synth, text, out, None);
             let stdin = self.spec.stdin.then_some(text);
-            run(&args, stdin, Duration::from_secs(120))
-                .with_context(|| tf("synth.failed", &[&self.name]))?;
+            run(
+                &args,
+                stdin,
+                Duration::from_secs(120),
+                &self.generation,
+                generation,
+            )
+            .with_context(|| tf("synth.failed", &[&self.name]))?;
         }
 
         if !out.exists() {
@@ -367,6 +388,7 @@ fn resident_for(name: &str, spec: &EngineSpec) -> Option<resident::Resident> {
     // `{worker}` — someone driving their own daemon — needs none, so a missing
     // one is only fatal if the template actually asks for it.
     let worker = resident::worker_script(&crate::paths::engines_dir(), name).ok()?;
+    let shipped_worker = worker.is_some() && spec.serve.contains("{worker}");
     if worker.is_none() && spec.serve.contains("{worker}") {
         return None;
     }
@@ -381,7 +403,13 @@ fn resident_for(name: &str, spec: &EngineSpec) -> Option<resident::Resident> {
         })
         .map(|arg| expand_tilde(&arg))
         .collect();
-    (!argv.is_empty()).then(|| resident::Resident::new(argv))
+    (!argv.is_empty()).then(|| {
+        if shipped_worker {
+            resident::Resident::cancellable(argv)
+        } else {
+            resident::Resident::new(argv)
+        }
+    })
 }
 
 /// The language on its own, without the flag it is usually spelled with.
@@ -453,7 +481,13 @@ pub fn split_args(template: &str) -> Vec<String> {
 ///
 /// `input` is written to the child's stdin, for engines like Piper that read
 /// their text there rather than from an argument.
-fn run(args: &[String], input: Option<&str>, timeout: Duration) -> Result<()> {
+fn run(
+    args: &[String],
+    input: Option<&str>,
+    timeout: Duration,
+    generation: &AtomicU64,
+    expected_generation: u64,
+) -> Result<()> {
     let Some((program, rest)) = args.split_first() else {
         return Err(anyhow!("{}", t("synth.empty_command")));
     };
@@ -482,6 +516,11 @@ fn run(args: &[String], input: Option<&str>, timeout: Duration) -> Result<()> {
 
     let deadline = std::time::Instant::now() + timeout;
     loop {
+        if generation.load(Ordering::SeqCst) != expected_generation {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow!("synthesis cancelled"));
+        }
         match child.try_wait()? {
             Some(status) if status.success() => return Ok(()),
             Some(status) => {
