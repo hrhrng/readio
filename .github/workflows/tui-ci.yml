@@ -71,9 +71,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Shellcheck
-        run: shellcheck --shell=sh scripts/install.sh
+        run: shellcheck --shell=sh scripts/install.sh scripts/test-release-workflow.sh
       - name: Help works under dash
         run: dash scripts/install.sh --help
+      - name: Release workflow contract
+        run: sh scripts/test-release-workflow.sh
 
   windows:
     name: windows installer

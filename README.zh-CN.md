@@ -22,7 +22,15 @@
 curl -fsSL https://raw.githubusercontent.com/hrhrng/readio/main/apps/tui/scripts/install.sh | sh
 ```
 
-脚本会识别系统和架构、下载对应产物、用 release 里的 `SHA256SUMS` 校验，然后把一个文件装到 `~/.local/bin/readio`。不需要 sudo、不需要编译器、不需要 Rust 工具链，也不会在安装目录之外留下任何东西。卸载就是删掉这个文件，再删 `~/.readio`。
+Windows PowerShell：
+
+```powershell
+$installer = Join-Path $env:TEMP "readio-install.ps1"
+Invoke-WebRequest https://raw.githubusercontent.com/hrhrng/readio/main/apps/tui/scripts/install.ps1 -OutFile $installer
+& $installer
+```
+
+两个安装器都会下载对应的 release 产物，并用 release 里的 `SHA256SUMS` 校验。Unix 脚本安装到 `~/.local/bin/readio`，PowerShell 安装到 `%USERPROFILE%\.local\bin\readio.exe`。都不需要 sudo、编译器或 Rust，也不会改书库和配置。卸载程序只需删除这个可执行文件；只有确实想一并清除书籍、设置和进度时才删除 `~/.readio`。
 
 从源码安装需要 Rust 1.90 及以上：
 
@@ -30,13 +38,14 @@ curl -fsSL https://raw.githubusercontent.com/hrhrng/readio/main/apps/tui/scripts
 cargo install --git https://github.com/hrhrng/readio readio
 ```
 
-预编译产物覆盖 macOS 的 `aarch64` / `x86_64` 和 Linux 的 `aarch64` / `x86_64`（musl 静态链接）。它们只是图方便，
-不是唯一的路：其他平台——Windows、BSD、没人打包的架构——用上面那条命令自己编译就行，依赖树是纯 Rust，不需要 C 工具链。
-Windows 的准确说法是没测过，而不是不支持。
+预编译产物覆盖 macOS 的 `aarch64` / `x86_64`、Linux 的 `aarch64` / `x86_64`（musl 静态链接），以及 Windows x64。它们只是图方便，
+不是唯一的路：BSD 或没人打包的架构仍可用上面那条命令自己编译，依赖树是纯 Rust，不需要 C 工具链。
 
-## 在 Windows 上自己编译
+每个 Pull Request 都会跑真实的五平台发布矩阵：在对应的原生 runner 上构建并启动可执行文件、生成最终归档，再汇总检查文件名和包内根目录结构。Pull Request 流程没有发布 GitHub Release 的权限。
 
-Windows 没有预编译产物，也没有安装脚本——准确的说法是没测过，而不是不支持。依赖树是纯 Rust，所以编译只需要 Rust 和一个链接器，别的都不用。
+## Windows 说明
+
+Windows x64 有预编译 ZIP 和带 SHA-256 校验的 PowerShell 安装器。每个 Pull Request 都会在干净的 Windows runner 上构建并运行 exe、从伪造 release 安装、验证重复安装，并确认校验和错误时拒绝落盘。仍然可以从源码编译：
 
 1. **装 Rust**，用 [rustup](https://rustup.rs)。默认的 `x86_64-pc-windows-msvc` 就好，它会提示你装 Visual Studio Build Tools（勾 *使用 C++ 的桌面开发*）。readio 里没有 C 代码，但 `rustc` 调用的链接器仍然是 MSVC 那一个。不想装 Visual Studio 就 `rustup default stable-x86_64-pc-windows-gnu`，配 MinGW-w64 也行。
 
@@ -57,9 +66,9 @@ Windows 没有预编译产物，也没有安装脚本——准确的说法是没
 
 6. **朗读不用额外装播放器**：默认的 `play` 就是一条用 `Media.SoundPlayer` 的 PowerShell 命令。语音引擎仍然要你自己装，并把 `tts.engines.<名字>.synth` 改成它在 Windows 上的命令行。
 
-有两样东西跟不过来：`scripts/install.sh` 是 POSIX sh，`scripts/pty_probe.py` 需要 POSIX pty，在这儿都跑不了——直接编译、直接运行就好。音频输出白名单在 Windows 上也没有内置的设备探测：把 `tts.output.query` 设成一条能打印当前输出设备名的命令（比如 PowerShell 加 `AudioDeviceCmdlets` 模块）；在你设好之前，`/device` 会说它读不到设备列表，并提醒白名单仍然让朗读保持静音。
+POSIX 专用的 `scripts/pty_probe.py` 在 Windows 上跑不了。音频输出白名单在 Windows 上也没有内置的设备探测：把 `tts.output.query` 设成一条能打印当前输出设备名的命令（比如 PowerShell 加 `AudioDeviceCmdlets` 模块）；在你设好之前，`/device` 会说它读不到设备列表，并提醒白名单仍然让朗读保持静音。
 
-`cargo test` 应该能跑——整帧渲染测试走的是 ratatui 的 `TestBackend`，不需要真终端——但没人在 Windows 上跑过全套，所以那里挂了算 bug，欢迎报。
+Windows CI 会验证发布版可执行文件和安装器。部分本地语音模型的托管安装测试仍依赖 POSIX runtime；文本阅读和已打包的可执行文件不依赖这些路径。
 
 ## 用法
 

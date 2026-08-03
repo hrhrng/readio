@@ -48,7 +48,7 @@ Invoke-WebRequest https://raw.githubusercontent.com/hrhrng/readio/main/apps/tui/
 & $installer
 ```
 
-The installer detects your platform, downloads the release archive, verifies it against the release's `SHA256SUMS`, and installs a single file to `~/.local/bin/readio`. It needs no sudo, no compiler and no Rust toolchain; it writes nothing outside the install directory. To uninstall, delete that file and `~/.readio`.
+Both installers download the matching release archive and verify it against the release's `SHA256SUMS`. The Unix script installs `~/.local/bin/readio`; PowerShell installs `%USERPROFILE%\.local\bin\readio.exe`. Neither needs sudo, a compiler, or Rust, and neither changes the library or configuration. To uninstall the program, delete that executable; remove `~/.readio` only if you also want to erase books, settings, and progress.
 
 From source, with Rust 1.90 or newer:
 
@@ -60,6 +60,8 @@ Prebuilt archives are published for `aarch64`/`x86_64` macOS, `aarch64`/`x86_64`
 linked), and Windows x64. They are a convenience, not the only path: anything else — a BSD, an architecture nobody
 packages — builds from source with the command above, since the dependency tree is pure Rust and needs no C
 toolchain.
+
+Every pull request runs the actual release matrix for all five targets, launches each binary on its native runner, creates the final archives, and verifies their names and root contents. Pull-request runs cannot publish a GitHub Release.
 
 ## Windows notes
 

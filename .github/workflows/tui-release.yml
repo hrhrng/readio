@@ -6,17 +6,22 @@ name: tui-release
 on:
   push:
     tags: ["tui-v*"]
+  pull_request:
+    paths:
+      - "apps/tui/**"
+      - ".github/workflows/tui-release.yml"
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to build (for a dry run), e.g. tui-v0.1.0"
+        description: "Tag to build and publish, e.g. tui-v0.1.0"
         required: true
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  READIO_RELEASE_VERSION: ${{ github.event_name == 'pull_request' && 'tui-v0.0.0-ci' || github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 defaults:
   run:
@@ -58,12 +63,28 @@ jobs:
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
+      - name: Run Unix release binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/readio"
+          "$binary" --version
+          "$binary" --help
+
+      - name: Run Windows release binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "target/${{ matrix.target }}/release/readio.exe" --version
+          & "target/${{ matrix.target }}/release/readio.exe" --help
+
       - name: Package Unix archive
         if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}"
+          version="$READIO_RELEASE_VERSION"
           name="readio-${version}-${{ matrix.target }}.tar.gz"
           # The archive holds the binary at its root, README and LICENSE
           # alongside: install.sh expects ./readio after unpacking.
@@ -75,7 +96,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $version = "${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.tag }}"
+          $version = $env:READIO_RELEASE_VERSION
           $name = "readio-$version-${{ matrix.target }}.zip"
           $stage = Join-Path $env:RUNNER_TEMP "readio-package"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
@@ -88,10 +109,50 @@ jobs:
           path: apps/tui/readio-*-${{ matrix.target }}.*
           if-no-files-found: error
 
-  publish:
-    name: publish
+  verify:
+    name: verify release archives
     needs: build
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Verify all target archives and their root contents
+        working-directory: dist
+        shell: bash
+        run: |
+          set -euo pipefail
+          targets=(
+            aarch64-apple-darwin
+            x86_64-apple-darwin
+            aarch64-unknown-linux-musl
+            x86_64-unknown-linux-musl
+          )
+          for target in "${targets[@]}"; do
+            archive="readio-${READIO_RELEASE_VERSION}-${target}.tar.gz"
+            test -f "$archive"
+            diff -u \
+              <(printf '%s\n' LICENSE README.md readio) \
+              <(tar -tzf "$archive" | sed 's#^\./##' | sort)
+          done
+
+          windows="readio-${READIO_RELEASE_VERSION}-x86_64-pc-windows-msvc.zip"
+          test -f "$windows"
+          diff -u \
+            <(printf '%s\n' LICENSE README.md readio.exe) \
+            <(unzip -Z1 "$windows" | tr -d '\r' | sed 's#^\./##' | sort)
+
+          count="$(find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) | wc -l | tr -d ' ')"
+          test "$count" -eq 5
+
+  publish:
+    name: publish
+    if: github.event_name != 'pull_request'
+    needs: [build, verify]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -113,12 +174,12 @@ jobs:
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name || github.event.inputs.tag }}
-          name: readio tui ${{ github.ref_name || github.event.inputs.tag }}
+          tag_name: ${{ env.READIO_RELEASE_VERSION }}
+          name: readio tui ${{ env.READIO_RELEASE_VERSION }}
           draft: false
           # A tag with a hyphen in its version is a prerelease by semver's own
           # rules — `tui-v0.2.0-beta.1` gets the badge, `tui-v0.2.0` does not.
-          prerelease: ${{ contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') }}
+          prerelease: ${{ contains(env.READIO_RELEASE_VERSION, '-beta') || contains(env.READIO_RELEASE_VERSION, '-rc') }}
           generate_release_notes: true
           files: |
             dist/*.tar.gz
@@ -136,7 +197,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = "${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.tag }}"
+          $tag = $env:READIO_RELEASE_VERSION
           gh release download $tag --repo $env:GITHUB_REPOSITORY --pattern install.ps1 --dir $env:RUNNER_TEMP
           "READIO_TEST_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append
       - name: Install twice and run the published binary
