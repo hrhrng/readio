@@ -84,17 +84,6 @@ fn main() -> Result<()> {
 async fn run(mut app: App) -> Result<()> {
     let mut terminal = setup()?;
 
-    // Opt-in input trace, from `debug_input_log` in config.yaml: every terminal
-    // event, appended. Invaluable when a keystroke seems to go missing and the
-    // screen is the only other evidence.
-    let mut input_log = app.input_log_path().and_then(|path| {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .ok()
-    });
-
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(FRAME);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -113,10 +102,7 @@ async fn run(mut app: App) -> Result<()> {
             maybe_event = events.next() => {
                 match maybe_event {
                     Some(Ok(event)) => {
-                        if let Some(log) = input_log.as_mut() {
-                            use std::io::Write;
-                            let _ = writeln!(log, "{event:?}");
-                        }
+                        app.trace_input(&event);
                         match event {
                             Event::Key(key) => app.on_key(key),
                             Event::Mouse(mouse) => app.on_mouse(mouse),

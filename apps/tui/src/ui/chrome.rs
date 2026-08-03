@@ -154,12 +154,7 @@ pub fn render_activity(area: Rect, buf: &mut Buffer, c: &Chrome<'_>) {
             Style::default().fg(th.accent_warning),
         ),
         Span::styled(
-            t(if c.mode == crate::mode::Mode::Speak {
-                "chrome.audio_paused"
-            } else {
-                "chrome.paused"
-            })
-            .to_string(),
+            t("chrome.paused").to_string(),
             Style::default().fg(th.accent_thinking),
         ),
     ]);
@@ -197,15 +192,7 @@ pub fn render_status(area: Rect, buf: &mut Buffer, c: &Chrome<'_>) {
         // only the way out of it belongs.
         vec![
             Span::raw("  "),
-            Span::styled(
-                t(if c.mode == crate::mode::Mode::Speak {
-                    "chrome.audio_paused_keys"
-                } else {
-                    "chrome.paused_keys"
-                })
-                .to_string(),
-                faint,
-            ),
+            Span::styled(t("chrome.paused_keys").to_string(), faint),
         ]
     } else if let Some(notice) = c.notice {
         vec![
@@ -278,11 +265,7 @@ pub fn render_status(area: Rect, buf: &mut Buffer, c: &Chrome<'_>) {
         spans
     };
 
-    let mode_chip = if c.mode == crate::mode::Mode::Speak {
-        format!("{} [ / ]", crate::mode::chip(c.mode))
-    } else {
-        crate::mode::chip(c.mode)
-    };
+    let mode_chip = crate::mode::chip(c.mode);
     let mut right = vec![Span::styled(
         format!("{mode_chip}  "),
         Style::default().fg(if c.mode.scrolls() {

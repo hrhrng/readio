@@ -38,8 +38,8 @@ pub struct Config {
     /// and "which voice" were never two questions.
     #[serde(alias = "tts")]
     pub voice: Voice,
-    /// Diagnostics: append every terminal event to this file. Unset normally —
-    /// it exists because a keystroke going missing is otherwise unprovable.
+    /// Diagnostics: append terminal events and sampled voice timing to this
+    /// file. Unset normally; enabled when an input or pacing bug needs evidence.
     pub input_log: Option<String>,
 }
 
@@ -561,7 +561,7 @@ impl Config {
             },
             input_log = match &self.input_log {
                 Some(path) => format!(
-                    "\n# 调试：每个按键都记到这个文件 / log every key event\ninput_log: {path}\n"
+                    "\n# 调试：记录按键、断句和音频时钟 / log input and voice timing\ninput_log: {path}\n"
                 ),
                 None => String::new(),
             },

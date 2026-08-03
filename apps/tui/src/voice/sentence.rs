@@ -1,9 +1,8 @@
 //! Splitting a passage into utterances for the speech engine.
 //!
-//! Speech wants whole clauses: a sentence at a time reads naturally, is short
-//! enough to synthesize without a long wait, and gives the highlight something
-//! meaningful to follow. Each utterance keeps the byte range it came from, so
-//! when its audio starts the reader can highlight exactly those words.
+//! Speech wants contextual windows: complete paragraphs where they fit, and
+//! complete sentences where they do not. Each utterance keeps the byte range it
+//! came from, so when its audio starts the reader can highlight those words.
 
 /// One thing to say, and where it sits in the passage.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,9 +15,8 @@ pub struct Utterance {
 
 /// Sentence-final punctuation, Chinese and ASCII.
 const HARD_STOP: &str = "。！？…";
-/// Softer breaks, used only when an utterance is already long.
-const SOFT_STOP: &str = "；，、";
-/// Longest utterance we will hand to an engine, in characters.
+/// Preferred synthesis-window ceiling. A complete sentence may exceed it: a
+/// semantic boundary is worth more than an arbitrary size guarantee.
 const MAX_CHARS: usize = 90;
 /// Below this, prefer to keep gluing clauses together. Chinese sentences are
 /// short — 「界面不是中立的。」 is eight characters — so the floor has to be low
@@ -31,8 +29,25 @@ const MIN_CHARS: usize = 6;
 /// quotes, and fenced code. Code fences are skipped — reading source aloud is
 /// noise — and the markers themselves are never spoken.
 pub fn split(passage: &str) -> Vec<Utterance> {
-    let mut out: Vec<Utterance> = Vec::new();
+    pack_windows(passage, paragraphs(passage))
+}
+
+/// Fine-grained boundaries used by transport navigation.
+///
+/// Synthesis deliberately packs these into larger contextual windows; player
+/// navigation must retain the smaller semantic units so `←` and `→` do not
+/// unexpectedly jump an entire paragraph.
+pub fn sentences(passage: &str) -> Vec<Utterance> {
+    paragraphs(passage)
+        .into_iter()
+        .flat_map(|paragraph| paragraph.clauses)
+        .collect()
+}
+
+fn paragraphs(passage: &str) -> Vec<Paragraph> {
+    let mut paragraphs: Vec<Paragraph> = Vec::new();
     let mut in_code = false;
+    let mut barrier_before = false;
     // Byte offset of the current line within `passage`.
     let mut base = 0usize;
 
@@ -44,6 +59,9 @@ pub fn split(passage: &str) -> Vec<Utterance> {
 
         if trimmed.starts_with("```") {
             in_code = !in_code;
+            // Context must not jump across omitted source: the two sides of a
+            // code sample are unrelated even when both happen to be short.
+            barrier_before = true;
             base += advance;
             continue;
         }
@@ -62,10 +80,113 @@ pub fn split(passage: &str) -> Vec<Utterance> {
         };
         let start = base + indent + marker;
         let body = &line[indent + marker..];
-        out.extend(split_line(body, start));
+        let clauses = split_line(body, start);
+        if !clauses.is_empty() {
+            paragraphs.push(Paragraph {
+                clauses,
+                barrier_before: std::mem::take(&mut barrier_before),
+            });
+        }
         base += advance;
     }
-    out
+    paragraphs
+}
+
+struct Paragraph {
+    clauses: Vec<Utterance>,
+    barrier_before: bool,
+}
+
+/// Recursive text splitting, stopping at the sentence level:
+///
+/// 1. Keep a paragraph whole when it fits the preferred window.
+/// 2. Otherwise pack its complete sentences up to that window.
+/// 3. Never hard-cut a sentence merely to satisfy the preferred size.
+///
+/// The resulting paragraph-sized pieces are then greedily packed with their
+/// neighbours. This is the useful part of a RAG text splitter for TTS: rich
+/// context without sacrificing the linguistic boundaries the voice needs.
+fn pack_windows(passage: &str, paragraphs: Vec<Paragraph>) -> Vec<Utterance> {
+    let mut windows = Vec::new();
+    let mut current: Option<Utterance> = None;
+    for paragraph in paragraphs {
+        let pieces = split_paragraph(passage, paragraph.clauses);
+        for (index, piece) in pieces.into_iter().enumerate() {
+            let Some(open) = current.take() else {
+                current = Some(piece);
+                continue;
+            };
+            let candidate = join(open.clone(), piece.clone(), passage);
+            if (paragraph.barrier_before && index == 0)
+                || candidate.text.chars().count() > MAX_CHARS
+            {
+                windows.push(open);
+                current = Some(piece);
+            } else {
+                current = Some(candidate);
+            }
+        }
+    }
+    if let Some(open) = current {
+        windows.push(open);
+    }
+    windows
+}
+
+fn split_paragraph(passage: &str, clauses: Vec<Utterance>) -> Vec<Utterance> {
+    let Some(first) = clauses.first().cloned() else {
+        return Vec::new();
+    };
+    let whole = clauses
+        .iter()
+        .skip(1)
+        .cloned()
+        .fold(first, |open, clause| join(open, clause, passage));
+    if whole.text.chars().count() <= MAX_CHARS || clauses.len() == 1 {
+        return vec![whole];
+    }
+
+    let mut pieces = Vec::new();
+    let mut current: Option<Utterance> = None;
+    for clause in clauses {
+        let Some(open) = current.take() else {
+            current = Some(clause);
+            continue;
+        };
+        let candidate = join(open.clone(), clause.clone(), passage);
+        if candidate.text.chars().count() > MAX_CHARS {
+            pieces.push(open);
+            current = Some(clause);
+        } else {
+            current = Some(candidate);
+        }
+    }
+    if let Some(open) = current {
+        pieces.push(open);
+    }
+    pieces
+}
+
+fn join(mut first: Utterance, second: Utterance, passage: &str) -> Utterance {
+    let source_gap = passage
+        .get(first.range.1..second.range.0)
+        .unwrap_or_default();
+    let last = first.text.chars().last();
+    let separator = if last.is_some_and(|ch| HARD_STOP.contains(ch)) {
+        ""
+    } else if last.is_some_and(|ch| matches!(ch, '.' | '!' | '?')) {
+        " "
+    } else if source_gap.is_empty() {
+        ""
+    } else if first.text.chars().any(crate::metrics::is_ideographic) {
+        "。"
+    } else {
+        ". "
+    };
+    first.text.push_str(separator);
+    first.text.push_str(second.text.trim_start());
+    first.range.1 = second.range.1;
+    first
 }
 
 /// Split one line of prose into utterances, offset by `origin`.
@@ -96,14 +217,9 @@ fn split_line(line: &str, origin: usize) -> Vec<Utterance> {
         let end = index + ch.len_utf8();
         let hard = HARD_STOP.contains(ch)
             || (matches!(ch, '.' | '!' | '?')
-                && line[end..].chars().next().is_none_or(|n| n == ' '));
-        let soft = SOFT_STOP.contains(ch) || matches!(ch, ',' | ';');
-
-        if (hard && chars >= MIN_CHARS) || (soft && chars >= MAX_CHARS) {
-            push(&mut current, current_start, end, &mut out);
-            chars = 0;
-        } else if chars >= MAX_CHARS + 30 {
-            // A wall of text with no punctuation still has to be said.
+                && line[end..].chars().next().is_none_or(|n| n == ' ')
+                && !period_abbreviation(&current));
+        if hard && chars >= MIN_CHARS {
             push(&mut current, current_start, end, &mut out);
             chars = 0;
         }
@@ -111,6 +227,35 @@ fn split_line(line: &str, origin: usize) -> Vec<Utterance> {
     let end = line.len();
     push(&mut current, current_start, end, &mut out);
     out
+}
+
+fn period_abbreviation(text: &str) -> bool {
+    let token = text
+        .trim_end_matches('.')
+        .split_whitespace()
+        .next_back()
+        .unwrap_or_default()
+        .trim_matches(|ch: char| !ch.is_alphanumeric())
+        .to_lowercase();
+    matches!(
+        token.as_str(),
+        "e.g"
+            | "i.e"
+            | "etc"
+            | "trans"
+            | "ed"
+            | "eds"
+            | "p"
+            | "pp"
+            | "vol"
+            | "no"
+            | "mr"
+            | "mrs"
+            | "ms"
+            | "dr"
+            | "prof"
+            | "ph"
+    ) || (token.len() == 1 && token.chars().all(|ch| ch.is_ascii_alphabetic()))
 }
 
 #[cfg(test)]
@@ -122,11 +267,48 @@ mod tests {
     }
 
     #[test]
-    fn splits_on_sentence_endings() {
-        let said = texts("界面不是中立的。它一边呈现内容，一边塑造你阅读的方式。");
-        assert_eq!(said.len(), 2, "expected two sentences, got {said:?}");
-        assert!(said[0].ends_with('。'));
-        assert!(said[1].starts_with('它'));
+    fn an_oversized_paragraph_splits_only_on_sentence_endings() {
+        let passage = "第一句先交代这座城市为何建在河流旁边。第二句描述黄昏时广场上的钟声和人群。第三句转向窗边那位始终沉默的老人。第四句补充远山在雨后显露出来的轮廓。第五句才揭示旅行者一直等待的答案。第六句让船夫把这个答案带往下一座城市。";
+        let said = texts(passage);
+        assert!(said.len() > 1, "oversized paragraph stayed whole: {said:?}");
+        assert!(
+            said.iter().all(|window| window.ends_with('。')),
+            "a window ended inside a sentence: {said:?}"
+        );
+        assert_eq!(said.concat(), passage, "text was lost or duplicated");
+    }
+
+    #[test]
+    fn punctuation_is_a_preferred_boundary_not_a_synthesis_window() {
+        let passage = "第一句话提供背景。第二句话继续展开。第三句话收住这一小段。";
+        assert_eq!(
+            texts(passage),
+            vec![passage],
+            "each full stop became a separate synthesis request"
+        );
+    }
+
+    #[test]
+    fn packed_english_sentences_keep_their_word_boundary() {
+        let passage = "This is one sentence. And here is another one.";
+        assert_eq!(
+            texts(passage),
+            vec![passage],
+            "packing removed the space between English sentences"
+        );
+    }
+
+    #[test]
+    fn a_complete_paragraph_is_not_split_to_fill_the_previous_window() {
+        let passage = "第一段先交代这座城市的背景，也说明旅行者为何会在黄昏时抵达这里，最后留下一个尚未回答的问题。\n\n第二段第一句描述广场上的人群和钟声。第二句转向窗边沉默的老人。第三句补充远处河流反射出来的微光。第四句才揭示他们正在等待什么。";
+        assert_eq!(
+            texts(passage),
+            vec![
+                "第一段先交代这座城市的背景，也说明旅行者为何会在黄昏时抵达这里，最后留下一个尚未回答的问题。",
+                "第二段第一句描述广场上的人群和钟声。第二句转向窗边沉默的老人。第三句补充远处河流反射出来的微光。第四句才揭示他们正在等待什么。",
+            ],
+            "a paragraph that fits the preferred window was split merely to fill the previous one"
+        );
     }
 
     #[test]
@@ -146,18 +328,55 @@ mod tests {
     #[test]
     fn strips_markup_but_keeps_the_words() {
         let said = texts("## 二 阅读的进度条\n\n> 界面不是中立的。\n\n正文在这里。");
-        assert!(
-            said.iter().any(|s| s == "二 阅读的进度条"),
-            "heading text should be spoken without the marker: {said:?}"
+        assert_eq!(
+            said,
+            vec!["二 阅读的进度条。界面不是中立的。正文在这里。"],
+            "markup leaked into speech or its words were lost"
         );
-        assert!(
-            said.iter().any(|s| s == "界面不是中立的。"),
-            "quote text should be spoken without the bar: {said:?}"
+    }
+
+    /// A heading or year is context for what follows, not a useful TTS clip on
+    /// its own. MOSS can turn a bare `1983` into several seconds of unstable
+    /// speech, which is exactly what happened at an EPUB bibliography boundary.
+    #[test]
+    fn short_lines_are_joined_to_the_sentence_that_follows() {
+        let said = texts("## 五\n\n选择马可波罗的故事，有什么意蕴呢？");
+        assert_eq!(
+            said,
+            vec!["五。选择马可波罗的故事，有什么意蕴呢？"],
+            "a one-character heading became its own synthesis job"
+        );
+    }
+
+    #[test]
+    fn bibliographic_abbreviations_do_not_become_tiny_clips() {
+        let said = texts(
+            "参考文献\n\nBaudrillard, Jean\n\n1983\n\nSimulations. trans. by Paul Foss etc. New York: Semiotext(e).",
         );
         assert!(
             said.iter()
-                .all(|s| !s.contains("##") && !s.starts_with('>')),
-            "markers leaked into speech: {said:?}"
+                .all(|text| !matches!(text.as_str(), "1983" | "trans." | "etc.")),
+            "bibliographic fragments leaked out as standalone clips: {said:?}"
+        );
+        let joined = said.join(" ");
+        for expected in [
+            "参考文献",
+            "Baudrillard, Jean",
+            "1983",
+            "Simulations",
+            "trans.",
+            "Paul Foss",
+            "etc.",
+            "New York",
+        ] {
+            assert!(joined.contains(expected), "{expected:?} was lost: {said:?}");
+        }
+        assert!(
+            said.iter().all(|window| {
+                let chars = window.chars().count();
+                chars <= MAX_CHARS || !window.contains(['。', '.', '!', '?'])
+            }),
+            "a multi-sentence window exceeded the preferred ceiling: {said:?}"
         );
     }
 
@@ -168,20 +387,14 @@ mod tests {
     }
 
     #[test]
-    fn very_long_clauses_are_broken_up() {
+    fn a_sentence_is_never_hard_split_to_meet_the_window_limit() {
         let passage = "注意力".repeat(120);
         let said = texts(&passage);
-        assert!(
-            said.len() > 1,
-            "a punctuation-free wall must still be split"
+        assert_eq!(
+            said,
+            vec![passage],
+            "a sentence was cut at an arbitrary character boundary"
         );
-        for utterance in &said {
-            assert!(
-                utterance.chars().count() <= MAX_CHARS + 31,
-                "utterance too long for an engine: {} chars",
-                utterance.chars().count()
-            );
-        }
     }
 
     #[test]
@@ -199,12 +412,6 @@ mod tests {
         assert!(texts("").is_empty());
         assert!(texts("\n\n   \n").is_empty());
         assert!(texts("```\ncode only\n```").is_empty());
-    }
-
-    #[test]
-    fn english_sentences_split_on_periods() {
-        let said = texts("This is one sentence. And here is another one.");
-        assert_eq!(said.len(), 2, "got {said:?}");
     }
 }
 
