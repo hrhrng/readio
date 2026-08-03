@@ -339,6 +339,68 @@ fn shown(app: &App) -> Option<usize> {
     app.turn.streaming_passage().map(|(_, chars)| chars)
 }
 
+/// Manual means the token clock is no longer running. The most surprising
+/// path into it is from read-aloud: stopping the speaker used to lift the
+/// voice's reveal ceiling, which handed the half-spoken passage straight to
+/// the automatic text pacer even though the mode chip already said manual.
+#[test]
+fn switching_to_manual_freezes_the_live_passage() {
+    let _guard = exclusive();
+    let (mut app, mut terminal) =
+        fixture_with(long_chapters(common::isolated_home()), 100, LONG_CLIP_MS);
+    start_reading_aloud(&mut app, &mut terminal);
+    until(&mut app, &mut terminal, "some spoken text", |app| {
+        shown(app).is_some_and(|chars| chars >= 4)
+    });
+
+    type_line(&mut app, "/mode manual");
+    assert_eq!(app.mode(), readio::mode::Mode::Manual);
+    let parked = shown(&app).expect("the passage remains in flight");
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        tick(&mut app, &mut terminal);
+    }
+
+    assert_eq!(
+        shown(&app),
+        Some(parked),
+        "manual inherited the automatic text clock after leaving read-aloud"
+    );
+}
+
+/// Switching modes during the simulated thinking/tool prelude is the same
+/// decision as switching during visible prose. The passage does not exist yet,
+/// so a ceiling captured only from `streaming_passage()` misses it and manual
+/// quietly starts auto-streaming as soon as the tool completes.
+#[test]
+fn switching_to_manual_before_the_passage_starts_holds_that_turn() {
+    let _guard = exclusive();
+    let (mut app, mut terminal) =
+        fixture_with(long_chapters(common::isolated_home()), 100, LONG_CLIP_MS);
+    until(&mut app, &mut terminal, "the opening turn", |app| {
+        !app.turn.busy()
+    });
+
+    type_line(&mut app, "/mode auto");
+    assert!(app.turn.busy(), "auto should have queued a reading turn");
+    type_line(&mut app, "/mode manual");
+    assert_eq!(app.mode(), readio::mode::Mode::Manual);
+    until(&mut app, &mut terminal, "the held passage", |app| {
+        shown(app).is_some()
+    });
+    let parked = shown(&app).expect("the passage started");
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        tick(&mut app, &mut terminal);
+    }
+
+    assert_eq!(
+        shown(&app),
+        Some(parked),
+        "manual started the passage on the automatic clock after the tool prelude"
+    );
+}
+
 /// The first half of the fix: a passage that is going to be read aloud shows
 /// nothing until there is audio to show it against.
 ///
@@ -1026,6 +1088,70 @@ fn arrow_keys_move_the_audio_and_text_to_sentence_boundaries() {
     assert!(
         view.contains("←") && view.contains("→"),
         "sentence transport keys should be discoverable:\n{view}"
+    );
+}
+
+/// A seek has a textual destination even while the replacement clip is still
+/// rendering. Keys pressed in that interval used to be discarded because the
+/// old audio clock had already been cleared. On a heavy model this interval is
+/// long enough to make repeated left presses look as if they broke playback.
+#[test]
+fn repeated_left_during_seek_clamps_at_the_first_sentence_and_resumes() {
+    let _guard = exclusive();
+    let home = common::isolated_home();
+    let path = long_chapters(home);
+    let (mut app, mut terminal) = fixture_with(path, 100, LONG_CLIP_MS);
+    start_reading_aloud(&mut app, &mut terminal);
+    let source = app
+        .turn
+        .passage_in_flight()
+        .map(|(_, text, _)| text.to_string())
+        .expect("streaming passage");
+    let first_body = source.find("这一句是甲子。").expect("first body sentence");
+    let second_body = source.find("这一句是乙丑。").expect("second body sentence");
+    let first = readio::voice::sentence::sentences(&source)
+        .first()
+        .expect("first textual sentence")
+        .range
+        .0;
+
+    until(&mut app, &mut terminal, "the opening audio cursor", |app| {
+        app.voice_position().is_some()
+    });
+    app.on_key(KeyEvent::from(KeyCode::Right));
+    until(&mut app, &mut terminal, "the first body sentence", |app| {
+        app.voice_position()
+            .is_some_and(|position| position.range.0 == first_body)
+    });
+    app.on_key(KeyEvent::from(KeyCode::Right));
+    until(&mut app, &mut terminal, "the second body sentence", |app| {
+        app.voice_position()
+            .is_some_and(|position| position.range.0 == second_body)
+    });
+
+    // The first press clears the live clock in the old implementation. Every
+    // press after it must still move the pending textual cursor, not disappear.
+    for _ in 0..8 {
+        app.on_key(KeyEvent::from(KeyCode::Left));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut resumed_at_first = false;
+    while Instant::now() < deadline {
+        tick(&mut app, &mut terminal);
+        if app
+            .voice_position()
+            .is_some_and(|position| position.range.0 == first)
+        {
+            resumed_at_first = true;
+            break;
+        }
+    }
+    assert!(
+        resumed_at_first,
+        "rapid left presses were lost while the replacement clip rendered; \
+         playback never resumed at the clamped first sentence\n{}",
+        screen(&terminal)
     );
 }
 

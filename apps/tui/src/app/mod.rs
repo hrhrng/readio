@@ -51,6 +51,8 @@ const NOTICE_TTL: Duration = Duration::from_secs(6);
 const QUIT_WINDOW: Duration = Duration::from_secs(2);
 /// Reading speed used when the reader presses Enter to skip ahead.
 const RUSH_CPS: f32 = 2_400.0;
+/// Coalesce a burst of sentence-navigation keys into one pipeline restart.
+const SPEECH_SEEK_DEBOUNCE: Duration = Duration::from_millis(120);
 
 pub struct App {
     pub sb: Scrollback,
@@ -82,6 +84,10 @@ pub struct App {
     /// Reader's configured speed, restored after a rush.
     base_cps: f32,
     rushing: bool,
+    /// This already-running turn was disowned by a switch to manual. It stays
+    /// held whether the passage is visible yet or still behind thinking/tools;
+    /// Enter explicitly authorizes the remainder and clears the flag.
+    manual_hold: bool,
     /// Library index of the book read last, offered on the empty prompt.
     resume: Option<usize>,
     last_frame: Instant,
@@ -107,6 +113,11 @@ pub struct App {
     voiced: Option<(u64, String)>,
     /// The sentence being sounded, and the word cursor walking through it.
     cursor: Option<Cursor>,
+    /// Textual seek destination retained while replacement audio is rendering.
+    /// The playback clock is deliberately not the navigation cursor: stopping
+    /// a clip clears that clock, and a heavy model can leave it absent long
+    /// enough for a whole burst of arrow keys to otherwise disappear.
+    speech_seek: Option<PendingSpeechSeek>,
     /// Last sentence boundary durably written for the active spoken passage.
     speech_checkpoint: Option<SpeechCheckpoint>,
     /// A saved boundary waiting to be applied to the first passage after a
@@ -248,6 +259,13 @@ struct Cursor {
     shown: Option<(usize, usize)>,
 }
 
+struct PendingSpeechSeek {
+    id: u64,
+    text: String,
+    sentence: usize,
+    apply_at: Instant,
+}
+
 struct TraceLog {
     file: File,
 }
@@ -313,6 +331,7 @@ impl App {
             marks: Vec::new(),
             base_cps: cps,
             rushing: false,
+            manual_hold: false,
             resume: None,
             last_frame: Instant::now(),
             ctrl_c_at: None,
@@ -326,6 +345,7 @@ impl App {
             lit: None,
             voiced: None,
             cursor: None,
+            speech_seek: None,
             speech_checkpoint: None,
             restoring_speech: None,
             trace,
@@ -508,6 +528,7 @@ impl App {
         // to advance. A blocked read-aloud turn must stop; pumping first would
         // reveal tokens at the text clock and become a one-frame Auto fallback.
         self.poll_audio_device();
+        self.apply_pending_speech_seek();
 
         // Whether the next passage is going to be spoken, refreshed every frame
         // so it can never be stale: a passage held for a voice that is not
@@ -537,7 +558,7 @@ impl App {
         self.advance_cursor();
         // Last line of defence: a hold belongs to a voice, and a voice that has
         // stopped without saying so must not take the text down with it.
-        if self.turn.held() && !self.speaking() {
+        if self.turn.held() && !self.speaking() && !self.manual_hold {
             self.turn.hold_reveal(None);
         }
         // The next turn waits on the voice rather than on the text. Checked
@@ -573,6 +594,7 @@ impl App {
     }
 
     fn on_turn_finished(&mut self) {
+        self.manual_hold = false;
         if self.rushing {
             self.rushing = false;
             self.apply_pace();
@@ -1007,9 +1029,15 @@ impl App {
     fn enqueue_speech(&mut self, id: u64, text: &str) {
         if !self.enqueue_speech_from(id, text, 0) {
             // Nothing is going to say this passage, so nothing should be
-            // holding it shut. A hold with no voice behind it is a frozen
-            // screen.
-            self.turn.hold_reveal(None);
+            // holding it shut — unless the reader just moved an already-running
+            // turn into manual, in which case that frozen screen is the choice.
+            let manual_limit = self.manual_hold.then(|| {
+                self.turn
+                    .streaming_passage()
+                    .filter(|(streaming, _)| *streaming == id)
+                    .map_or(0, |(_, released)| released)
+            });
+            self.turn.hold_reveal(manual_limit);
         }
     }
 
@@ -1115,46 +1143,86 @@ impl App {
     /// that point. The turn's reveal ceiling moves in the same operation, so a
     /// model wait can never hand pacing back to the automatic text clock.
     fn step_spoken_sentence(&mut self, forward: bool) {
-        let Some(position) = self.voice_position() else {
-            return;
+        let pending = self.speech_seek.as_ref();
+        let (id, text, current) = match pending {
+            Some(pending) => (pending.id, pending.text.clone(), pending.sentence),
+            None => {
+                let Some(position) = self.voice_position() else {
+                    return;
+                };
+                let Some((id, text)) = self.voiced.clone().filter(|(id, _)| *id == position.id)
+                else {
+                    return;
+                };
+                if position.range.1 > text.len()
+                    || !text.is_char_boundary(position.range.0)
+                    || !text.is_char_boundary(position.range.1)
+                {
+                    return;
+                }
+                let span = &text[position.range.0..position.range.1];
+                let span_chars = span.chars().count();
+                let elapsed = position.elapsed.as_nanos();
+                let duration = position.duration.as_nanos().max(1);
+                let advanced =
+                    ((span_chars as u128 * elapsed) / duration).min(span_chars as u128) as usize;
+                let at = position.range.0 + char_to_byte(span, advanced);
+                let sentences = sentence::sentences(&text);
+                let Some(current) = sentences
+                    .iter()
+                    .position(|sentence| sentence.range.0 <= at && at < sentence.range.1)
+                    .or_else(|| {
+                        sentences
+                            .iter()
+                            .rposition(|sentence| sentence.range.0 <= at)
+                    })
+                else {
+                    return;
+                };
+                (id, text, current)
+            }
         };
-        let Some((id, text)) = self.voiced.clone().filter(|(id, _)| *id == position.id) else {
-            return;
-        };
-        if position.range.1 > text.len()
-            || !text.is_char_boundary(position.range.0)
-            || !text.is_char_boundary(position.range.1)
-        {
+        let count = sentence::sentences(&text).len();
+        if count == 0 {
             return;
         }
-        let span = &text[position.range.0..position.range.1];
-        let span_chars = span.chars().count();
-        let elapsed = position.elapsed.as_nanos();
-        let duration = position.duration.as_nanos().max(1);
-        let advanced = ((span_chars as u128 * elapsed) / duration).min(span_chars as u128) as usize;
-        let at = position.range.0 + char_to_byte(span, advanced);
-        let sentences = sentence::sentences(&text);
-        let Some(current) = sentences
-            .iter()
-            .position(|sentence| sentence.range.0 <= at && at < sentence.range.1)
-            .or_else(|| {
-                sentences
-                    .iter()
-                    .rposition(|sentence| sentence.range.0 <= at)
-            })
+        let target = if forward {
+            current.saturating_add(1).min(count - 1)
+        } else {
+            current.saturating_sub(1)
+        };
+        if target == current {
+            return;
+        }
+        self.speech_seek = Some(PendingSpeechSeek {
+            id,
+            text,
+            sentence: target,
+            apply_at: Instant::now() + SPEECH_SEEK_DEBOUNCE,
+        });
+    }
+
+    fn apply_pending_speech_seek(&mut self) {
+        let Some(pending) = self
+            .speech_seek
+            .take_if(|pending| Instant::now() >= pending.apply_at)
         else {
             return;
         };
-        let target = if forward {
-            sentences.get(current + 1)
-        } else {
-            current
-                .checked_sub(1)
-                .and_then(|index| sentences.get(index))
-        };
-        let Some(target) = target else {
+        if !self.speech
+            || self
+                .voiced
+                .as_ref()
+                .is_none_or(|(id, text)| *id != pending.id || *text != pending.text)
+        {
+            return;
+        }
+        let sentences = sentence::sentences(&pending.text);
+        let Some(target) = sentences.get(pending.sentence) else {
             return;
         };
+        let id = pending.id;
+        let text = pending.text;
         let target_byte = target.range.0;
         let target_chars = text[..target_byte].chars().count();
         let was_paused = self.turn.paused();
@@ -1183,8 +1251,8 @@ impl App {
             speaker.pause();
         }
         self.trace(format!(
-            "voice sentence {} id={id} from_byte={target_byte}",
-            if forward { "next" } else { "previous" }
+            "voice sentence seek id={id} index={} from_byte={target_byte}",
+            pending.sentence
         ));
     }
 
@@ -1212,8 +1280,13 @@ impl App {
                         .streaming_passage()
                         .filter(|(streaming, _)| *streaming == id)
                         .map_or(0, |(_, released)| released);
+                    let synthesis = self
+                        .speaker
+                        .as_ref()
+                        .and_then(Speaker::synthesis_factor)
+                        .map_or_else(|| "warming".to_string(), |factor| format!("{factor:.2}x"));
                     self.trace(format!(
-                        "voice started id={id} range={}..{} chars={chars} duration_ms={ms} released={released} runway={} rate={}",
+                        "voice started id={id} range={}..{} chars={chars} duration_ms={ms} released={released} runway={} rate={} synthesis={synthesis}",
                         range.0,
                         range.1,
                         self.voice_runway(),
@@ -1571,6 +1644,7 @@ impl App {
 
     /// Stop the current clip and forget everything queued.
     fn silence(&mut self) {
+        self.speech_seek = None;
         if let Some(speaker) = self.speaker.as_mut() {
             speaker.stop();
         }
@@ -2189,6 +2263,10 @@ impl App {
     /// missing, slow or failed engine may stop progress, but it can never turn
     /// the selection into auto and let tokens run ahead in silence.
     fn set_mode(&mut self, want: ReadMode) -> bool {
+        let hold_turn = want == ReadMode::Manual && self.turn.busy();
+        let manual_limit = (want == ReadMode::Manual)
+            .then(|| self.turn.streaming_passage().map(|(_, released)| released))
+            .flatten();
         let leaving_speech = self.mode == ReadMode::Speak && want != ReadMode::Speak;
         if want == ReadMode::Speak && self.mode != ReadMode::Speak {
             self.spoke_from = self.mode;
@@ -2202,6 +2280,15 @@ impl App {
         self.cfg.reading.mode = want;
         self.cfg.voice.enabled = want.speaks();
         let _ = self.cfg.save();
+        self.manual_hold = hold_turn;
+
+        if want == ReadMode::Manual {
+            if let Some(released) = manual_limit {
+                self.turn.hold_reveal(Some(released));
+            }
+        } else if want != ReadMode::Speak {
+            self.turn.hold_reveal(None);
+        }
 
         if want == ReadMode::Speak {
             self.rushing = false;
@@ -2294,6 +2381,7 @@ impl App {
         // reader asked for silence, not for the next paragraph.
         self.awaiting_voice = false;
         self.warmed = None;
+        self.manual_hold = false;
         self.silence();
         if self.turn.interrupt(&mut self.sb) {
             self.sb.push(Block::Event(Event::Interrupted));
@@ -2327,6 +2415,10 @@ impl App {
             // The thinking and the tool call are still hurried along, since
             // those are readio's own theatre and nobody is listening to them.
             if self.turn.busy() {
+                if self.mode == ReadMode::Manual {
+                    self.manual_hold = false;
+                    self.turn.hold_reveal(None);
+                }
                 if !self.rushing && !self.speaks() {
                     self.rushing = true;
                     self.turn.set_cps(RUSH_CPS);
