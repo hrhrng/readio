@@ -134,7 +134,9 @@ try {
     }
 
     $installedVersion = (& $destination --version | Select-Object -First 1)
-    if ($LASTEXITCODE -ne 0) { Fail "the installed readio.exe did not start" }
+    if (-not $installedVersion -or -not $installedVersion.StartsWith("readio ")) {
+        Fail "the installed readio.exe did not return a valid version"
+    }
     Write-Log "readio: installed $installedVersion -> $destination"
 
     $pathEntries = $env:PATH -split ";" | ForEach-Object { $_.TrimEnd("\") }

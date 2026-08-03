@@ -77,8 +77,8 @@ try {
     & $Installer -Version latest -InstallDir $installDir
     $installed = Join-Path $installDir "readio.exe"
     Assert-True (Test-Path -LiteralPath $installed -PathType Leaf) "readio.exe was not installed"
-    & $installed --version | Out-Null
-    Assert-True ($LASTEXITCODE -eq 0) "installed binary did not run"
+    $installedVersion = (& $installed --version | Select-Object -First 1)
+    Assert-True ($installedVersion -and $installedVersion.StartsWith("readio ")) "installed binary did not run"
 
     & $Installer -Version $tag -InstallDir $installDir
 
