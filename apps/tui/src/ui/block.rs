@@ -4,7 +4,7 @@
 //! decides layout. Every block renders into owned `Line<'static>` values so the
 //! scrollback can cache them between frames.
 
-use ratatui::style::{Modifier, Style, Stylize};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::i18n::{t, tf};
@@ -242,7 +242,8 @@ pub enum Block {
         hidden: usize,
     },
     Context(ContextInfo),
-    /// An illustration from the book, drawn with half-block characters.
+    /// An illustration from the book, drawn with the terminal's native image
+    /// protocol.
     ///
     /// The block only reserves rows and draws the caption; the pixels are
     /// painted by the scrollback afterwards, because they need cell access

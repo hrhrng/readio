@@ -627,9 +627,8 @@ const EFFORT_NOTE: &str = "  # Reading pace, shown as the reasoning effort of th
   # level: minimal | low | medium | high | xhigh | max —— /effort 或 ^r 切换
 ";
 
-const IMAGES_NOTE: &str =
-    "  # illustrations are drawn with half-block characters, max_rows tall at most
-  # 书里的插图用半块字符画在终端里；max_rows 是最高几行
+const IMAGES_NOTE: &str = "  # native terminal images are at most max_rows tall
+  # 书里的插图使用终端原生图片协议；max_rows 是最高几行
 ";
 
 const VOICE_NOTE: &str =

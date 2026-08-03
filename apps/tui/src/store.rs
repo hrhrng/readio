@@ -133,6 +133,18 @@ impl Store {
         self.last_book = progress.path.clone().or(self.last_book.clone());
         self.books.insert(id.to_string(), progress);
     }
+
+    /// Remove every persisted trace of one book.
+    pub fn forget(&mut self, id: &str, path: &std::path::Path) -> Result<()> {
+        let saved_path = self.books.remove(id).and_then(|progress| progress.path);
+        let is_resume_target = self.last_book.as_deref().is_some_and(|last| {
+            std::path::Path::new(last) == path || saved_path.as_deref() == Some(last)
+        });
+        if is_resume_target {
+            self.last_book = None;
+        }
+        self.save()
+    }
 }
 
 pub fn now_secs() -> u64 {

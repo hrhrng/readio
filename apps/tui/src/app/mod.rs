@@ -2786,7 +2786,7 @@ impl App {
                 }
                 KeyCode::Enter => workspace.activate(&self.cfg, installing.as_deref()),
                 KeyCode::Char('d') if workspace.focus == voice_ui::Pane::Models => {
-                    workspace.activate(&self.cfg, installing.as_deref())
+                    workspace.delete(&self.cfg, installing.as_deref())
                 }
                 KeyCode::Char(ch) => {
                     workspace.type_param(ch);
@@ -2810,6 +2810,24 @@ impl App {
                 self.voice_workspace = None;
             }
             voice_ui::Action::Install(engine) => self.install_engine(&engine),
+            voice_ui::Action::Delete(engine) => {
+                let result = self
+                    .cfg
+                    .spec(&engine)
+                    .cloned()
+                    .ok_or_else(|| "model is no longer configured".to_string())
+                    .and_then(|spec| install::delete_model(&engine, &spec));
+                match result {
+                    Ok(_) => {
+                        self.restart_voice();
+                        self.notice(&tf("install.deleted", &[&engine]));
+                        if let Some(workspace) = self.voice_workspace.as_mut() {
+                            workspace.reload(&self.cfg);
+                        }
+                    }
+                    Err(reason) => self.notice(&tf("install.delete_failed", &[&engine, &reason])),
+                }
+            }
             voice_ui::Action::Save => {
                 let Some(request) = self
                     .voice_workspace
@@ -3556,6 +3574,10 @@ impl App {
         let open_id = self.book.as_ref().map(|b| b.id.clone());
         match self.library.forget(index) {
             Ok(entry) => {
+                if let Err(err) = self.store.forget(&entry.id, &entry.path) {
+                    self.system(&format!("{err:#}"));
+                    return;
+                }
                 if open_id.as_deref() == Some(entry.id.as_str()) {
                     self.book = None;
                     self.pos = Pos::default();

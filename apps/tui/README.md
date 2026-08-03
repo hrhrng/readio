@@ -48,7 +48,7 @@ src/
     sample.rs     the built-in sample, one per interface language
   ui/
     block.rs      nine block kinds, from user input to a rendered illustration
-    image.rs      half-block rendering: two pixels per cell, aspect corrected
+    image.rs      image geometry and unreadable-image placeholders
     scrollback.rs entries, per-entry line cache, tail-following viewport, pixel layer
     prompt.rs     single-line editor with a grapheme-level cursor
     chrome.rs     top bar, status line, help panel
@@ -73,7 +73,7 @@ src/
 
 **Identity comes from content.** A book is identified by its length plus a hash of its first 128 KiB, not by its path. Importing the same file twice does not create a second entry, and copying or moving it into the library keeps the position that was already stored. This is what makes `-c`, `-l` and `-m` interchangeable after the fact.
 
-**Illustrations are a pixel layer, not character art.** The block reserves rows and draws a caption; pixels are composited after the text, so an image takes part in ratatui's diffing, can be covered by text, and clips correctly when half of it scrolls off. The kitty and iTerm2 protocols are detected but unused: half-blocks hold in every terminal and never leave an image stranded after a scroll.
+**Illustrations use the terminal's native pixel layer, not character art.** The block reserves rows and draws a caption; `ratatui-image` selects Kitty, iTerm2 or Sixel and slices the encoded image by terminal row so it clips correctly while scrolling. Halfblocks are intentionally rejected: a terminal without a native image protocol gets an explicit placeholder instead of a mosaic.
 
 ## Books, positions and progress
 
@@ -528,7 +528,7 @@ cargo test          # wrapping, pacing, parsing, import modes, reading, whole fr
 - `tests/find.rs` walks search → jump by number → the term deeply washed, asserts the counts are true counts, that `^g` says so when it wraps, and that `^g` with no search points back at `/find`.
 - `tests/library.rs` covers the filesystem consequences of each import mode, that a second import of the same book adds no second entry, and that `/forget` never deletes a file the reader owns.
 - `tests/audio_device.rs` runs the allowlist end to end — blocked, warned, `/device allow`, restored — while `src/voice/device.rs` simulates sleeping headphones through an injected probe and asserts the decision flips once rather than every frame.
-- `tests/illustration.rs` generates a PNG and an EPUB on the spot and checks that coloured half-blocks reach the screen, so there is no fixture to go stale.
+- `tests/illustration.rs` generates a PNG and an EPUB on the spot and checks that a native Kitty image reaches the screen, so there is no fixture to go stale.
 - Every test runs against a temporary host directory (`paths::set_home`) and cannot touch a real library.
 
 Some things only a terminal knows. `scripts/pty_probe.py` runs the binary in a real pty with a small terminal emulator behind it, and prints the screen as text:

@@ -5,12 +5,12 @@
 [![tui-ci](https://github.com/hrhrng/readio/actions/workflows/tui-ci.yml/badge.svg?branch=main)](https://github.com/hrhrng/readio/actions/workflows/tui-ci.yml)
 [![release](https://img.shields.io/github/v/release/hrhrng/readio?include_prereleases&filter=tui-v*&label=release&color=6f5ec7)](https://github.com/hrhrng/readio/releases)
 [![license](https://img.shields.io/badge/license-MIT-6f5ec7)](LICENSE)
-[![rust](https://img.shields.io/badge/rust-1.85%2B-6f5ec7)](https://www.rust-lang.org)
+[![rust](https://img.shields.io/badge/rust-1.90%2B-6f5ec7)](https://www.rust-lang.org)
 ![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-6f5ec7)
 
 [English](README.md)
 
-用 Rust 写成，键盘优先。章节按书自己的目录来分，斜体保留，封面和插图直接画在终端里。朗读交给你自己选的本地模型，正在读的那句浅高亮、读到的那个字深高亮。核心是一个 4 MB 的二进制，不带模型、不带资源、不要求运行时依赖或云端账号。
+用 Rust 写成，键盘优先。章节按书自己的目录来分，斜体保留，封面和插图通过终端原生图片协议精确渲染。朗读交给你自己选的本地模型，正在读的那句浅高亮、读到的那个字深高亮。核心是一个二进制，不带模型、不带资源、不要求运行时依赖或云端账号。
 
 屏幕上的每一个数字都是真读出来的——真实的段落偏移、真实的行号区间、真实的全文检索命中数。伪装的只是词表，不是数据。
 
@@ -47,7 +47,7 @@ curl -fsSL https://raw.githubusercontent.com/hrhrng/readio/main/apps/tui/scripts
 
 脚本会识别系统和架构、下载对应产物、用 release 里的 `SHA256SUMS` 校验，然后把一个文件装到 `~/.local/bin/readio`。不需要 sudo、不需要编译器、不需要 Rust 工具链，也不会在安装目录之外留下任何东西。卸载就是删掉这个文件，再删 `~/.readio`。
 
-从源码安装需要 Rust 1.85 及以上：
+从源码安装需要 Rust 1.90 及以上：
 
 ```sh
 cargo install --git https://github.com/hrhrng/readio readio
@@ -74,7 +74,7 @@ Windows 没有预编译产物，也没有安装脚本——准确的说法是没
 
 3. **放进 PATH。** `cargo install --path .` 会把 `readio.exe` 装到 `%USERPROFILE%\.cargo\bin`，这个目录 rustup 已经加进 PATH 了。
 
-4. **用支持 VT 的终端。** readio 需要真彩色、alternate screen，以及用半块字符画插图，Windows Terminal 三样都支持。如果只能用老的 `conhost`，先 `chcp 65001`，否则框线和中文会变成乱码。
+4. **用支持 VT 的终端。** 想精确显示封面和插图，需要终端支持 Kitty graphics、iTerm2 inline images 或 Sixel；其他终端仍能运行 readio，但图片位置会显示占位框。如果只能用老的 `conhost`，先 `chcp 65001`，否则框线和中文会变成乱码。
 
 5. **文件在哪儿。** `%USERPROFILE%\.readio` 下面是 `config.yaml`、`books\`、`state.json`。`readio --home D:\readio` 可以整体换个地方。
 

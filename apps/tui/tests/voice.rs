@@ -35,12 +35,18 @@ fn fixture() -> (App, Terminal<TestBackend>) {
     // presets, whose Python packages intentionally are not part of the test
     // environment.
     for (name, voice) in [("local-a", "reader-a"), ("local-b", "reader-b")] {
+        let model = common::isolated_home().join(format!("{name}.model"));
+        std::fs::write(&model, b"test model").expect("local model fixture");
         config.voice.engines.insert(
             name.to_string(),
             readio::voice::config::EngineSpec {
                 synth: "sh -c true".to_string(),
                 voice: voice.to_string(),
                 about: format!("{name} test model"),
+                fetch: vec![readio::voice::config::Fetch {
+                    url: "https://example.invalid/test-model".to_string(),
+                    to: model.to_string_lossy().into_owned(),
+                }],
                 languages: std::collections::BTreeMap::from([(
                     "zh".to_string(),
                     readio::voice::config::LanguageSpec {
@@ -376,6 +382,24 @@ fn model_management_never_changes_voice_configuration() {
         after, before,
         "a model becoming available is not a configuration choice"
     );
+}
+
+#[test]
+fn pressing_d_twice_deletes_only_the_selected_models_artifacts() {
+    let _guard = exclusive();
+    let (mut app, mut terminal) = fixture();
+    settle(&mut app, &mut terminal);
+    let selected = common::isolated_home().join("local-a.model");
+    let other = common::isolated_home().join("local-b.model");
+
+    type_line(&mut app, "/voice");
+    app.on_key(KeyEvent::from(KeyCode::Char('d')));
+    assert!(selected.exists(), "one d only asks for confirmation");
+    app.on_key(KeyEvent::from(KeyCode::Char('d')));
+    draw(&mut app, &mut terminal, 2);
+
+    assert!(!selected.exists(), "the confirmed model should be removed");
+    assert!(other.exists(), "another model must remain untouched");
 }
 
 /// Scope is a field in the form, not a guess based on whether a book happens to

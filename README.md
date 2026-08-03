@@ -5,14 +5,28 @@
 [![tui-ci](https://github.com/hrhrng/readio/actions/workflows/tui-ci.yml/badge.svg?branch=main)](https://github.com/hrhrng/readio/actions/workflows/tui-ci.yml)
 [![release](https://img.shields.io/github/v/release/hrhrng/readio?include_prereleases&filter=tui-v*&label=release&color=6f5ec7)](https://github.com/hrhrng/readio/releases)
 [![license](https://img.shields.io/badge/license-MIT-6f5ec7)](LICENSE)
-[![rust](https://img.shields.io/badge/rust-1.85%2B-6f5ec7)](https://www.rust-lang.org)
+[![rust](https://img.shields.io/badge/rust-1.90%2B-6f5ec7)](https://www.rust-lang.org)
 ![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-6f5ec7)
 
 [中文文档](README.zh-CN.md)
 
-Built in Rust as a keyboard-first TUI. Chapters follow the book's own table of contents, italics stay italic, and covers and illustrations are drawn in the terminal. Read-aloud uses a local model of your choice, with the spoken sentence and sounded character highlighted. The core is one 4 MB binary with no bundled model, assets, runtime dependencies or required cloud account.
+Built in Rust as a keyboard-first TUI. Chapters follow the book's own table of contents, italics stay italic, and covers and illustrations are drawn through the terminal's native image protocol. Read-aloud uses a local model of your choice, with the spoken sentence and sounded character highlighted. The core is one binary with no bundled model, assets, runtime dependencies or required cloud account.
 
 Every number on screen is a real reading — real paragraph offsets, real line ranges, real full-text search hits. Only the vocabulary is costume.
+
+## See it in action
+
+Read aloud with a local MOSS model while the spoken sentence and current word stay highlighted:
+
+![Read-aloud with synchronized text highlighting powered by the local MOSS model](docs/assets/readio/read-aloud-moss.gif)
+
+Import a book, then read it in agent-shaped turns:
+
+| Import an EPUB | Read the book |
+| --- | --- |
+| ![Importing an EPUB from the readio library](docs/assets/readio/import-epub.png) | ![Reading an EPUB in the terminal](docs/assets/readio/reading-session.png) |
+
+<sub>Captured from real readio sessions in a terminal.</sub>
 
 ```
  readio   The Shape of Attention  readio sample                   ch 1/4  ·  ctx 0.0%
@@ -47,7 +61,7 @@ curl -fsSL https://raw.githubusercontent.com/hrhrng/readio/main/apps/tui/scripts
 
 The installer detects your platform, downloads the release archive, verifies it against the release's `SHA256SUMS`, and installs a single file to `~/.local/bin/readio`. It needs no sudo, no compiler and no Rust toolchain; it writes nothing outside the install directory. To uninstall, delete that file and `~/.readio`.
 
-From source, with Rust 1.85 or newer:
+From source, with Rust 1.90 or newer:
 
 ```sh
 cargo install --git https://github.com/hrhrng/readio readio
@@ -75,7 +89,7 @@ Windows has no prebuilt archive and no installer script — it is untested rathe
 
 3. **Put it on PATH.** `cargo install --path .` places `readio.exe` in `%USERPROFILE%\.cargo\bin`, which rustup already added to your PATH.
 
-4. **Use a VT-capable terminal.** readio needs truecolour, the alternate screen, and half-block characters for illustrations: Windows Terminal handles all three. In the legacy `conhost` console, run `chcp 65001` first or the box drawing and any CJK text will come out as mojibake.
+4. **Use a VT-capable terminal.** For exact cover and illustration rendering, use a terminal that supports Kitty graphics, iTerm2 inline images or Sixel. Other terminals still run readio but show an image placeholder. In the legacy `conhost` console, run `chcp 65001` first or the box drawing and any CJK text will come out as mojibake.
 
 5. **Where things live.** `%USERPROFILE%\.readio` holds `config.yaml`, `books\` and `state.json`. `readio --home D:\readio` moves the lot somewhere else.
 
