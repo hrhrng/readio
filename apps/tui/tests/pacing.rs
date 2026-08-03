@@ -113,11 +113,7 @@ fn stand_in_engine(home: &Path, synth_ms: u64, clip_ms: u64) -> EngineSpec {
         // 600ms for the baseline sentence keeps contextual playback at a
         // plausible upper bound even in fixtures whose original 300ms clip was
         // chosen only to make synthesis slower than playback.
-        let duration = clip_ms
-            .max(600)
-            .saturating_mul(bytes)
-            .div_ceil(21)
-            .max(20);
+        let duration = clip_ms.max(600).saturating_mul(bytes).div_ceil(21).max(20);
         std::fs::write(clips.join(format!("{bytes}.wav")), silence(duration))
             .expect("write scaled clip");
     }
@@ -738,17 +734,40 @@ fn read_aloud_exposes_and_obeys_bracket_speed_keys() {
         LONG_CLIP_MS,
     );
     start_reading_aloud(&mut app, &mut terminal);
+    until(&mut app, &mut terminal, "a live audio cursor", |app| {
+        app.voice_position().is_some()
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let view = loop {
+        tick(&mut app, &mut terminal);
+        let view = screen(&terminal);
+        if view.contains("stand-in") {
+            break view;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the transient mode notice never yielded to the transport:\n{view}"
+        );
+    };
+    assert!(
+        view.contains("[1×]"),
+        "the live speed should carry its two bracket controls:\n{view}"
+    );
+    assert_eq!(
+        view.matches("[1×]").count(),
+        1,
+        "speed state should appear once, next to the engine:\n{view}"
+    );
+    assert!(
+        !view.contains("[ / ]"),
+        "a second generic speed hint repeats the same control:\n{view}"
+    );
 
     app.on_key(KeyEvent::from(KeyCode::Char(']')));
     assert_eq!(app.multiplier(), 1.25, "] should make read-aloud faster");
     app.on_key(KeyEvent::from(KeyCode::Char('[')));
     assert_eq!(app.multiplier(), 1.0, "[ should make read-aloud slower");
-
-    let view = screen(&terminal);
-    assert!(
-        view.contains("[ / ]") || view.contains("[ ]"),
-        "read-aloud should print its speed keys where they can be discovered:\n{view}"
-    );
 }
 
 /// Playback speed belongs to the live audio cursor, not to synthesis.

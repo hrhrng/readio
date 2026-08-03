@@ -125,8 +125,8 @@ pub const TABLE: &[(&str, &str, &str)] = &[
     ("chrome.idle_tail", "  ·  shift+tab 换模式  ·  /help 更多",
         "  ·  shift+tab cycles modes  ·  /help for more"),
     ("chrome.busy_tail", "  ·  esc 中断  ·  ↑↓ 滚动", "  ·  esc interrupts  ·  ↑↓ to scroll"),
-    ("chrome.aloud_tail", "  ·  ← / → 换句  ·  [ / ] 调速  ·  空格暂停",
-        "  ·  ← / → sentence  ·  [ / ] speed  ·  space pauses"),
+    ("chrome.aloud_tail", "  ·  ← / → 换句  ·  空格暂停",
+        "  ·  ← / → sentence  ·  space pauses"),
     // Pausing wears the agent's own clothes: a stopped stream is a model
     // thinking, which is the one state a coding agent is always allowed to be in.
     // esc holds the turn where it is. It is called an interruption because that

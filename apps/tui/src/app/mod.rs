@@ -879,11 +879,11 @@ impl App {
         match (&self.speaker, self.lit) {
             (Some(speaker), Some(_)) => {
                 let engine = speaker.engine();
-                if (self.multiplier() - 1.0).abs() < 0.001 {
-                    Some(engine.to_string())
-                } else {
-                    Some(format!("{engine} {}", effort::times(self.multiplier())))
-                }
+                // One compact transport readout: the brackets are the actual
+                // slower/faster keys and the value between them is their state.
+                // Repeating a generic `[ / ]` beside the mode and again in the
+                // hint row made one control look like three separate concepts.
+                Some(format!("{engine}  [{}]", effort::times(self.multiplier())))
             }
             _ => None,
         }

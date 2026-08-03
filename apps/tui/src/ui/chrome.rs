@@ -265,11 +265,7 @@ pub fn render_status(area: Rect, buf: &mut Buffer, c: &Chrome<'_>) {
         spans
     };
 
-    let mode_chip = if c.mode == crate::mode::Mode::Speak {
-        format!("{} [ / ]", crate::mode::chip(c.mode))
-    } else {
-        crate::mode::chip(c.mode)
-    };
+    let mode_chip = crate::mode::chip(c.mode);
     let mut right = vec![Span::styled(
         format!("{mode_chip}  "),
         Style::default().fg(if c.mode.scrolls() {
