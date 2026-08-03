@@ -224,6 +224,7 @@ fn a_character_offset_outranks_a_stale_chapter_index() {
             chars_read: target as u64,
             sessions: 1,
             updated: 0,
+            speech: None,
             marks: Vec::new(),
         },
     );

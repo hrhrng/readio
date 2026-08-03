@@ -28,7 +28,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use readio::app::App;
 use readio::book::Book;
 use readio::library::Library;
-use readio::store::Store;
+use readio::store::{Progress, SpeechCheckpoint, Store};
 use readio::voice::config::EngineSpec;
 
 /// How long the stand-in engine pretends to spend synthesizing a sentence.
@@ -742,7 +742,7 @@ fn read_aloud_exposes_and_obeys_bracket_speed_keys() {
     let view = loop {
         tick(&mut app, &mut terminal);
         let view = screen(&terminal);
-        if view.contains("stand-in") {
+        if view.contains("stand-in") && view.contains("[1×]") {
             break view;
         }
         assert!(
@@ -763,11 +763,119 @@ fn read_aloud_exposes_and_obeys_bracket_speed_keys() {
         !view.contains("[ / ]"),
         "a second generic speed hint repeats the same control:\n{view}"
     );
+    assert!(
+        !view.contains("readio-1"),
+        "the selected audio model should replace the fictional agent model:\n{view}"
+    );
+    assert_eq!(
+        view.matches("stand-in").count(),
+        1,
+        "the audio model belongs in the model slot, not in two status regions:\n{view}"
+    );
 
     app.on_key(KeyEvent::from(KeyCode::Char(']')));
     assert_eq!(app.multiplier(), 1.25, "] should make read-aloud faster");
     app.on_key(KeyEvent::from(KeyCode::Char('[')));
     assert_eq!(app.multiplier(), 1.0, "[ should make read-aloud slower");
+}
+
+/// Closing readio halfway through a spoken passage must not turn a restart into
+/// a replay of the whole passage. The durable checkpoint is the current fine
+/// sentence boundary; the live audio millisecond remains process-local.
+#[test]
+fn restarting_read_aloud_resumes_at_the_live_sentence() {
+    let _guard = exclusive();
+    let home = fixture_home();
+    let path = book(&home, "spoken-checkpoint", 2, 8);
+    let (mut app, mut terminal) = fixture_at_home(home, path.clone(), 20, CLIP_MS, "", 46.0, None);
+    start_reading_aloud(&mut app, &mut terminal);
+
+    let source = app
+        .turn
+        .passage_in_flight()
+        .map(|(_, text, _)| text.to_string())
+        .expect("streaming passage");
+    let third = source.find("这一句是丙寅。").expect("third sentence");
+    let inside_third = source[..third].chars().count() + 1;
+    until(
+        &mut app,
+        &mut terminal,
+        "the live voice to enter the third sentence",
+        |app| {
+            app.turn
+                .streaming_passage()
+                .is_some_and(|(_, released)| released >= inside_third)
+        },
+    );
+
+    let id = app.book.as_ref().expect("open book").id.clone();
+    let saved = app
+        .store
+        .get(&id)
+        .cloned()
+        .expect("read-aloud should have durable progress");
+    drop(app);
+    drop(terminal);
+
+    let mut store = Store::ephemeral();
+    store.record(&id, saved);
+    let reopened = Book::load(Some(&path)).expect("reopen book");
+    let mut restarted = App::new(Library::ephemeral(), store, Some(reopened), None);
+    let mut terminal = Terminal::new(TestBackend::new(96, 30)).expect("terminal");
+    until(
+        &mut restarted,
+        &mut terminal,
+        "the restored audio cursor",
+        |app| app.voice_position().is_some(),
+    );
+
+    let position = restarted.voice_position().expect("playing after restart");
+    assert!(
+        position.range.0 >= third,
+        "restart replayed the passage from byte {} instead of resuming at byte {third}:\n{}",
+        position.range.0,
+        screen(&terminal)
+    );
+}
+
+#[test]
+fn an_explicit_chapter_jump_discards_the_spoken_checkpoint() {
+    let _guard = exclusive();
+    let home = fixture_home();
+    let path = book(&home, "checkpoint-jump", 2, 8);
+    let mut config = readio::config::Config::load().0;
+    config.reading.mode = readio::mode::Mode::Manual;
+    let _ = config.save();
+
+    let book = Book::load(Some(&path)).expect("book");
+    let id = book.id.clone();
+    let mut store = Store::ephemeral();
+    store.record(
+        &id,
+        Progress {
+            title: book.title.clone(),
+            speech: Some(SpeechCheckpoint {
+                chapter: 0,
+                para: 0,
+                from: 54,
+                anchor: "这一句是丙寅。".to_string(),
+            }),
+            ..Progress::default()
+        },
+    );
+    let mut app = App::new(Library::ephemeral(), store, Some(book), None);
+    let mut terminal = Terminal::new(TestBackend::new(96, 30)).expect("terminal");
+    until(&mut app, &mut terminal, "the restored welcome", |app| {
+        !app.turn.busy()
+    });
+
+    type_line(&mut app, "/goto 1");
+    assert!(
+        app.store
+            .get(&id)
+            .is_some_and(|progress| progress.speech.is_none()),
+        "an explicit jump to the chapter start left the old spoken sentence armed"
+    );
 }
 
 /// Playback speed belongs to the live audio cursor, not to synthesis.

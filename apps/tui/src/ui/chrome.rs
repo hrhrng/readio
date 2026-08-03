@@ -25,6 +25,9 @@ pub struct Chrome<'a> {
     pub elapsed: std::time::Duration,
     /// Engine name while read-aloud is on.
     pub speaking: Option<&'a str>,
+    /// Selected speech model. In read-aloud it owns the agent-model slot;
+    /// otherwise the coding-agent costume keeps its fictional model name.
+    pub audio_model: Option<&'a str>,
     /// Read-aloud is on but held back because the output device is not on the
     /// whitelist. Shown wherever the engine name would be, because a silent
     /// mute is indistinguishable from a broken engine.
@@ -274,6 +277,7 @@ pub fn render_status(area: Rect, buf: &mut Buffer, c: &Chrome<'_>) {
             th.text_faint
         }),
     )];
+    let model = c.audio_model.unwrap_or("readio-1");
     right.extend([
         Span::styled(
             format!("{} ", theme::dot_frame(c.tick)),
@@ -283,7 +287,7 @@ pub fn render_status(area: Rect, buf: &mut Buffer, c: &Chrome<'_>) {
                 th.text_faint
             }),
         ),
-        Span::styled("readio-1".to_string(), Style::default().fg(th.accent_model)),
+        Span::styled(model.to_string(), Style::default().fg(th.accent_model)),
         // The effort level rides with the model name, the way a coding agent
         // prints `(high)` after the model it is talking to.
         Span::styled(

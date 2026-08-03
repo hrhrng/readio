@@ -25,10 +25,29 @@ pub struct Progress {
     pub sessions: u32,
     #[serde(default)]
     pub updated: u64,
+    /// Fine-grained read-aloud position inside the passage that starts at
+    /// `(chapter, para)`. Ordinary reading still commits whole paragraph
+    /// windows; speech additionally keeps the current sentence so a process
+    /// restart does not replay that window from its first word.
+    #[serde(default)]
+    pub speech: Option<SpeechCheckpoint>,
     /// Places the reader asked to keep. Empty for a book nobody marked, and
     /// absent from an older state file, which is what `default` is for.
     #[serde(default)]
     pub marks: Vec<Mark>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeechCheckpoint {
+    pub chapter: usize,
+    pub para: usize,
+    /// Byte offset in the rendered passage. Sentence and synthesis ranges use
+    /// bytes too, so resuming does not round through a second coordinate system.
+    pub from: usize,
+    /// Opening text at `from`, used to relocate the sentence if passage packing
+    /// changes between releases.
+    #[serde(default)]
+    pub anchor: String,
 }
 
 /// A place worth coming back to.
