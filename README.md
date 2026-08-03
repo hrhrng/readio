@@ -28,29 +28,6 @@ Import a book, then read it in agent-shaped turns:
 
 <sub>Captured from real readio sessions in a terminal.</sub>
 
-```
- readio   The Shape of Attention  readio sample                   ch 1/4  ·  ctx 0.0%
-   ○  3. Three  The feel of a tool  783 tok
-   ○  4. Four  One continuous piece of work  485 tok
-
- ❙ Thought for 1.3s
-
- ● Read readio://sample/attention.md  L1-9  ·  0.3s
-   # One  Attention in eighty columns
-   The first time I noticed that attention has a shape, I was watching a cursor…
-   I was waiting on a slow build. There was nothing on the screen but that one …
-
-   One  Attention in eighty columns
-
-   The first time I noticed that attention has a shap▌
-╭────────────────────────────────────────────────────────────────────────────────────╮
-│❯ enter to keep reading; / opens commands                                           │
-╰────────────────────────────────────────────────────────────────────────────────────╯
-  ⠼ One  Attention in eighty co…  ·  esc to stop  ·  ↑↓ … ⸬ readio-1  64 tok  ·  0:06
-```
-
-<sub>Captured from a real pty by `apps/tui/scripts/pty_probe.py`, not typed by hand.</sub>
-
 ## Install
 
 > **readio is in beta.** Releases are tagged `tui-v0.Y.0-beta.N` and flagged as prereleases on GitHub; the installer takes the newest one. Things settle as they get used — read-aloud in particular has been exercised against command templates and tests, not against every engine in the table.
