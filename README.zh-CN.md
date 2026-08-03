@@ -14,29 +14,6 @@
 
 屏幕上的每一个数字都是真读出来的——真实的段落偏移、真实的行号区间、真实的全文检索命中数。伪装的只是词表，不是数据。
 
-```
- readio   The Shape of Attention  readio sample                   ch 1/4  ·  ctx 0.0%
-   ○  3. Three  The feel of a tool  783 tok
-   ○  4. Four  One continuous piece of work  485 tok
-
- ❙ Thought for 1.3s
-
- ● Read readio://sample/attention.md  L1-9  ·  0.3s
-   # One  Attention in eighty columns
-   The first time I noticed that attention has a shape, I was watching a cursor…
-   I was waiting on a slow build. There was nothing on the screen but that one …
-
-   One  Attention in eighty columns
-
-   The first time I noticed that attention has a shap▌
-╭────────────────────────────────────────────────────────────────────────────────────╮
-│❯ enter to keep reading; / opens commands                                           │
-╰────────────────────────────────────────────────────────────────────────────────────╯
-  ⠼ One  Attention in eighty co…  ·  esc to stop  ·  ↑↓ … ⸬ readio-1  64 tok  ·  0:06
-```
-
-<sub>这一屏由 `apps/tui/scripts/pty_probe.py` 从一个真实 pty 抓下来，不是手写的。</sub>
-
 ## 安装
 
 > **readio 还在 beta。** 版本按 `tui-v0.Y.0-beta.N` 打标签，在 GitHub 上标为 prerelease，安装脚本取最新的那个。用的人多了才会稳下来——尤其是朗读，目前只对着命令模板和测试验过，并没有把表格里每个引擎都跑通。

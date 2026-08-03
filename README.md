@@ -26,30 +26,11 @@ Import a book, then read it in agent-shaped turns:
 | --- | --- |
 | ![Importing an EPUB from the readio library](docs/assets/readio/import-epub.png) | ![Reading an EPUB in the terminal](docs/assets/readio/reading-session.png) |
 
+Download a local voice on the left, then configure it globally or for one book on the right:
+
+![Downloading and configuring local voice models in the readio Voice workspace](docs/assets/readio/voice-workspace.png)
+
 <sub>Captured from real readio sessions in a terminal.</sub>
-
-```
- readio   The Shape of Attention  readio sample                   ch 1/4  ·  ctx 0.0%
-   ○  3. Three  The feel of a tool  783 tok
-   ○  4. Four  One continuous piece of work  485 tok
-
- ❙ Thought for 1.3s
-
- ● Read readio://sample/attention.md  L1-9  ·  0.3s
-   # One  Attention in eighty columns
-   The first time I noticed that attention has a shape, I was watching a cursor…
-   I was waiting on a slow build. There was nothing on the screen but that one …
-
-   One  Attention in eighty columns
-
-   The first time I noticed that attention has a shap▌
-╭────────────────────────────────────────────────────────────────────────────────────╮
-│❯ enter to keep reading; / opens commands                                           │
-╰────────────────────────────────────────────────────────────────────────────────────╯
-  ⠼ One  Attention in eighty co…  ·  esc to stop  ·  ↑↓ … ⸬ readio-1  64 tok  ·  0:06
-```
-
-<sub>Captured from a real pty by `apps/tui/scripts/pty_probe.py`, not typed by hand.</sub>
 
 ## Install
 
