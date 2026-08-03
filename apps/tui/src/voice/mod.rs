@@ -35,16 +35,17 @@ pub mod resident;
 pub mod sentence;
 pub mod wav;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use sha2::{Digest, Sha256};
 
 pub use sentence::Utterance as Sentence;
 
@@ -74,24 +75,15 @@ pub trait Synthesizer: Send + Sync {
     ///
     /// Pause is deliberately separate from cancellation. A pause keeps the
     /// player's audio cursor alive so resume continues at the same millisecond;
-    /// cancellation throws the clip away for an interrupt or speed change.
+    /// cancellation throws the clip away for an interrupt or navigation.
     fn play(&self, clip: &Clip, control: &PlaybackControl) -> Result<()>;
 
-    /// Read at a different speed from now on.
+    /// Stable description of everything that changes canonical synthesis.
     ///
-    /// Speed is applied at synthesis rather than at playback — resampling would
-    /// change the voice along with the tempo — so it has to reach the engine
-    /// rather than the player. It is a live setting and not a constructor
-    /// argument because the alternative is rebuilding the engine to change it,
-    /// and for one that keeps a model in memory that means the reader waits out
-    /// a model load for having pressed `^r`.
-    ///
-    /// Only what has not been rendered yet is affected; the caller flushes.
-    fn set_rate(&self, _rate: f32) {}
-
-    /// The speed in force, as the renderer would use it right now.
-    fn rate(&self) -> f32 {
-        1.0
+    /// Playback controls are intentionally absent: one validated 1× WAV must
+    /// survive pause, resume and every transport rate.
+    fn cache_identity(&self) -> String {
+        self.describe()
     }
 
     /// Short human-readable name, shown in the status line.
@@ -116,7 +108,7 @@ pub enum SpeechEvent {
     Finished { id: u64 },
     /// Everything queued has been spoken.
     Idle,
-    /// Synthesis or playback failed; the app falls back to timed reading.
+    /// Synthesis or playback failed; read-aloud stops without changing modes.
     Failed { message: String },
 }
 
@@ -166,8 +158,7 @@ struct Job {
     text: String,
     range: (usize, usize),
     /// Which run of the speaker this belongs to. [`Speaker::stop`] bumps the
-    /// era and both threads discard anything older, which is how a speed change
-    /// throws away clips that were rendered at the old speed.
+    /// era and both threads discard anything older after navigation or stop.
     era: u64,
 }
 
@@ -187,7 +178,10 @@ enum Command {
     /// another second after that — all of it in silence. This hands the opening
     /// sentence over early, while the last clip of the paragraph before it is
     /// still playing.
-    Warm(String),
+    Warm {
+        text: String,
+        era: u64,
+    },
     Stop,
 }
 
@@ -205,9 +199,22 @@ struct Pipeline {
     room: Condvar,
     /// How many clips may wait ahead of the one playing: `voice.prefetch`.
     capacity: usize,
+    /// Live transport inputs for the rolling runway decision. Direct unit
+    /// users that never render may leave this absent.
+    transport: Option<TransportWindow>,
     era: AtomicU64,
     closed: AtomicBool,
 }
+
+struct TransportWindow {
+    paused: Arc<AtomicBool>,
+    rate: Arc<AtomicU32>,
+    clock: Arc<PlaybackClock>,
+}
+
+/// Enough time to absorb ordinary sentence variance and one slower synthesis,
+/// while the sentence cap and disk budget keep the controller bounded.
+const PREFETCH_TARGET_WALL: Duration = Duration::from_secs(24);
 
 impl Pipeline {
     fn new(capacity: usize) -> Self {
@@ -216,8 +223,25 @@ impl Pipeline {
             ready: Condvar::new(),
             room: Condvar::new(),
             capacity,
+            transport: None,
             era: AtomicU64::new(0),
             closed: AtomicBool::new(false),
+        }
+    }
+
+    fn with_transport(
+        capacity: usize,
+        paused: Arc<AtomicBool>,
+        rate: Arc<AtomicU32>,
+        clock: Arc<PlaybackClock>,
+    ) -> Self {
+        Self {
+            transport: Some(TransportWindow {
+                paused,
+                rate,
+                clock,
+            }),
+            ..Self::new(capacity)
         }
     }
 
@@ -265,16 +289,55 @@ impl Pipeline {
     /// is no longer wanted.
     fn wait_for_room(&self, era: u64) -> bool {
         let mut queue = self.lock();
-        while queue.len() >= self.capacity {
+        while self.window_full(&queue) {
             if self.is_closed() || self.is_stale(era) {
                 return false;
             }
-            queue = self
+            let (next, _) = self
                 .room
-                .wait(queue)
+                .wait_timeout(queue, Duration::from_millis(100))
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            queue = next;
         }
         !self.is_closed() && !self.is_stale(era)
+    }
+
+    fn window_full(&self, queue: &VecDeque<Rendered>) -> bool {
+        if queue.len() >= self.capacity {
+            return true;
+        }
+        let Some(transport) = &self.transport else {
+            return false;
+        };
+        // Pause freezes demand. A synthesis already in progress may still land
+        // in `push`, but the controller does not start another one.
+        if transport.paused.load(Ordering::SeqCst) {
+            return true;
+        }
+
+        let queued_ms = queue
+            .iter()
+            .map(|rendered| rendered.clip.ms)
+            .fold(0u64, u64::saturating_add);
+        let active_ms = transport
+            .clock
+            .position()
+            .filter(|position| !position.finished)
+            .map(|position| {
+                position
+                    .duration
+                    .saturating_sub(position.elapsed)
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64
+            })
+            .unwrap_or(0);
+        let source = Duration::from_millis(queued_ms.saturating_add(active_ms));
+        let wall = source.div_f32(playback_rate(&transport.rate));
+        wall >= PREFETCH_TARGET_WALL
+    }
+
+    fn transport_changed(&self) {
+        self.room.notify_all();
     }
 
     /// Hand a finished clip to the player. `false` means it was dropped.
@@ -320,6 +383,7 @@ pub struct PlaybackControl {
     pipeline: Arc<Pipeline>,
     era: u64,
     paused: Arc<AtomicBool>,
+    rate: Arc<AtomicU32>,
     clock: Arc<PlaybackClock>,
     events: Sender<SpeechEvent>,
     id: u64,
@@ -337,6 +401,11 @@ impl PlaybackControl {
         self.paused.load(Ordering::SeqCst)
     }
 
+    /// Playback tempo, independent of the audio the model rendered.
+    pub fn rate(&self) -> f32 {
+        playback_rate(&self.rate)
+    }
+
     /// Commit the only start that matters: the player has accepted the clip
     /// and its presentation timestamp is now advancing.
     pub fn started(&self) {
@@ -347,6 +416,7 @@ impl PlaybackControl {
             self.ms,
             self.era,
             self.paused(),
+            self.rate(),
         ) {
             let _ = self.events.send(SpeechEvent::Started {
                 id: self.id,
@@ -427,6 +497,7 @@ enum ClockSource {
     Estimated {
         elapsed: Duration,
         running_since: Option<Instant>,
+        rate: f32,
     },
     /// An embedded audio callback is authoritative. Wall time never advances
     /// this source; only an absolute presented-frame report can move it.
@@ -443,8 +514,9 @@ impl ClockClip {
             ClockSource::Estimated {
                 elapsed,
                 running_since,
+                rate,
             } => running_since
-                .map(|started| elapsed + started.elapsed())
+                .map(|started| elapsed + started.elapsed().mul_f32(rate))
                 .unwrap_or(elapsed),
             ClockSource::Frames { elapsed, .. } => elapsed,
         }
@@ -484,6 +556,7 @@ impl PlaybackClock {
         ms: u64,
         era: u64,
         paused: bool,
+        rate: f32,
     ) -> bool {
         let mut slot = self.lock();
         if slot
@@ -499,6 +572,7 @@ impl PlaybackClock {
             source: ClockSource::Estimated {
                 elapsed: Duration::ZERO,
                 running_since: (!paused).then(Instant::now),
+                rate,
             },
             duration: Duration::from_millis(ms),
             finished: false,
@@ -567,9 +641,10 @@ impl PlaybackClock {
             ClockSource::Estimated {
                 elapsed,
                 running_since,
+                rate,
             } => {
                 if let Some(started) = running_since.take() {
-                    *elapsed = (*elapsed + started.elapsed()).min(clip.duration);
+                    *elapsed = (*elapsed + started.elapsed().mul_f32(*rate)).min(clip.duration);
                 }
             }
             ClockSource::Frames { paused, .. } => *paused = true,
@@ -597,6 +672,27 @@ impl PlaybackClock {
         self.changed.notify_all();
     }
 
+    fn set_rate(&self, rate: f32) {
+        let mut slot = self.lock();
+        let Some(clip) = slot.as_mut() else {
+            return;
+        };
+        if let ClockSource::Estimated {
+            elapsed,
+            running_since,
+            rate: current,
+        } = &mut clip.source
+        {
+            if let Some(started) = running_since.as_mut() {
+                *elapsed = (*elapsed + started.elapsed().mul_f32(*current)).min(clip.duration);
+                *started = Instant::now();
+            }
+            *current = rate;
+        }
+        drop(slot);
+        self.changed.notify_all();
+    }
+
     fn finish(&self, era: u64) {
         let mut slot = self.lock();
         let Some(clip) = slot.as_mut().filter(|clip| clip.era == era) else {
@@ -606,6 +702,7 @@ impl PlaybackClock {
             ClockSource::Estimated {
                 elapsed,
                 running_since,
+                ..
             } => {
                 *elapsed = clip.duration;
                 *running_since = None;
@@ -672,12 +769,17 @@ fn frames_duration(frames: u64, sample_rate: u32) -> Duration {
     Duration::from_nanos(nanos.min(u64::MAX as u128) as u64)
 }
 
+fn playback_rate(rate: &AtomicU32) -> f32 {
+    f32::from_bits(rate.load(Ordering::Relaxed)).clamp(0.5, 3.0)
+}
+
 /// Background speech: one thread rendering, one playing, `prefetch` clips of
 /// slack between them.
 pub struct Speaker {
     commands: Sender<Command>,
     events: Receiver<SpeechEvent>,
     paused: Arc<AtomicBool>,
+    rate: Arc<AtomicU32>,
     clock: Arc<PlaybackClock>,
     pipeline: Arc<Pipeline>,
     /// Sentences accepted but not yet finished playing. Zero means the reader
@@ -693,11 +795,22 @@ pub struct Speaker {
 }
 
 impl Speaker {
-    /// Start the two threads. `prefetch` is how many sentences may be rendered
-    /// ahead of the one being played.
+    /// Start the two threads. `prefetch` is the sentence hard cap around the
+    /// playback-aware wall-clock runway target.
     pub fn spawn(
         synth: Box<dyn Synthesizer>,
         scratch: std::path::PathBuf,
+        prefetch: usize,
+    ) -> Self {
+        let cache = scratch.join("cache-v1");
+        Self::spawn_cached(synth, scratch, cache, prefetch)
+    }
+
+    /// Start a speaker with scratch and reusable audio in separate roots.
+    pub fn spawn_cached(
+        synth: Box<dyn Synthesizer>,
+        scratch: std::path::PathBuf,
+        cache: std::path::PathBuf,
         prefetch: usize,
     ) -> Self {
         let synth: Arc<dyn Synthesizer> = Arc::from(synth);
@@ -705,8 +818,14 @@ impl Speaker {
         let (commands, command_rx) = channel::<Command>();
         let (event_tx, events) = channel::<SpeechEvent>();
         let paused = Arc::new(AtomicBool::new(false));
+        let rate = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let clock = Arc::new(PlaybackClock::default());
-        let pipeline = Arc::new(Pipeline::new(prefetch.max(1)));
+        let pipeline = Arc::new(Pipeline::with_transport(
+            prefetch.max(1),
+            Arc::clone(&paused),
+            Arc::clone(&rate),
+            Arc::clone(&clock),
+        ));
         let inflight = Arc::new(AtomicUsize::new(0));
 
         let render = std::thread::Builder::new()
@@ -716,7 +835,11 @@ impl Speaker {
                 let pipeline = Arc::clone(&pipeline);
                 let inflight = Arc::clone(&inflight);
                 let events = event_tx.clone();
-                move || render_loop(synth, scratch, command_rx, events, pipeline, inflight)
+                move || {
+                    render_loop(
+                        synth, scratch, cache, command_rx, events, pipeline, inflight,
+                    )
+                }
             })
             .ok();
 
@@ -726,8 +849,9 @@ impl Speaker {
                 let pipeline = Arc::clone(&pipeline);
                 let inflight = Arc::clone(&inflight);
                 let paused = Arc::clone(&paused);
+                let rate = Arc::clone(&rate);
                 let clock = Arc::clone(&clock);
-                move || play_loop(synth, event_tx, pipeline, inflight, paused, clock)
+                move || play_loop(synth, event_tx, pipeline, inflight, paused, rate, clock)
             })
             .ok();
 
@@ -735,6 +859,7 @@ impl Speaker {
             commands,
             events,
             paused,
+            rate,
             clock,
             pipeline,
             inflight,
@@ -776,19 +901,33 @@ impl Speaker {
         if text.trim().is_empty() {
             return;
         }
-        let _ = self.commands.send(Command::Warm(text.to_string()));
+        let _ = self.commands.send(Command::Warm {
+            text: text.to_string(),
+            era: self.pipeline.era(),
+        });
     }
 
     /// Freeze the current clip at its audio cursor, leaving the queue intact.
     pub fn pause(&self) {
         self.paused.store(true, Ordering::SeqCst);
         self.clock.wait_until_paused();
+        self.pipeline.transport_changed();
     }
 
     /// Continue the same clip from the audio cursor held by [`Speaker::pause`].
     pub fn resume(&self) {
         self.paused.store(false, Ordering::SeqCst);
         self.clock.wait_until_running();
+        self.pipeline.transport_changed();
+    }
+
+    /// Change tempo at the live playback cursor. Rendered and prefetched clips
+    /// remain valid because model synthesis is always canonical 1× audio.
+    pub fn set_rate(&self, rate: f32) {
+        let rate = rate.clamp(0.5, 3.0);
+        self.rate.store(rate.to_bits(), Ordering::Relaxed);
+        self.clock.set_rate(rate);
+        self.pipeline.transport_changed();
     }
 
     /// The single presentation timestamp sampled by text and highlighting.
@@ -883,12 +1022,14 @@ fn forget(inflight: &AtomicUsize) {
 fn render_loop(
     synth: Arc<dyn Synthesizer>,
     scratch: std::path::PathBuf,
+    cache_dir: std::path::PathBuf,
     commands: Receiver<Command>,
     events: Sender<SpeechEvent>,
     pipeline: Arc<Pipeline>,
     inflight: Arc<AtomicUsize>,
 ) {
     let _ = std::fs::create_dir_all(&scratch);
+    let cache = SpeechCache::new(cache_dir, synth.cache_identity());
     let mut sequence = 0u64;
     // One sentence rendered before it was asked for, and the text it says. One
     // slot, because there is only ever one next paragraph.
@@ -908,14 +1049,17 @@ fn render_loop(
     while let Ok(command) = commands.recv() {
         let job = match command {
             Command::Speak(job) => job,
-            Command::Warm(text) => {
+            Command::Warm { text, era } => {
+                if pipeline.is_stale(era) || !pipeline.wait_for_room(era) {
+                    continue;
+                }
                 if warm.as_ref().is_none_or(|(had, _)| *had != text) {
                     sequence += 1;
                     let out = scratch.join(format!("warm-{sequence}.wav"));
                     // A failed warm-up is a slower boundary, not an error: if
                     // the engine is really gone, the sentence itself will say
                     // so a moment later, in front of the reader.
-                    if let Ok(clip) = synth.synthesize(&text, &out)
+                    if let Ok(clip) = cache.render(synth.as_ref(), &text, &out)
                         && let Some((_, stale)) = warm.replace((text, clip))
                     {
                         let _ = std::fs::remove_file(&stale.path);
@@ -935,7 +1079,11 @@ fn render_loop(
             Some((_, clip)) => Ok(clip),
             None => {
                 sequence += 1;
-                synth.synthesize(&job.text, &scratch.join(format!("utt-{sequence}.wav")))
+                cache.render(
+                    synth.as_ref(),
+                    &job.text,
+                    &scratch.join(format!("utt-{sequence}.wav")),
+                )
             }
         };
         match rendered {
@@ -958,6 +1106,138 @@ fn render_loop(
     pipeline.close();
 }
 
+/// Content-addressed canonical WAVs. Playback always receives a disposable
+/// scratch copy, so stopping or finishing a clip cannot evict the durable copy.
+struct SpeechCache {
+    dir: std::path::PathBuf,
+    identity: String,
+    recency: Mutex<HashMap<std::path::PathBuf, u64>>,
+    sequence: AtomicU64,
+}
+
+const SPEECH_CACHE_MAX_ENTRIES: usize = 128;
+const SPEECH_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+static SPEECH_CACHE_TMP: AtomicU64 = AtomicU64::new(0);
+
+impl SpeechCache {
+    fn new(dir: std::path::PathBuf, identity: String) -> Self {
+        Self {
+            dir,
+            identity,
+            recency: Mutex::new(HashMap::new()),
+            sequence: AtomicU64::new(0),
+        }
+    }
+
+    fn path(&self, text: &str) -> std::path::PathBuf {
+        let mut digest = Sha256::new();
+        digest.update(b"readio-speech-v1\0");
+        digest.update(self.identity.as_bytes());
+        digest.update(b"\0");
+        digest.update(text.as_bytes());
+        self.dir.join(format!("{:x}.wav", digest.finalize()))
+    }
+
+    fn render(&self, synth: &dyn Synthesizer, text: &str, out: &Path) -> Result<Clip> {
+        let cached = self.path(text);
+        if let Ok(ms) = wav::duration_ms(&cached) {
+            self.touch(&cached);
+            std::fs::copy(&cached, out)?;
+            return Ok(Clip {
+                path: out.to_path_buf(),
+                ms,
+            });
+        }
+        let _ = std::fs::remove_file(&cached);
+
+        let rendered = synth.synthesize(text, out)?;
+        // Trust neither an engine's return value nor the mere existence of its
+        // output. Only a WAV the same parser used by playback accepts is cached.
+        let ms = wav::duration_ms(&rendered.path)?;
+        std::fs::create_dir_all(&self.dir)?;
+        let tmp = cached.with_extension(format!(
+            "{}.{}.tmp",
+            std::process::id(),
+            SPEECH_CACHE_TMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::copy(&rendered.path, &tmp)?;
+        if let Err(err) = std::fs::rename(&tmp, &cached) {
+            let _ = std::fs::remove_file(&tmp);
+            // Another reader may have won the same content-addressed entry.
+            if !cached.exists() {
+                return Err(err.into());
+            }
+        }
+        self.touch(&cached);
+        let _ = self.prune();
+        Ok(Clip {
+            path: rendered.path,
+            ms,
+        })
+    }
+
+    fn touch(&self, path: &Path) {
+        let tick = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
+        self.recency
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path.to_path_buf(), tick);
+    }
+
+    fn prune(&self) -> std::io::Result<()> {
+        let remembered = self
+            .recency
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut entries = std::fs::read_dir(&self.dir)?
+            .filter_map(std::result::Result::ok)
+            .filter_map(|entry| {
+                let path = entry.path();
+                if path.extension().is_none_or(|ext| ext != "wav") {
+                    return None;
+                }
+                let metadata = entry.metadata().ok()?;
+                let disk_age = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|when| when.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|age| age.as_millis().min(u64::MAX as u128) as u64)
+                    .unwrap_or(0);
+                Some((
+                    remembered
+                        .get(&path)
+                        .copied()
+                        .map_or((0, disk_age), |tick| (1, tick)),
+                    metadata.len(),
+                    path,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let mut bytes = entries
+            .iter()
+            .map(|(_, len, _)| *len)
+            .fold(0u64, u64::saturating_add);
+        entries.sort_by_key(|(age, _, _)| *age);
+
+        let mut count = entries.len();
+        for (_, len, path) in entries {
+            if count <= SPEECH_CACHE_MAX_ENTRIES && bytes <= SPEECH_CACHE_MAX_BYTES {
+                break;
+            }
+            if std::fs::remove_file(&path).is_ok() {
+                count = count.saturating_sub(1);
+                bytes = bytes.saturating_sub(len);
+                self.recency
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&path);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Play rendered clips in order and report where the audio is.
 fn play_loop(
     synth: Arc<dyn Synthesizer>,
@@ -965,6 +1245,7 @@ fn play_loop(
     pipeline: Arc<Pipeline>,
     inflight: Arc<AtomicUsize>,
     paused: Arc<AtomicBool>,
+    rate: Arc<AtomicU32>,
     clock: Arc<PlaybackClock>,
 ) {
     while let Some(Rendered { job, clip }) = pipeline.pop() {
@@ -978,6 +1259,7 @@ fn play_loop(
             pipeline: Arc::clone(&pipeline),
             era: job.era,
             paused: Arc::clone(&paused),
+            rate: Arc::clone(&rate),
             clock: Arc::clone(&clock),
             events: events.clone(),
             id: job.id,
@@ -1008,6 +1290,7 @@ fn play_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -1096,7 +1379,7 @@ mod tests {
         fn synthesize(&self, _text: &str, out: &Path) -> Result<Clip> {
             self.note("render-start");
             std::thread::sleep(self.synth);
-            std::fs::write(out, b"")?;
+            std::fs::write(out, wav::silence(self.play.as_millis() as u64, 24_000))?;
             self.note("render-end");
             Ok(Clip {
                 path: out.to_path_buf(),
@@ -1279,6 +1562,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Playback may consume a scratch copy, but a validated canonical WAV is
+    /// retained for the next occurrence. Playback rate is deliberately changed
+    /// between requests: including it in the cache key would couple transport
+    /// state back into synthesis and make this render twice.
+    #[test]
+    fn a_validated_clip_is_reused_across_playback_rates() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let dir = scratch("cache-rate");
+        let mut speaker = Speaker::spawn(Box::new(Fake::new(&log, 20, 40)), dir.clone(), 2);
+
+        speaker.speak(1, "same sentence.", (0, 14));
+        assert_eq!(wait_for_finishes(&mut speaker, 1), 1, "first playback");
+        speaker.set_rate(2.0);
+        speaker.speak(2, "same sentence.", (0, 14));
+        assert_eq!(wait_for_finishes(&mut speaker, 1), 1, "cached playback");
+
+        assert_eq!(
+            count(&log, "render-start"),
+            1,
+            "playback rate entered the synthesis cache key, or no durable cache was used"
+        );
+        drop(speaker);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A long book must not turn prefetch into an unbounded second audiobook
+    /// on disk. The current and queued scratch clips are separate; this counts
+    /// only reusable content-addressed entries.
+    #[test]
+    fn speech_cache_has_a_hard_entry_budget() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let dir = scratch("cache-budget");
+        let mut speaker = Speaker::spawn(Box::new(Fake::new(&log, 0, 1)), dir.clone(), 8);
+        for n in 0..130u64 {
+            let text = format!("unique sentence {n}.");
+            speaker.speak(n, &text, (0, text.len()));
+        }
+        assert_eq!(wait_for_finishes(&mut speaker, 130), 130);
+
+        let entries = std::fs::read_dir(dir.join("cache-v1"))
+            .expect("speech cache")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "wav"))
+            .count();
+        assert!(
+            entries <= 128,
+            "the reusable speech cache grew to {entries} entries"
+        );
+
+        drop(speaker);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Prefetch is a window, not a licence to render the whole chapter: a slow
     /// player must not have a hundred wavs piling up behind it.
     ///
@@ -1298,7 +1634,8 @@ mod tests {
             2,
         );
         for n in 0..6u64 {
-            speaker.speak(n, "a sentence.", (0, 11));
+            let text = format!("sentence {n}.");
+            speaker.speak(n, &text, (0, text.len()));
         }
 
         // One clip in the player, `prefetch` queued behind it, and there the
@@ -1319,6 +1656,91 @@ mod tests {
         hold.store(false, Ordering::SeqCst);
         drop(speaker);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct RunwayFake {
+        log: Log,
+        hold: Arc<AtomicBool>,
+        media_ms: u64,
+    }
+
+    impl Synthesizer for RunwayFake {
+        fn synthesize(&self, _text: &str, out: &Path) -> Result<Clip> {
+            self.log
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(("render-start", Instant::now()));
+            std::fs::write(out, wav::silence(self.media_ms, 24_000))?;
+            Ok(Clip {
+                path: out.to_path_buf(),
+                ms: self.media_ms,
+            })
+        }
+
+        fn play(&self, _clip: &Clip, control: &PlaybackControl) -> Result<()> {
+            control.started();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while self.hold.load(Ordering::SeqCst)
+                && !control.cancelled()
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Ok(())
+        }
+
+        fn describe(&self) -> String {
+            format!("runway-fake-{}", self.media_ms)
+        }
+    }
+
+    fn rendered_runway_at(rate: f32, tag: &str) -> (usize, Arc<AtomicBool>, Speaker, PathBuf) {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let hold = Arc::new(AtomicBool::new(true));
+        let dir = scratch(tag);
+        let mut speaker = Speaker::spawn(
+            Box::new(RunwayFake {
+                log: Arc::clone(&log),
+                hold: Arc::clone(&hold),
+                media_ms: 10_000,
+            }),
+            dir.clone(),
+            8,
+        );
+        speaker.set_rate(rate);
+        for n in 0..10 {
+            speaker.speak(n, &format!("sentence {n}."), (0, 10));
+        }
+
+        let minimum = if rate > 1.0 { 5 } else { 3 };
+        assert_eq!(count_at_least(&log, "render-start", minimum), minimum);
+        std::thread::sleep(Duration::from_millis(120));
+        (count(&log, "render-start"), hold, speaker, dir)
+    }
+
+    /// The controller optimises wall-clock runway from the live media cursor.
+    /// Ten seconds of canonical audio buys ten seconds at 1× but only five at
+    /// 2×, so the faster transport must render farther ahead without simply
+    /// filling the sentence cap in both cases.
+    #[test]
+    fn prefetch_window_uses_playback_runway_and_rate() {
+        let (normal, normal_hold, normal_speaker, normal_dir) =
+            rendered_runway_at(1.0, "runway-normal");
+        let (fast, fast_hold, fast_speaker, fast_dir) = rendered_runway_at(2.0, "runway-fast");
+
+        assert_eq!(normal, 3, "1× should stop near the 24s runway target");
+        assert_eq!(
+            fast, 5,
+            "2× needs twice as much source audio for that target"
+        );
+        assert!(fast < 9, "the local optimum ignored the sentence hard cap");
+
+        normal_hold.store(false, Ordering::SeqCst);
+        fast_hold.store(false, Ordering::SeqCst);
+        drop(normal_speaker);
+        drop(fast_speaker);
+        let _ = std::fs::remove_dir_all(normal_dir);
+        let _ = std::fs::remove_dir_all(fast_dir);
     }
 
     #[test]
@@ -1345,6 +1767,30 @@ mod tests {
             1,
             "resume rendered the same sentence a second time"
         );
+        drop(speaker);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The app may identify the next paragraph while paused, but demand is
+    /// frozen. The candidate stays queued and only becomes synthesis work when
+    /// the transport resumes.
+    #[test]
+    fn pause_does_not_expand_the_boundary_prefetch_window() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let dir = scratch("paused-prefetch");
+        let speaker = Speaker::spawn(Box::new(Fake::new(&log, 20, 20)), dir.clone(), 8);
+
+        speaker.pause();
+        speaker.prerender("next paragraph.");
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            count(&log, "render-start"),
+            0,
+            "a paused transport expanded its prefetch window"
+        );
+
+        speaker.resume();
+        assert_eq!(count_at_least(&log, "render-end", 1), 1);
         drop(speaker);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1467,11 +1913,10 @@ mod tests {
         );
     }
 
-    /// A speed change throws away everything rendered at the old speed. The
-    /// clips are gone and their files with them; the reader hears the new speed
-    /// on the next sentence rather than after the queue drains.
+    /// A real stop throws away unplayed scratch clips. Reusable canonical WAVs
+    /// remain in the bounded cache; changing playback speed does not call this.
     #[test]
-    fn stopping_discards_clips_rendered_at_the_old_speed() {
+    fn stopping_discards_unplayed_scratch_clips() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let fake = Fake::new(&log, 10, 200);
         let dir = scratch("flush");
@@ -1486,7 +1931,12 @@ mod tests {
         // Give the threads a moment, then check no wav was left behind.
         std::thread::sleep(Duration::from_millis(250));
         let leftovers = std::fs::read_dir(&dir)
-            .map(|entries| entries.filter_map(Result::ok).count())
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.path().is_file())
+                    .count()
+            })
             .unwrap_or(0);
         assert_eq!(
             leftovers, 0,

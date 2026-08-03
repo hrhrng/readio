@@ -588,6 +588,92 @@ fn read_aloud_exposes_and_obeys_bracket_speed_keys() {
     );
 }
 
+/// Playback speed belongs to the live audio cursor, not to synthesis.
+///
+/// A bracket press must keep the same clip and presentation timestamp alive.
+/// Replacing the speaker resets that timestamp to `None`, creates a model wait,
+/// and briefly gives the passage back to the ordinary character pacer.
+#[test]
+fn speed_change_keeps_the_same_audio_cursor_moving() {
+    let _guard = exclusive();
+    let (mut app, mut terminal) = fixture_with(
+        long_chapters(common::isolated_home()),
+        SYNTH_MS,
+        LONG_CLIP_MS,
+    );
+    start_reading_aloud(&mut app, &mut terminal);
+    until(&mut app, &mut terminal, "a live audio cursor", |app| {
+        app.voice_position()
+            .is_some_and(|position| position.elapsed >= Duration::from_millis(100))
+    });
+    let before = app.voice_position().expect("a playback position");
+
+    app.on_key(KeyEvent::from(KeyCode::Char(']')));
+    let after_key = app
+        .voice_position()
+        .expect("changing playback speed must not discard the audio cursor");
+    assert_eq!(after_key.id, before.id, "the playing clip was replaced");
+    assert_eq!(
+        after_key.range, before.range,
+        "playback restarted from another sentence"
+    );
+    assert!(
+        after_key.elapsed >= before.elapsed,
+        "the audio pointer moved backwards"
+    );
+
+    until(
+        &mut app,
+        &mut terminal,
+        "the same faster cursor to advance",
+        |app| {
+            app.voice_position().is_some_and(|position| {
+                position.id == before.id
+                    && position.range == before.range
+                    && position.elapsed >= before.elapsed + Duration::from_millis(200)
+            })
+        },
+    );
+    assert_eq!(
+        app.mode(),
+        readio::mode::Mode::Speak,
+        "changing speed must leave read-aloud as the only active pacing mode"
+    );
+}
+
+/// The multiplier changes media time, not merely the label in the chrome.
+#[test]
+fn playback_rate_controls_the_live_media_clock() {
+    let _guard = exclusive();
+    let (mut app, mut terminal) = fixture_with(
+        long_chapters(common::isolated_home()),
+        SYNTH_MS,
+        LONG_CLIP_MS,
+    );
+    start_reading_aloud(&mut app, &mut terminal);
+    until(&mut app, &mut terminal, "a live audio cursor", |app| {
+        app.voice_position()
+            .is_some_and(|position| position.elapsed >= Duration::from_millis(100))
+    });
+
+    // 1× → 1.25× → 1.5× → 2×.
+    for _ in 0..3 {
+        app.on_key(KeyEvent::from(KeyCode::Char(']')));
+    }
+    let before = app.voice_position().expect("a playback position");
+    let wall_start = Instant::now();
+    while wall_start.elapsed() < Duration::from_millis(300) {
+        tick(&mut app, &mut terminal);
+    }
+    let after = app.voice_position().expect("the same playback position");
+    let media_advance = after.elapsed.saturating_sub(before.elapsed);
+    assert!(
+        media_advance >= Duration::from_millis(450),
+        "2× was only worth {media_advance:?} of media time in {:?} of wall time",
+        wall_start.elapsed()
+    );
+}
+
 /// Enter must not take the pace away from the voice.
 ///
 /// `⏎` during a turn means "get on with it", and it did that by setting the

@@ -445,7 +445,7 @@ voice:
   name: audiobook         # a voice the downloaded model knows
   language: zh            # explicit; text never switches it per sentence
   params: ""              # model-specific parameters; empty keeps defaults
-  prefetch: 2             # sentences rendered ahead of the one playing
+  prefetch: 8             # hard cap; actual prefetch targets ~24s of playback runway
   books:                  # only the books that asked for something else
     3f9a1c7d5e2b4a10:
       title: 论语         # written for you to read; nothing reads it back
