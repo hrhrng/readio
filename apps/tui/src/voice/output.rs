@@ -24,9 +24,9 @@ pub(super) const INTERNAL_PLAYER: &str = "@readio";
 struct PcmCursor {
     samples: Vec<f32>,
     channels: usize,
-    next_sample: usize,
-    pending_frames: u64,
-    presented_frames: u64,
+    next_frame: f64,
+    pending_frame: Option<f64>,
+    presented_frame: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,9 +67,9 @@ impl PcmCursor {
         Self {
             samples,
             channels: channels.max(1),
-            next_sample: 0,
-            pending_frames: 0,
-            presented_frames: 0,
+            next_frame: 0.0,
+            pending_frame: None,
+            presented_frame: 0.0,
         }
     }
 
@@ -78,26 +78,38 @@ impl PcmCursor {
     /// The previous submission is committed first: another callback means the
     /// device callback has crossed that period boundary. A paused callback submits only
     /// the zeroes already written below and leaves the PCM cursor untouched.
-    fn fill(&mut self, output: &mut [f32], paused: bool) -> FrameReport {
+    fn fill(&mut self, output: &mut [f32], paused: bool, rate: f32) -> FrameReport {
         output.fill(0.0);
-        self.presented_frames = self.presented_frames.saturating_add(self.pending_frames);
-        self.pending_frames = 0;
+        if let Some(pending) = self.pending_frame.take() {
+            self.presented_frame = pending;
+        }
 
+        let total_frames = self.samples.len() / self.channels;
+        let mut submitted = 0usize;
         if !paused {
             let capacity = output.len() / self.channels;
-            let available = self.samples.len().saturating_sub(self.next_sample) / self.channels;
-            let submitted = capacity.min(available);
-            let sample_count = submitted * self.channels;
-            output[..sample_count]
-                .copy_from_slice(&self.samples[self.next_sample..self.next_sample + sample_count]);
-            self.next_sample += sample_count;
-            self.pending_frames = submitted as u64;
+            let step = rate.clamp(0.5, 3.0) as f64;
+            while submitted < capacity && self.next_frame < total_frames as f64 {
+                let at = self.next_frame.floor() as usize;
+                let next = (at + 1).min(total_frames.saturating_sub(1));
+                let fraction = (self.next_frame - at as f64) as f32;
+                for channel in 0..self.channels {
+                    let a = self.samples[at * self.channels + channel];
+                    let b = self.samples[next * self.channels + channel];
+                    output[submitted * self.channels + channel] = a + (b - a) * fraction;
+                }
+                submitted += 1;
+                self.next_frame = (self.next_frame + step).min(total_frames as f64);
+            }
+            if submitted > 0 {
+                self.pending_frame = Some(self.next_frame);
+            }
         }
 
         FrameReport {
-            presented_frames: self.presented_frames,
-            submitted_frames: self.pending_frames,
-            drained: self.next_sample == self.samples.len() && self.pending_frames == 0,
+            presented_frames: self.presented_frame.floor() as u64,
+            submitted_frames: submitted as u64,
+            drained: self.next_frame >= total_frames as f64 && self.pending_frame.is_none(),
         }
     }
 }
@@ -119,6 +131,7 @@ fn play_with_backends(
     let state = Arc::new(CallbackState::default());
     let callback_state = Arc::clone(&state);
     let requested_pause = Arc::clone(&control.paused);
+    let requested_rate = Arc::clone(&control.rate);
     let mut cursor = PcmCursor::new(decoded.samples, decoded.channels);
     let mut untyped = DeviceBuilder::playback();
     let mut builder = untyped.f32();
@@ -135,7 +148,7 @@ fn play_with_backends(
         .with_callback(move |_device, output| {
             let paused = requested_pause.load(Ordering::SeqCst);
             let silent = paused || callback_state.cancelled.load(Ordering::SeqCst);
-            let report = cursor.fill(output, silent);
+            let report = cursor.fill(output, silent, super::playback_rate(&requested_rate));
             callback_state
                 .presented
                 .store(report.presented_frames, Ordering::Release);
@@ -189,7 +202,9 @@ fn decode(path: &std::path::Path) -> Result<Decoded> {
     let info = super::wav::info(&bytes)?;
     let channels = info.channels as usize;
     let sample_rate = SampleRate::try_from(info.sample_rate).map_err(|err| anyhow!("{err:?}"))?;
-    let mut decoder = DecoderBuilder::new_f32(info.channels as u32, sample_rate)
+    let mut decoder = DecoderBuilder::new_f32()
+        .channels(info.channels as u32)
+        .sample_rate(sample_rate)
         .copy_memory(Arc::<[u8]>::from(bytes))
         .map_err(|err| anyhow!("decode wav {}: {err:?}", path.display()))?;
     let capacity = usize::try_from(info.frames())
@@ -214,6 +229,95 @@ fn decode(path: &std::path::Path) -> Result<Decoded> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use crate::voice::{Pipeline, PlaybackClock};
+
+    /// A started device is not enough: the callback must consume the clip and
+    /// let the blocking playback call return. This exercises the same default
+    /// backend as a real read-aloud session, because a device that reports a
+    /// successful start without invoking its callback otherwise leaves the
+    /// player thread asleep forever.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn default_output_consumes_a_short_pcm_clip() {
+        let path =
+            std::env::temp_dir().join(format!("readio-output-{}-short.wav", std::process::id()));
+        std::fs::write(&path, crate::voice::wav::silence(80, 48_000)).expect("write test wav");
+
+        let pipeline = Arc::new(Pipeline::new(1));
+        let clock = Arc::new(PlaybackClock::default());
+        let (events, _event_rx) = mpsc::channel();
+        let control = PlaybackControl {
+            pipeline,
+            era: 0,
+            paused: Arc::new(AtomicBool::new(false)),
+            rate: Arc::new(std::sync::atomic::AtomicU32::new(1.0f32.to_bits())),
+            clock,
+            events,
+            id: 1,
+            range: (0, 1),
+            chars: 1,
+            ms: 80,
+        };
+        let (finished, result) = mpsc::channel();
+        let played = path.clone();
+        std::thread::spawn(move || {
+            let _ = finished.send(play(&played, &control));
+        });
+
+        let outcome = result
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the audio device started but its callback never consumed the clip");
+        outcome.expect("play short PCM clip");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The embedded transport consumes canonical PCM at the selected rate; it
+    /// never asks the synthesizer for another version of the clip.
+    #[test]
+    fn pcm_output_applies_playback_rate() {
+        let path =
+            std::env::temp_dir().join(format!("readio-output-{}-rate.wav", std::process::id()));
+        std::fs::write(&path, crate::voice::wav::silence(800, 48_000)).expect("write test wav");
+
+        let pipeline = Arc::new(Pipeline::new(1));
+        let clock = Arc::new(PlaybackClock::default());
+        let (events, event_rx) = mpsc::channel();
+        let control = PlaybackControl {
+            pipeline,
+            era: 0,
+            paused: Arc::new(AtomicBool::new(false)),
+            rate: Arc::new(std::sync::atomic::AtomicU32::new(2.0f32.to_bits())),
+            clock,
+            events,
+            id: 1,
+            range: (0, 1),
+            chars: 1,
+            ms: 800,
+        };
+        let (finished, result) = mpsc::channel();
+        let played = path.clone();
+        std::thread::spawn(move || {
+            let outcome = play_with_backends(&played, &control, &[Backend::Null]);
+            let _ = finished.send(outcome);
+        });
+
+        event_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("PCM playback never started");
+        let started = std::time::Instant::now();
+        result
+            .recv_timeout(Duration::from_millis(600))
+            .expect("2× PCM playback still consumed the clip at 1×")
+            .expect("play rate-adjusted PCM clip");
+        assert!(
+            started.elapsed() < Duration::from_millis(600),
+            "800ms of media did not finish inside the 2× playback window"
+        );
+        let _ = std::fs::remove_file(path);
+    }
 
     /// The buffer submitted by callback N is only considered presented when
     /// callback N+1 arrives. This keeps the UI behind the callback boundary
@@ -223,26 +327,26 @@ mod tests {
         let mut cursor = PcmCursor::new(vec![0.1, 0.2, 0.3, 0.4], 1);
         let mut output = [0.0; 2];
 
-        let first = cursor.fill(&mut output, false);
+        let first = cursor.fill(&mut output, false, 1.0);
         assert_eq!(output, [0.1, 0.2]);
         assert_eq!(first.presented_frames, 0);
         assert_eq!(first.submitted_frames, 2);
 
-        let paused = cursor.fill(&mut output, true);
+        let paused = cursor.fill(&mut output, true, 1.0);
         assert_eq!(output, [0.0, 0.0]);
         assert_eq!(paused.presented_frames, 2);
         assert_eq!(paused.submitted_frames, 0);
 
-        let held = cursor.fill(&mut output, true);
+        let held = cursor.fill(&mut output, true, 1.0);
         assert_eq!(held.presented_frames, 2);
         assert_eq!(held.submitted_frames, 0);
 
-        let resumed = cursor.fill(&mut output, false);
+        let resumed = cursor.fill(&mut output, false, 1.0);
         assert_eq!(output, [0.3, 0.4]);
         assert_eq!(resumed.presented_frames, 2);
         assert_eq!(resumed.submitted_frames, 2);
 
-        let drained = cursor.fill(&mut output, false);
+        let drained = cursor.fill(&mut output, false, 1.0);
         assert_eq!(drained.presented_frames, 4);
         assert!(drained.drained);
     }

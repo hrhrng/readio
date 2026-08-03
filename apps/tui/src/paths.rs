@@ -74,6 +74,17 @@ pub fn speech_dir() -> PathBuf {
     home().join("speech")
 }
 
+/// Rebuildable content-addressed speech audio.
+///
+/// Unlike live scratch clips this belongs in the platform cache: deleting it
+/// only costs synthesis time, and clearing `~/.readio` should remain about the
+/// reader's library and choices rather than hundreds of megabytes of PCM.
+pub fn speech_cache_dir() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| home().join("cache"))
+        .join("readio/speech-v1")
+}
+
 /// Where readio writes the helper scripts it carries.
 ///
 /// Beside the config rather than in a cache: it is a file the reader is allowed

@@ -105,7 +105,7 @@ pub struct Voice {
     /// the model preset's own defaults.
     #[serde(default)]
     pub params: String,
-    /// How many sentences to synthesize ahead of playback.
+    /// Hard sentence cap for the playback-aware prefetch controller.
     pub prefetch: usize,
     /// Which audio outputs may be spoken through.
     pub output: Output,
@@ -197,7 +197,7 @@ impl Default for Voice {
             name: String::new(),
             language: String::new(),
             params: String::new(),
-            prefetch: 2,
+            prefetch: 8,
             output: Output::default(),
             books: BTreeMap::new(),
             engines: presets(),
@@ -651,8 +651,8 @@ const VOICE_NOTE: &str =
   # params 是模型支持的独立参数；留空使用模型默认值。
   # The playback speed is not here: it is the effort multiplier above, so one
   # ladder covers reading and listening / 倍速在上面的 effort，读和听共用一套。
-  # prefetch: sentences rendered ahead of the one playing, so there is no gap
-  # at a sentence boundary. Raise it if your engine is slow / 提前合成几句
+  # prefetch: hard sentence cap. The controller otherwise targets ~24 seconds
+  # of playback runway and accounts for live speed / 句数硬上限；实际按约 24 秒播放余量调度
 ";
 
 const BOOKS_NOTE: &str =

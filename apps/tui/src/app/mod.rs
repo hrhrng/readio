@@ -473,8 +473,8 @@ impl App {
         }
         // The next turn waits on the voice rather than on the text. Checked
         // here, once, rather than on the idle event: a voice also stops by being
-        // stopped — a speed change re-renders the queue — and every one of those
-        // endings has to release the reader just the same.
+        // stopped by navigation or an explicit interrupt, and every one of
+        // those endings has to release the reader just the same.
         //
         // The threshold is one clip, not none: asking for the next turn while
         // the last sentence is still playing is what keeps the engine rendering
@@ -521,10 +521,9 @@ impl App {
             // coming.
             //
             // What this guards is the other case: audio outlasting its text,
-            // which happens after a rush, or after a speed change re-queues a
-            // passage. Starting the next turn then would pile paragraphs up in
-            // front of a voice still working through this one, so it waits —
-            // the text may not overtake the sound.
+            // which can happen after a rush. Starting the next turn then would
+            // pile paragraphs up in front of a voice still working through
+            // this one, so it waits — the text may not overtake the sound.
             if self.voice_runway() > 1 {
                 self.awaiting_voice = true;
             } else {
@@ -803,35 +802,17 @@ impl App {
 
     /// `/effort <level>` and `^r`: change the pace of everything at once.
     ///
-    /// Clips are rendered at a speed rather than resampled at playback, so
-    /// everything already prefetched is wrong the moment this changes. Dropping
-    /// the speaker throws those away, and re-queueing from the start of the
-    /// sentence that was playing means the reader hears the new pace within a
-    /// sentence instead of at the next passage.
+    /// In read-aloud this changes only the live player's tempo. Canonical TTS
+    /// clips stay valid at every playback speed, so the current audio pointer,
+    /// the prefetched queue and the model cache are all left intact.
     fn set_effort(&mut self, level: Effort) {
         self.cfg.effort.level = level;
         let _ = self.cfg.save();
         self.apply_pace();
-
-        let resume = if self.speech {
-            self.cursor
-                .as_ref()
-                .map(|cursor| cursor.sentence.0)
-                .or_else(|| {
-                    self.turn
-                        .passage_in_flight()
-                        .map(|(_, text, released)| char_to_byte(text, released))
-                })
-        } else {
-            None
-        };
-        let voiced = self.voiced.clone();
-        self.silence();
-        self.speaker = None;
-        if let (Some(from), Some((id, text))) = (resume, voiced)
-            && !self.enqueue_speech_from(id, &text, from)
+        if self.speech
+            && let Some(speaker) = self.speaker.as_ref()
         {
-            self.stop_reading();
+            speaker.set_rate(self.multiplier());
         }
 
         let times = effort::times(self.multiplier());
@@ -904,7 +885,7 @@ impl App {
             // The explicit choice only: left empty, the configured model and
             // language entry provide their declared default.
             chosen.name.clone(),
-            self.multiplier(),
+            1.0,
         )
         .in_language(&chosen.language);
         if !synth.is_available() {
@@ -912,11 +893,14 @@ impl App {
             self.notice(&tf("voice.missing_binary", &[&program]));
             return false;
         }
-        self.speaker = Some(Speaker::spawn(
+        let speaker = Speaker::spawn_cached(
             Box::new(synth),
             paths::speech_dir(),
+            paths::speech_cache_dir(),
             self.cfg.voice.prefetch,
-        ));
+        );
+        speaker.set_rate(self.multiplier());
+        self.speaker = Some(speaker);
         true
     }
 
@@ -933,8 +917,8 @@ impl App {
     /// The same, but skipping everything that ends before `from`. False when the
     /// passage went nowhere.
     ///
-    /// Used when the speed changes mid-passage: the sentences already spoken
-    /// stay spoken, and the one in progress starts again at the new speed.
+    /// Used when navigation resumes partway through a passage: sentences before
+    /// the byte offset stay spoken.
     fn enqueue_speech_from(&mut self, id: u64, text: &str, from: usize) -> bool {
         // Only read-aloud reads aloud. The guard is here rather than at each
         // caller because a passage queued in another mode would take the pace
@@ -1024,9 +1008,10 @@ impl App {
     /// The only thing that moves is the engine's work, into the time when the
     /// engine has nothing else to do.
     fn render_ahead(&mut self) {
-        // One clip left, and nothing queued behind it in this turn: whatever
-        // the voice says next has to come from the paragraph after this one.
-        if !self.speech || self.voice_runway() > 1 || self.turn.more_to_say() {
+        // Once this turn has handed over every sentence, offer the next
+        // paragraph. Speaker decides when to render it from the live runway;
+        // identifying a candidate here does not bypass pause or the budget.
+        if !self.speech || self.turn.more_to_say() {
             return;
         }
         let Some((chapter, para)) = self.turn.advancing_to() else {

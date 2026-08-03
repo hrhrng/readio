@@ -178,6 +178,26 @@ impl Synthesizer for CommandSynth {
         }
     }
 
+    fn cache_identity(&self) -> String {
+        let language = self.language_for("");
+        let voice = self.voice_for(language);
+        let model = match language.map(|entry| entry.model.as_str()) {
+            Some(model) if !model.is_empty() => model,
+            _ => &self.spec.model,
+        };
+        serde_json::to_string(&(
+            &self.name,
+            &self.spec.synth,
+            &self.spec.serve,
+            model,
+            voice,
+            language_code(language),
+            &self.spec.extra,
+            self.spec.stdin,
+        ))
+        .unwrap_or_else(|_| self.describe())
+    }
+
     fn describe(&self) -> String {
         let voice = if self.voice.trim().is_empty() {
             String::new()
@@ -520,7 +540,10 @@ fn sleep_controlled(ms: u64, control: &PlaybackControl) -> Result<()> {
         }
         let now = std::time::Instant::now();
         if !paused {
-            remaining = remaining.saturating_sub(now.saturating_duration_since(sampled));
+            remaining = remaining.saturating_sub(
+                now.saturating_duration_since(sampled)
+                    .mul_f32(control.rate()),
+            );
         }
         sampled = now;
         std::thread::sleep(Duration::from_millis(15));
@@ -675,6 +698,63 @@ mod tests {
             args.contains(&"1.25".to_string()),
             "rate should be formatted plainly, got {args:?}"
         );
+    }
+
+    /// The cache represents synthesis configuration, not the transport. A
+    /// model, voice, language or engine parameter change may alter every PCM
+    /// sample; a playback-rate change alters none of them.
+    #[test]
+    fn cache_identity_tracks_synthesis_but_not_playback_rate() {
+        let mut engine = spec("engine --model {model} --voice {voice} {lang} {extra}");
+        engine.model = "model-a".to_string();
+        engine.extra = "--temperature 0.7".to_string();
+        engine.languages.insert(
+            "zh".to_string(),
+            LanguageSpec {
+                voice: "xiaoyi".to_string(),
+                model: String::new(),
+                lang: "--lang zh".to_string(),
+            },
+        );
+        engine.languages.insert(
+            "en".to_string(),
+            LanguageSpec {
+                voice: "alice".to_string(),
+                model: String::new(),
+                lang: "--lang en".to_string(),
+            },
+        );
+
+        let base = CommandSynth::new("engine", engine.clone(), "xiaoyi".to_string(), 1.0)
+            .in_language("zh");
+        let faster = CommandSynth::new("engine", engine.clone(), "xiaoyi".to_string(), 2.0)
+            .in_language("zh");
+        assert_eq!(
+            base.cache_identity(),
+            faster.cache_identity(),
+            "playback rate must not split canonical WAV cache entries"
+        );
+
+        let mut another_model = engine.clone();
+        another_model.model = "model-b".to_string();
+        let model =
+            CommandSynth::new("engine", another_model, "xiaoyi".to_string(), 1.0).in_language("zh");
+        let voice = CommandSynth::new("engine", engine.clone(), "xiaobei".to_string(), 1.0)
+            .in_language("zh");
+        let language = CommandSynth::new("engine", engine.clone(), "xiaoyi".to_string(), 1.0)
+            .in_language("en");
+        let mut other_params = engine;
+        other_params.extra = "--temperature 0.2".to_string();
+        let params =
+            CommandSynth::new("engine", other_params, "xiaoyi".to_string(), 1.0).in_language("zh");
+
+        for changed in [model, voice, language, params] {
+            assert_ne!(
+                base.cache_identity(),
+                changed.cache_identity(),
+                "a synthesis-affecting choice aliased another cache entry"
+            );
+        }
     }
 
     #[test]
