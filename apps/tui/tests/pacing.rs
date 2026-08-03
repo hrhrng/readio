@@ -1100,7 +1100,10 @@ fn repeated_left_during_seek_clamps_at_the_first_sentence_and_resumes() {
     let _guard = exclusive();
     let home = common::isolated_home();
     let path = long_chapters(home);
-    let (mut app, mut terminal) = fixture_with(path, 100, LONG_CLIP_MS);
+    // The renderer is deliberately slow. Returning to a fine sentence creates
+    // one new contextual window, so the deadline allows that 1.5s render but
+    // not another 1.5s spent waiting for obsolete work first.
+    let (mut app, mut terminal) = fixture_with(path, 1_500, LONG_CLIP_MS);
     start_reading_aloud(&mut app, &mut terminal);
     let source = app
         .turn
@@ -1135,7 +1138,7 @@ fn repeated_left_during_seek_clamps_at_the_first_sentence_and_resumes() {
         app.on_key(KeyEvent::from(KeyCode::Left));
     }
 
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + Duration::from_millis(2_200);
     let mut resumed_at_first = false;
     while Instant::now() < deadline {
         tick(&mut app, &mut terminal);

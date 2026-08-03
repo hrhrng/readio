@@ -20,6 +20,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, channel};
 use std::thread;
 use std::time::Duration;
@@ -66,6 +67,9 @@ const READY_TIMEOUT: Duration = Duration::from_secs(45);
 /// A speech engine kept alive between sentences.
 pub struct Resident {
     argv: Vec<String>,
+    cooperative_cancel: bool,
+    generation: AtomicU64,
+    active_pid: AtomicU32,
     /// `None` until the first sentence, and again after a failure, which is
     /// what makes the next sentence a retry rather than a second corpse.
     session: Mutex<Option<Session>>,
@@ -75,6 +79,19 @@ struct Session {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+}
+
+enum ExchangeOutcome {
+    Rendered,
+    Cancelled,
+}
+
+struct ActivePid<'a>(&'a AtomicU32);
+
+impl Drop for ActivePid<'_> {
+    fn drop(&mut self) {
+        self.0.store(0, Ordering::SeqCst);
+    }
 }
 
 /// One sentence, as the worker expects it.
@@ -91,7 +108,41 @@ impl Resident {
     pub fn new(argv: Vec<String>) -> Self {
         Self {
             argv,
+            cooperative_cancel: false,
+            generation: AtomicU64::new(0),
+            active_pid: AtomicU32::new(0),
             session: Mutex::new(None),
+        }
+    }
+
+    /// A worker that implements readio's cooperative SIGUSR1 contract.
+    pub(crate) fn cancellable(argv: Vec<String>) -> Self {
+        Self {
+            argv,
+            cooperative_cancel: true,
+            generation: AtomicU64::new(0),
+            active_pid: AtomicU32::new(0),
+            session: Mutex::new(None),
+        }
+    }
+
+    /// Interrupt the active request without unloading its resident model.
+    pub fn cancel(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        if !self.cooperative_cancel {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            let pid = self.active_pid.load(Ordering::SeqCst);
+            if pid != 0 {
+                // SAFETY: `pid` is read from this Resident's live Child. A
+                // failed delivery merely means it exited between the load and
+                // the signal; the exchange then observes the closed pipe.
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGUSR1);
+                }
+            }
         }
     }
 
@@ -115,11 +166,29 @@ impl Resident {
 
     /// Render one sentence, starting the worker if this is the first.
     pub fn render(&self, request: Request<'_>) -> Result<()> {
+        let generation = self.generation.load(Ordering::SeqCst);
+        self.render_at(request, generation)
+    }
+
+    /// Render only while the caller's route generation is still current.
+    pub(crate) fn render_at(&self, request: Request<'_>, generation: u64) -> Result<()> {
+        if self.generation.load(Ordering::SeqCst) != generation {
+            return Err(anyhow!("synthesis cancelled"));
+        }
         let mut guard = self.session.lock().expect("resident lock");
         if guard.is_none() {
             *guard = Some(self.start()?);
         }
         let session = guard.as_mut().expect("just started");
+
+        if self.generation.load(Ordering::SeqCst) != generation {
+            return Err(anyhow!("synthesis cancelled"));
+        }
+        self.active_pid.store(session.child.id(), Ordering::SeqCst);
+        let _active = ActivePid(&self.active_pid);
+        if self.generation.load(Ordering::SeqCst) != generation {
+            return Err(anyhow!("synthesis cancelled"));
+        }
 
         let job = serde_json::json!({
             "text": request.text,
@@ -133,11 +202,14 @@ impl Resident {
         // A write or read that fails here means the worker is gone — killed by
         // the system, or crashed on something the reply never got to describe.
         // Drop it, so the next sentence starts a new one.
-        let outcome = Self::exchange(session, &job.to_string());
-        if outcome.is_err() {
-            *guard = None;
+        match Self::exchange(session, &job.to_string()) {
+            Ok(ExchangeOutcome::Rendered) => Ok(()),
+            Ok(ExchangeOutcome::Cancelled) => Err(anyhow!("synthesis cancelled")),
+            Err(err) => {
+                *guard = None;
+                Err(err)
+            }
         }
-        outcome
     }
 
     /// One request, one reply.
@@ -146,7 +218,7 @@ impl Resident {
     /// and answered once, so the failure it is exposed to is the worker dying
     /// mid-sentence — which closes the pipe and ends the read rather than
     /// hanging on it.
-    fn exchange(session: &mut Session, job: &str) -> Result<()> {
+    fn exchange(session: &mut Session, job: &str) -> Result<ExchangeOutcome> {
         writeln!(session.stdin, "{job}")?;
         session.stdin.flush()?;
 
@@ -156,7 +228,10 @@ impl Resident {
         }
         let reply: serde_json::Value = serde_json::from_str(line.trim())?;
         if reply.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
-            return Ok(());
+            return Ok(ExchangeOutcome::Rendered);
+        }
+        if reply.get("cancelled").and_then(serde_json::Value::as_bool) == Some(true) {
+            return Ok(ExchangeOutcome::Cancelled);
         }
         let why = reply
             .get("error")
@@ -459,6 +534,117 @@ def load_model(model):
         assert!(
             crate::voice::wav::duration_ms(&wav).expect("valid wav") > 0,
             "the worker should write playable audio"
+        );
+    }
+
+    /// Cancelling Qwen must unwind one generation request, not terminate the
+    /// Python process and reload 0.6B parameters. The fake model sleeps only
+    /// for the requested sentence; warm-up and the replacement stay cheap, so
+    /// the boot log tells those two behaviours apart directly.
+    #[cfg(unix)]
+    #[test]
+    fn qwen_worker_cancels_one_request_and_keeps_the_model_loaded() {
+        let home = tempdir();
+        let package = home.join("mlx_audio/tts");
+        let model = home.join("configured-qwen");
+        let active = home.join("active");
+        let boots = home.join("boots");
+        std::fs::create_dir_all(&package).expect("fake package");
+        std::fs::create_dir_all(&model).expect("fake local model");
+        std::fs::write(home.join("mlx_audio/__init__.py"), "").expect("package");
+        std::fs::write(package.join("__init__.py"), "").expect("package");
+        std::fs::write(
+            package.join("utils.py"),
+            format!(
+                r#"import time
+import numpy as np
+
+ACTIVE = {active}
+BOOTS = {boots}
+
+class Segment:
+    def __init__(self):
+        self.audio = np.linspace(-0.25, 0.25, 240, dtype=np.float32)
+        self.sample_rate = 24000
+
+class Model:
+    def generate(self, *, text, voice, lang_code, speed, verbose):
+        if text == "stale":
+            with open(ACTIVE, "w", encoding="utf-8") as out:
+                out.write("active")
+            time.sleep(3)
+        yield Segment()
+
+def load_model(model):
+    with open(BOOTS, "a", encoding="utf-8") as out:
+        out.write("boot\n")
+    return Model()
+"#,
+                active = serde_json::to_string(&active.to_string_lossy()).expect("active path"),
+                boots = serde_json::to_string(&boots.to_string_lossy()).expect("boots path"),
+            ),
+        )
+        .expect("fake mlx-audio");
+
+        let worker = worker_script(&home, "qwen")
+            .expect("write worker")
+            .expect("qwen worker");
+        let Some(python) = which("python3").or_else(|| which("python")) else {
+            return;
+        };
+        let resident = std::sync::Arc::new(Resident::cancellable(vec![
+            python.to_string_lossy().into_owned(),
+            worker.to_string_lossy().into_owned(),
+            "--model".to_string(),
+            model.to_string_lossy().into_owned(),
+        ]));
+        resident.warm().expect("qwen ready");
+
+        let stale_resident = std::sync::Arc::clone(&resident);
+        let stale_out = home.join("stale.wav");
+        let stale = std::thread::spawn(move || {
+            stale_resident.render(Request {
+                text: "stale",
+                out: &stale_out,
+                voice: "serena",
+                lang: "chinese",
+                speed: 1.0,
+                params: "",
+            })
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !active.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(active.exists(), "the slow qwen request never started");
+
+        let cancelled_at = std::time::Instant::now();
+        resident.cancel();
+        assert!(
+            stale.join().expect("render thread").is_err()
+                && cancelled_at.elapsed() < Duration::from_millis(800),
+            "the qwen request did not cancel promptly"
+        );
+
+        let replacement = home.join("replacement.wav");
+        resident
+            .render(Request {
+                text: "replacement",
+                out: &replacement,
+                voice: "serena",
+                lang: "chinese",
+                speed: 1.0,
+                params: "",
+            })
+            .expect("replacement render");
+        assert!(replacement.exists(), "replacement produced no audio");
+        assert_eq!(
+            std::fs::read_to_string(&boots)
+                .expect("boot log")
+                .lines()
+                .count(),
+            1,
+            "qwen reloaded its model after a cancelled request"
         );
     }
 

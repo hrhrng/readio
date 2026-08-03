@@ -33,6 +33,7 @@ import argparse
 import json
 import os
 import shutil
+import signal
 import sys
 import wave
 
@@ -73,6 +74,19 @@ def claim_stdout():
 
 
 OUT = None
+
+
+class Cancelled(BaseException):
+    """Unwind one inference without letting broad model errors swallow it."""
+
+
+def install_cancel_handler():
+    if hasattr(signal, "SIGUSR1"):
+        signal.signal(signal.SIGUSR1, cancel_request)
+
+
+def cancel_request(_signum, _frame):
+    raise Cancelled()
 
 
 def reply(**fields):
@@ -206,6 +220,7 @@ def main():
         reply(ready=False, error=f"{type(err).__name__}: {err}")
         return 1
 
+    install_cancel_handler()
     reply(ready=True)
 
     for line in sys.stdin:
@@ -226,6 +241,12 @@ def main():
             )
             write_wav(job["out"], chunks, rate)
             reply(ok=True)
+        except Cancelled:
+            try:
+                os.remove(job["out"])
+            except FileNotFoundError:
+                pass
+            reply(cancelled=True)
         except Exception as err:  # noqa: BLE001
             # One sentence failing is not the worker failing: report it and stay
             # up, so a single odd line does not end the chapter.
