@@ -26,6 +26,10 @@ Import a book, then read it in agent-shaped turns:
 | --- | --- |
 | ![Importing an EPUB from the readio library](docs/assets/readio/import-epub.png) | ![Reading an EPUB in the terminal](docs/assets/readio/reading-session.png) |
 
+Download a local voice on the left, then configure it globally or for one book on the right:
+
+![Downloading and configuring local voice models in the readio Voice workspace](docs/assets/readio/voice-workspace.png)
+
 <sub>Captured from real readio sessions in a terminal.</sub>
 
 ## Install
