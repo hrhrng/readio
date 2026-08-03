@@ -23,7 +23,7 @@ use crate::library::{Library, Mode};
 // The library's `Mode` is how a file is held; this one is how the reader moves.
 use crate::mode::Mode as ReadMode;
 use crate::paths;
-use crate::store::{Progress, Store, now_secs};
+use crate::store::{Progress, SpeechCheckpoint, Store, now_secs};
 use crate::theme::theme;
 use crate::ui::block::{Block, Event, Highlight, Tool, Verb};
 use crate::ui::chrome::{self, Chrome};
@@ -107,6 +107,12 @@ pub struct App {
     voiced: Option<(u64, String)>,
     /// The sentence being sounded, and the word cursor walking through it.
     cursor: Option<Cursor>,
+    /// Last sentence boundary durably written for the active spoken passage.
+    speech_checkpoint: Option<SpeechCheckpoint>,
+    /// A saved boundary waiting to be applied to the first passage after a
+    /// restart. Kept separate so later text runs in the same turn cannot reuse
+    /// the one-shot restore offset.
+    restoring_speech: Option<SpeechCheckpoint>,
     /// Opt-in main-thread diagnostics. Voice callbacks never touch this file;
     /// their events are recorded only after `pump_speech` receives them.
     trace: Option<TraceLog>,
@@ -320,6 +326,8 @@ impl App {
             lit: None,
             voiced: None,
             cursor: None,
+            speech_checkpoint: None,
+            restoring_speech: None,
             trace,
             voice_trace_sample: None,
             idle: false,
@@ -377,14 +385,21 @@ impl App {
             .map(|p| restore(&book, p))
             .unwrap_or_default();
         let pos = flow::normalize(&book, pos);
+        let speech_checkpoint = saved
+            .as_ref()
+            .and_then(|progress| progress.speech.clone())
+            .filter(|checkpoint| checkpoint.chapter == pos.chapter && checkpoint.para == pos.para);
 
         // Who was reading a moment ago. A book may carry its own voice, so the
         // engine running for the last one is not necessarily the engine this one
         // asked for, and a resident engine outlives the book it was started for.
         let was = self.voice();
 
-        self.resumed = saved.is_some() && (pos.chapter > 0 || pos.para > 0);
+        self.resumed =
+            saved.is_some() && (pos.chapter > 0 || pos.para > 0 || speech_checkpoint.is_some());
         self.pos = pos;
+        self.speech_checkpoint = speech_checkpoint.clone();
+        self.restoring_speech = self.speech.then_some(speech_checkpoint).flatten();
         self.library.touch(&book.id);
         self.book = Some(book);
         // A new book brings its own bookmarks, and the book select behind it has
@@ -501,7 +516,20 @@ impl App {
         let effects = self.turn.pump(&mut self.sb, dt.min(200.0));
         if let Some((id, text)) = self.turn.take_spoken() {
             self.mark_match(id, &text);
-            self.enqueue_speech(id, &text);
+            let restored = self
+                .restoring_speech
+                .take()
+                .and_then(|checkpoint| restored_speech_offset(&text, &checkpoint));
+            if let Some(from) = restored {
+                let released = text[..from].chars().count();
+                self.turn.reveal_passage_to(id, released, &mut self.sb);
+                self.turn.hold_reveal(Some(released));
+                if !self.enqueue_speech_from(id, &text, from) {
+                    self.stop_reading();
+                }
+            } else {
+                self.enqueue_speech(id, &text);
+            }
         }
         self.pump_speech();
         self.sync_reveal_to_audio();
@@ -534,6 +562,8 @@ impl App {
                     if let Some(book) = self.book.as_ref() {
                         self.pos = flow::normalize(book, Pos { chapter, para });
                     }
+                    self.speech_checkpoint = None;
+                    self.restoring_speech = None;
                     self.resumed = false;
                     self.save_progress();
                 }
@@ -875,18 +905,34 @@ impl App {
     /// What the status line says while audio is playing: the engine, plus the
     /// multiplier whenever it is not 1× — the number a listener wants to glance
     /// at without opening a menu.
-    fn speaking_engine(&self) -> Option<String> {
+    fn speaking_transport(&self) -> Option<String> {
         match (&self.speaker, self.lit) {
-            (Some(speaker), Some(_)) => {
-                let engine = speaker.engine();
+            (Some(_), Some(_)) => {
+                let voice = self
+                    .cfg
+                    .voice_name(self.book.as_ref().map(|book| book.id.as_str()));
                 // One compact transport readout: the brackets are the actual
                 // slower/faster keys and the value between them is their state.
                 // Repeating a generic `[ / ]` beside the mode and again in the
                 // hint row made one control look like three separate concepts.
-                Some(format!("{engine}  [{}]", effort::times(self.multiplier())))
+                Some(if voice.is_empty() {
+                    format!("[{}]", effort::times(self.multiplier()))
+                } else {
+                    format!("{voice}  [{}]", effort::times(self.multiplier()))
+                })
             }
             _ => None,
         }
+    }
+
+    /// The real model replaces the agent costume's fictional one only while it
+    /// actually owns the reading clock.
+    fn audio_model(&self) -> Option<String> {
+        if !self.speech {
+            return None;
+        }
+        let engine = self.voice().engine;
+        (!engine.is_empty()).then_some(engine)
     }
 
     /// Bring the engine up before anyone has asked it for a sentence.
@@ -1354,6 +1400,7 @@ impl App {
         let target = cursor.reveal.0 + advanced;
         self.turn
             .reveal_passage_to(position.id, target, &mut self.sb);
+        self.save_live_speech_checkpoint(&position);
         let sample = (
             position.id,
             position.range,
@@ -1378,6 +1425,36 @@ impl App {
                 self.multiplier()
             ));
         }
+    }
+
+    /// Persist at most once per fine sentence. The clip may be a contextual
+    /// paragraph window, so its own range is too coarse; project its PTS onto
+    /// the textual sentence boundaries used by left/right navigation.
+    fn save_live_speech_checkpoint(&mut self, position: &PlaybackPosition) {
+        if !self.speech {
+            return;
+        }
+        let Some((_, text)) = self.voiced.as_ref().filter(|(id, _)| *id == position.id) else {
+            return;
+        };
+        let Some(from) = live_sentence_start(text, position) else {
+            return;
+        };
+        let checkpoint = SpeechCheckpoint {
+            chapter: self.pos.chapter,
+            para: self.pos.para,
+            from,
+            anchor: text[from..].chars().take(48).collect(),
+        };
+        self.persist_speech_checkpoint(checkpoint);
+    }
+
+    fn persist_speech_checkpoint(&mut self, checkpoint: SpeechCheckpoint) {
+        if self.speech_checkpoint.as_ref() == Some(&checkpoint) {
+            return;
+        }
+        self.speech_checkpoint = Some(checkpoint);
+        self.save_progress();
     }
 
     /// Walk the word highlight along with the audio. Called once per frame.
@@ -1514,10 +1591,16 @@ impl App {
             None => Pos::default(),
         };
         let highlight = if self.speech {
-            self.speaking_engine().or_else(|| Some(self.speech_label()))
+            self.speaking_transport().or_else(|| {
+                let voice = self
+                    .cfg
+                    .voice_name(self.book.as_ref().map(|book| book.id.as_str()));
+                (!voice.is_empty()).then_some(voice)
+            })
         } else {
             None
         };
+        let audio_model = self.audio_model();
         let chrome = Chrome {
             book: self
                 .book
@@ -1554,6 +1637,7 @@ impl App {
             library_count: self.library.len(),
             elapsed: self.started.elapsed(),
             speaking: highlight.as_deref(),
+            audio_model: audio_model.as_deref(),
             audio_muted: self.speech && !self.audio_permitted(),
         };
 
@@ -3292,6 +3376,8 @@ impl App {
 
     fn jump(&mut self, chapter: usize) {
         self.pos = Pos { chapter, para: 0 };
+        self.speech_checkpoint = None;
+        self.restoring_speech = None;
         self.resumed = false;
         self.save_progress();
         let title = self
@@ -3429,6 +3515,9 @@ impl App {
             chars_read: book.chars_before(self.pos.chapter, self.pos.para) as u64,
             sessions: previous.sessions.max(1),
             updated: now_secs(),
+            speech: self.speech_checkpoint.clone().filter(|checkpoint| {
+                checkpoint.chapter == self.pos.chapter && checkpoint.para == self.pos.para
+            }),
             marks: previous.marks,
         };
         self.store.record(&id, progress);
@@ -3478,6 +3567,44 @@ fn char_to_byte(text: &str, chars: usize) -> usize {
     text.char_indices()
         .nth(chars)
         .map_or(text.len(), |(at, _)| at)
+}
+
+/// Fine sentence under a contextual clip's live presentation timestamp.
+fn live_sentence_start(text: &str, position: &PlaybackPosition) -> Option<usize> {
+    if position.range.1 > text.len()
+        || !text.is_char_boundary(position.range.0)
+        || !text.is_char_boundary(position.range.1)
+    {
+        return None;
+    }
+    let span = &text[position.range.0..position.range.1];
+    let span_chars = span.chars().count();
+    let elapsed = position.elapsed.as_nanos();
+    let duration = position.duration.as_nanos().max(1);
+    let advanced = ((span_chars as u128 * elapsed) / duration).min(span_chars as u128) as usize;
+    let at = position.range.0 + char_to_byte(span, advanced);
+    let sentences = sentence::sentences(text);
+    sentences
+        .iter()
+        .find(|utterance| utterance.range.0 <= at && at < utterance.range.1)
+        .or_else(|| sentences.iter().rfind(|utterance| utterance.range.0 <= at))
+        .map(|utterance| utterance.range.0)
+}
+
+/// Resolve a saved sentence after passage packing or markup rendering changes.
+/// The byte offset is exact in the common case; the text anchor is the durable
+/// fallback across releases.
+fn restored_speech_offset(text: &str, checkpoint: &SpeechCheckpoint) -> Option<usize> {
+    let exact = checkpoint.from <= text.len()
+        && text.is_char_boundary(checkpoint.from)
+        && (checkpoint.anchor.is_empty()
+            || text[checkpoint.from..].starts_with(&checkpoint.anchor));
+    if exact {
+        return Some(checkpoint.from);
+    }
+    (!checkpoint.anchor.is_empty())
+        .then(|| text.find(&checkpoint.anchor))
+        .flatten()
 }
 
 pub fn expand_tilde(path: &str) -> PathBuf {
