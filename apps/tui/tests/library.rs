@@ -8,10 +8,12 @@ mod common;
 use std::path::PathBuf;
 
 use common::{isolated_home, source_book, under_books};
-use readio::app::parse_import_arg;
+use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use readio::app::{App, parse_import_arg};
 use readio::book::content_id;
 use readio::library::{Library, Mode};
 use readio::paths;
+use readio::store::{Progress, SpeechCheckpoint, Store};
 
 fn library() -> Library {
     isolated_home();
@@ -149,6 +151,52 @@ fn forget_removes_the_entry_and_only_deletes_library_copies() {
         lib.forget(1).is_err(),
         "removing from an empty library fails"
     );
+}
+
+#[test]
+fn forget_removes_saved_progress_and_the_resume_pointer() {
+    let source = source_book("forget-state", "忘干净的书");
+    let mut lib = library();
+    let (entry, book) = lib.import(&source, Mode::Copy).expect("import");
+    let mut store = Store::default();
+    store.record(
+        &entry.id,
+        Progress {
+            title: entry.title.clone(),
+            path: Some(entry.path.to_string_lossy().into_owned()),
+            speech: Some(SpeechCheckpoint {
+                chapter: 0,
+                para: 0,
+                from: 3,
+                anchor: "旧朗读断点".to_string(),
+            }),
+            ..Progress::default()
+        },
+    );
+    store.save().expect("save progress");
+    assert_eq!(store.last_book.as_deref(), entry.path.to_str());
+
+    let id = entry.id.clone();
+    let mut app = App::new(lib, store, Some(book), None);
+    app.on_paste("/forget 1".to_string());
+    app.on_key(KeyEvent::from(KeyCode::Enter));
+
+    assert!(app.library.is_empty(), "the library entry should be gone");
+    assert!(
+        app.store.get(&id).is_none(),
+        "forget must remove the saved position and speech checkpoint"
+    );
+    assert_eq!(
+        app.store.last_book, None,
+        "a forgotten book cannot remain the bare-launch resume target"
+    );
+
+    let reloaded = Store::load();
+    assert!(
+        reloaded.get(&id).is_none(),
+        "the removal must survive a restart"
+    );
+    assert_eq!(reloaded.last_book, None);
 }
 
 #[test]

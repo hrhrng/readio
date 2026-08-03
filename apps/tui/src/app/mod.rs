@@ -3574,6 +3574,10 @@ impl App {
         let open_id = self.book.as_ref().map(|b| b.id.clone());
         match self.library.forget(index) {
             Ok(entry) => {
+                if let Err(err) = self.store.forget(&entry.id, &entry.path) {
+                    self.system(&format!("{err:#}"));
+                    return;
+                }
                 if open_id.as_deref() == Some(entry.id.as_str()) {
                     self.book = None;
                     self.pos = Pos::default();
