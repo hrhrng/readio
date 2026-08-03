@@ -1481,34 +1481,35 @@ mod tests {
     #[test]
     fn the_next_sentence_is_rendered_while_this_one_plays() {
         let log = Arc::new(Mutex::new(Vec::new()));
-        let fake = Fake::new(&log, 60, 140);
+        let hold = Arc::new(AtomicBool::new(true));
+        let fake = Fake::new(&log, 20, 1).parked(&hold);
         let dir = scratch("overlap");
         let mut speaker = Speaker::spawn(Box::new(fake), dir.clone(), 2);
         for (n, text) in ["one.", "two.", "three."].iter().enumerate() {
             speaker.speak(n as u64, text, (0, text.len()));
         }
+
+        assert_eq!(
+            count_at_least(&log, "play-start", 1),
+            1,
+            "sentence one should start playing"
+        );
+        assert_eq!(
+            count_at_least(&log, "render-end", 2),
+            2,
+            "sentence two should render while sentence one is held open"
+        );
+        assert_eq!(
+            count(&log, "play-end"),
+            0,
+            "rendering sentence two waited for sentence one to finish"
+        );
+
+        hold.store(false, Ordering::SeqCst);
         assert_eq!(
             wait_for_finishes(&mut speaker, 3),
             3,
             "all three should play"
-        );
-
-        let log = log.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        let at = |what: &str, nth: usize| {
-            log.iter()
-                .filter(|(kind, _)| *kind == what)
-                .nth(nth)
-                .map(|(_, when)| *when)
-                .unwrap_or_else(|| panic!("no {what} #{nth} in {log:?}"))
-        };
-        assert!(
-            at("render-end", 1) < at("play-end", 0),
-            "sentence two must be ready before sentence one stops playing"
-        );
-        assert!(
-            at("render-start", 1) < at("play-start", 0)
-                || at("render-start", 1) < at("play-end", 0),
-            "rendering must overlap playback, not follow it"
         );
         drop(speaker);
         let _ = std::fs::remove_dir_all(&dir);
