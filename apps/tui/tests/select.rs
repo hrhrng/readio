@@ -170,6 +170,26 @@ fn typing_narrows_a_select_and_shows_what_was_typed() {
     assert!(view.contains("392字"), "and every chapter is back:\n{view}");
 }
 
+/// `/plan` is the chapter picker, not a request to print or execute a plan in
+/// the transcript. Reintroducing the old `flow::plan` branch makes this fail:
+/// there are no chapter rows above the prompt and the turn becomes busy.
+#[test]
+fn plan_opens_the_chapter_select() {
+    let (mut app, mut terminal) = fixture();
+    settle(&mut app, &mut terminal);
+
+    let view = command(&mut app, &mut terminal, "/plan");
+
+    assert!(
+        view.contains("392字"),
+        "/plan should offer chapters in the select above the prompt:\n{view}"
+    );
+    assert!(
+        !app.turn.busy(),
+        "/plan must not enqueue a plan behind the current turn"
+    );
+}
+
 /// A filter that matches nothing is a dead end: the reader sees an empty box and
 /// cannot tell whether the key registered.
 #[test]

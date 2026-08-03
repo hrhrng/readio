@@ -3,6 +3,8 @@
 pub mod flow;
 pub mod turn;
 
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -105,6 +107,12 @@ pub struct App {
     voiced: Option<(u64, String)>,
     /// The sentence being sounded, and the word cursor walking through it.
     cursor: Option<Cursor>,
+    /// Opt-in main-thread diagnostics. Voice callbacks never touch this file;
+    /// their events are recorded only after `pump_speech` receives them.
+    trace: Option<TraceLog>,
+    /// Last quarter-second media sample written, so a 30fps UI does not become
+    /// a 30-lines-per-second log writer.
+    voice_trace_sample: Option<(u64, (usize, usize), u128)>,
     /// The worker has nothing left to say; acted on once the last clip's own
     /// duration has elapsed.
     idle: bool,
@@ -225,10 +233,40 @@ struct Cursor {
     /// Words or characters, in passage coordinates.
     units: Vec<Unit>,
     /// Character positions the clip owns on the passage reveal timeline:
-    /// what was visible when it began, and its sentence-end ceiling.
+    /// its sentence start and sentence-end ceiling. This stays absolute even
+    /// when read-aloud begins after part of the sentence is already visible;
+    /// the audio cursor then catches up instead of stretching the remainder
+    /// over the whole clip.
     reveal: (usize, usize),
     /// Last unit shown, so the scrollback is only touched when it changes.
     shown: Option<(usize, usize)>,
+}
+
+struct TraceLog {
+    file: File,
+}
+
+impl TraceLog {
+    fn open(path: Option<&str>) -> Option<Self> {
+        let path = path?.trim();
+        if path.is_empty() {
+            return None;
+        }
+        let path = expand_tilde(path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok()?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()?;
+        Some(Self { file })
+    }
+
+    fn write(&mut self, elapsed_ms: u128, message: &str) {
+        let _ = writeln!(self.file, "t_ms={elapsed_ms} {message}");
+    }
 }
 
 impl App {
@@ -243,6 +281,7 @@ impl App {
         let paced = (cps * cfg.effort.multipliers.get(cfg.effort.level)).clamp(4.0, 4000.0);
         let mode = cfg.reading.mode;
         let speech = mode.speaks();
+        let trace = TraceLog::open(cfg.input_log.as_deref());
         let spoke_from = if mode == ReadMode::Speak {
             ReadMode::Manual
         } else {
@@ -281,6 +320,8 @@ impl App {
             lit: None,
             voiced: None,
             cursor: None,
+            trace,
+            voice_trace_sample: None,
             idle: false,
             gate: None,
             find: None,
@@ -561,6 +602,18 @@ impl App {
             return None;
         }
         Some(expand_tilde(raw))
+    }
+
+    /// Add a terminal event to the same opt-in trace as the voice timeline.
+    pub fn trace_input(&mut self, event: &crossterm::event::Event) {
+        self.trace(format!("input {event:?}"));
+    }
+
+    fn trace(&mut self, message: String) {
+        let elapsed = self.started.elapsed().as_millis();
+        if let Some(trace) = self.trace.as_mut() {
+            trace.write(elapsed, &message);
+        }
     }
 
     // ── audio output whitelist ───────────────────────────────────────────────
@@ -929,6 +982,16 @@ impl App {
     /// Say this passage, whatever mode is in force. Used by `/voice test`,
     /// which proves the wiring without turning the book into an audiobook.
     fn queue_speech(&mut self, id: u64, text: &str, from: usize) -> bool {
+        self.queue_speech_at(id, text, from, false)
+    }
+
+    /// Start exactly at a semantic boundary instead of replaying the larger
+    /// synthesis window that happens to contain it.
+    fn queue_speech_from_boundary(&mut self, id: u64, text: &str, from: usize) -> bool {
+        self.queue_speech_at(id, text, from, true)
+    }
+
+    fn queue_speech_at(&mut self, id: u64, text: &str, from: usize, exact: bool) -> bool {
         // Speech routed to a device the reader excluded is not read-aloud, and
         // carrying on regardless would be exactly the fallback this mode does
         // not have: pages turning towards headphones that are not there.
@@ -945,23 +1008,138 @@ impl App {
             self.lose_the_voice(&tf("voice.engine_gone", &[&engine]));
             return false;
         }
-        let Some(speaker) = self.speaker.as_mut() else {
+        if from > text.len() || !text.is_char_boundary(from) {
             return false;
+        }
+        let sentences = if from > 0 || exact {
+            let fine = sentence::sentences(text);
+            let Some(first_at) = fine.iter().position(|utterance| utterance.range.1 > from) else {
+                return false;
+            };
+            let first = fine[first_at].clone();
+            let tail = first.range.1;
+            let mut utterances = vec![first];
+            utterances.extend(
+                sentence::split(&text[tail..])
+                    .into_iter()
+                    .map(|mut utterance| {
+                        utterance.range.0 += tail;
+                        utterance.range.1 += tail;
+                        utterance
+                    }),
+            );
+            utterances
+        } else {
+            sentence::split(text)
         };
-        let sentences = sentence::split(text);
         if sentences.is_empty() {
             return false;
         }
-        let mut queued = 0usize;
-        for utterance in sentences {
-            if utterance.range.1 <= from {
-                continue;
-            }
+        let utterances = sentences
+            .into_iter()
+            .filter(|utterance| utterance.range.1 > from)
+            .collect::<Vec<_>>();
+        if utterances.is_empty() {
+            return false;
+        }
+        for utterance in &utterances {
+            self.trace(format!(
+                "voice enqueue id={id} range={}..{} chars={} from_byte={from} text={:?}",
+                utterance.range.0,
+                utterance.range.1,
+                utterance.text.chars().count(),
+                utterance.text.chars().take(120).collect::<String>()
+            ));
+        }
+        let Some(speaker) = self.speaker.as_mut() else {
+            return false;
+        };
+        for utterance in utterances {
             speaker.speak(id, &utterance.text, utterance.range);
-            queued += 1;
         }
         self.voiced = Some((id, text.to_string()));
-        queued > 0
+        true
+    }
+
+    /// Move the live transport by one textual sentence without changing modes.
+    ///
+    /// The audio clip is a contextual synthesis window and can contain several
+    /// sentences. Navigation therefore resolves the current PTS back onto the
+    /// source, chooses a fine-grained boundary, and renders only the suffix from
+    /// that point. The turn's reveal ceiling moves in the same operation, so a
+    /// model wait can never hand pacing back to the automatic text clock.
+    fn step_spoken_sentence(&mut self, forward: bool) {
+        let Some(position) = self.voice_position() else {
+            return;
+        };
+        let Some((id, text)) = self.voiced.clone().filter(|(id, _)| *id == position.id) else {
+            return;
+        };
+        if position.range.1 > text.len()
+            || !text.is_char_boundary(position.range.0)
+            || !text.is_char_boundary(position.range.1)
+        {
+            return;
+        }
+        let span = &text[position.range.0..position.range.1];
+        let span_chars = span.chars().count();
+        let elapsed = position.elapsed.as_nanos();
+        let duration = position.duration.as_nanos().max(1);
+        let advanced = ((span_chars as u128 * elapsed) / duration).min(span_chars as u128) as usize;
+        let at = position.range.0 + char_to_byte(span, advanced);
+        let sentences = sentence::sentences(&text);
+        let Some(current) = sentences
+            .iter()
+            .position(|sentence| sentence.range.0 <= at && at < sentence.range.1)
+            .or_else(|| {
+                sentences
+                    .iter()
+                    .rposition(|sentence| sentence.range.0 <= at)
+            })
+        else {
+            return;
+        };
+        let target = if forward {
+            sentences.get(current + 1)
+        } else {
+            current
+                .checked_sub(1)
+                .and_then(|index| sentences.get(index))
+        };
+        let Some(target) = target else {
+            return;
+        };
+        let target_byte = target.range.0;
+        let target_chars = text[..target_byte].chars().count();
+        let was_paused = self.turn.paused();
+
+        self.awaiting_voice = false;
+        self.warmed = None;
+        if let Some(speaker) = self.speaker.as_mut() {
+            speaker.stop();
+        }
+        self.cursor = None;
+        self.idle = false;
+        self.lit = None;
+        self.sb.clear_highlight();
+        self.turn.reveal_passage_to(id, target_chars, &mut self.sb);
+        self.turn.hold_reveal(Some(
+            self.turn
+                .streaming_passage()
+                .filter(|(streaming, _)| *streaming == id)
+                .map_or(target_chars, |(_, released)| released),
+        ));
+        if !self.queue_speech_from_boundary(id, &text, target_byte) {
+            self.stop_reading();
+            return;
+        }
+        if was_paused && let Some(speaker) = self.speaker.as_ref() {
+            speaker.pause();
+        }
+        self.trace(format!(
+            "voice sentence {} id={id} from_byte={target_byte}",
+            if forward { "next" } else { "previous" }
+        ));
     }
 
     /// Drain speech events: move the highlight and pace the text to the audio.
@@ -983,10 +1161,33 @@ impl App {
                     }
                     self.cursor = self.build_cursor(id, range, ms);
                     self.follow_clip(id, range, chars, ms);
+                    let released = self
+                        .turn
+                        .streaming_passage()
+                        .filter(|(streaming, _)| *streaming == id)
+                        .map_or(0, |(_, released)| released);
+                    self.trace(format!(
+                        "voice started id={id} range={}..{} chars={chars} duration_ms={ms} released={released} runway={} rate={}",
+                        range.0,
+                        range.1,
+                        self.voice_runway(),
+                        self.multiplier()
+                    ));
                 }
-                SpeechEvent::Finished { .. } => {}
-                SpeechEvent::Idle => self.idle = true,
-                SpeechEvent::Failed { message } => self.lose_the_voice(&message),
+                SpeechEvent::Finished { id } => {
+                    self.trace(format!(
+                        "voice finished id={id} runway={}",
+                        self.voice_runway()
+                    ));
+                }
+                SpeechEvent::Idle => {
+                    self.trace("voice idle".to_string());
+                    self.idle = true;
+                }
+                SpeechEvent::Failed { message } => {
+                    self.trace(format!("voice failed message={message:?}"));
+                    self.lose_the_voice(&message);
+                }
             }
         }
         self.render_ahead();
@@ -1118,13 +1319,8 @@ impl App {
         if units.is_empty() || ms == 0 {
             return None;
         }
+        let reveal_from = text[..range.0].chars().count();
         let reveal_to = text[..range.1].chars().count();
-        let reveal_from = self
-            .turn
-            .streaming_passage()
-            .filter(|(streaming, _)| *streaming == id)
-            .map(|(_, released)| released.min(reveal_to))
-            .unwrap_or_else(|| text[..range.0].chars().count());
         Some(Cursor {
             id,
             sentence: range,
@@ -1158,6 +1354,30 @@ impl App {
         let target = cursor.reveal.0 + advanced;
         self.turn
             .reveal_passage_to(position.id, target, &mut self.sb);
+        let sample = (
+            position.id,
+            position.range,
+            position.elapsed.as_millis() / 250,
+        );
+        if self.voice_trace_sample != Some(sample) {
+            self.voice_trace_sample = Some(sample);
+            let released = self
+                .turn
+                .streaming_passage()
+                .filter(|(streaming, _)| *streaming == position.id)
+                .map_or(0, |(_, released)| released);
+            self.trace(format!(
+                "voice clock id={} range={}..{} media_ms={} duration_ms={} target={target} released={released} finished={} runway={} rate={}",
+                position.id,
+                position.range.0,
+                position.range.1,
+                position.elapsed.as_millis(),
+                position.duration.as_millis(),
+                position.finished,
+                self.voice_runway(),
+                self.multiplier()
+            ));
+        }
     }
 
     /// Walk the word highlight along with the audio. Called once per frame.
@@ -1480,6 +1700,16 @@ impl App {
             (KeyCode::Backspace, _) if self.select.is_some() => self.menu_erase(),
             (KeyCode::Backspace, _) => self.prompt.backspace(),
             (KeyCode::Delete, _) => self.prompt.delete(),
+            (KeyCode::Left, _)
+                if self.mode == ReadMode::Speak && self.prompt.is_empty() && !self.menu_open() =>
+            {
+                self.step_spoken_sentence(false)
+            }
+            (KeyCode::Right, _)
+                if self.mode == ReadMode::Speak && self.prompt.is_empty() && !self.menu_open() =>
+            {
+                self.step_spoken_sentence(true)
+            }
             (KeyCode::Left, _) => self.prompt.left(),
             (KeyCode::Right, _) => self.prompt.right(),
             (KeyCode::Home, _) => {
@@ -1834,6 +2064,7 @@ impl App {
             if let Some(speaker) = self.speaker.as_ref() {
                 speaker.pause();
             }
+            self.trace("voice paused".to_string());
         }
         self.turn.pause();
     }
@@ -1846,6 +2077,7 @@ impl App {
             if let Some(speaker) = self.speaker.as_ref() {
                 speaker.resume();
             }
+            self.trace("voice resumed".to_string());
         }
         self.turn.resume();
     }
@@ -2138,17 +2370,9 @@ impl App {
             // ── reading ──
             // The table of contents is a choice, not a printout: the select
             // above the prompt lists every chapter with where the reader is.
-            "toc" => {
+            "toc" | "plan" => {
                 if self.book.is_some() {
                     self.open_select("goto");
-                } else {
-                    self.no_book();
-                }
-            }
-            "plan" => {
-                if let Some(book) = self.book.as_ref() {
-                    let steps = flow::plan(book, self.pos);
-                    self.turn.enqueue(steps);
                 } else {
                     self.no_book();
                 }

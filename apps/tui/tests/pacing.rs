@@ -74,7 +74,10 @@ fn fixture_home() -> PathBuf {
 /// A silent mono wav of `ms` milliseconds, which is all the clock needs: the
 /// player waits out the duration in the header.
 fn silence(ms: u64) -> Vec<u8> {
-    let rate = 8_000u32;
+    // Playback in these integration tests is clocked rather than sent to a
+    // device. A low valid sample rate keeps the family of duration-scaled WAVs
+    // tiny while preserving their exact media time.
+    let rate = 100u32;
     let frames = (rate as u64 * ms / 1000) as u32;
     let data = frames * 2;
     let mut out = Vec::with_capacity(44 + data as usize);
@@ -100,15 +103,33 @@ fn silence(ms: u64) -> Vec<u8> {
 /// itself" — so playback is exactly the clip's own duration, with none of a
 /// real player's start-up in the way.
 fn stand_in_engine(home: &Path, synth_ms: u64, clip_ms: u64) -> EngineSpec {
-    let clip = home.join(format!("clip-{clip_ms}.wav"));
-    std::fs::write(&clip, silence(clip_ms)).expect("write clip");
+    let clips = home.join(format!("clips-{clip_ms}"));
+    std::fs::create_dir_all(&clips).expect("clip dir");
+    // The baseline fixture sentence is seven Chinese characters, or 21 UTF-8
+    // bytes. Real TTS duration grows with its input; keeping one fixed WAV for
+    // every contextual window makes a paragraph appear to be spoken in the
+    // time previously assigned to one sentence.
+    for bytes in 1..=512u64 {
+        // 600ms for the baseline sentence keeps contextual playback at a
+        // plausible upper bound even in fixtures whose original 300ms clip was
+        // chosen only to make synthesis slower than playback.
+        let duration = clip_ms
+            .max(600)
+            .saturating_mul(bytes)
+            .div_ceil(21)
+            .max(20);
+        std::fs::write(clips.join(format!("{bytes}.wav")), silence(duration))
+            .expect("write scaled clip");
+    }
     let script = home.join(format!("stand-in-voice-{synth_ms}-{clip_ms}"));
     std::fs::write(
         &script,
         format!(
-            "#!/bin/sh\nsleep {}\ncp '{}' \"$1\"\n",
+            "#!/bin/sh\nsleep {}\nbytes=$(printf %s \"$2\" | wc -c | tr -d ' ')\n\
+             [ \"$bytes\" -lt 1 ] && bytes=1\n[ \"$bytes\" -gt 512 ] && bytes=512\n\
+             cp \"{}/$bytes.wav\" \"$1\"\n",
             synth_ms as f64 / 1000.0,
-            clip.display()
+            clips.display()
         ),
     )
     .expect("write engine");
@@ -119,7 +140,7 @@ fn stand_in_engine(home: &Path, synth_ms: u64, clip_ms: u64) -> EngineSpec {
             .expect("chmod engine");
     }
     EngineSpec {
-        synth: format!("{} {{out}}", script.display()),
+        synth: format!("{} {{out}} {{text}}", script.display()),
         about: "stand-in".to_string(),
         ..EngineSpec::default()
     }
@@ -169,7 +190,29 @@ fn fixture_with_query(
     clip_ms: u64,
     output_query: &str,
 ) -> (App, Terminal<TestBackend>) {
+    fixture_with_pace(book_path, synth_ms, clip_ms, output_query, 46.0)
+}
+
+fn fixture_with_pace(
+    book_path: PathBuf,
+    synth_ms: u64,
+    clip_ms: u64,
+    output_query: &str,
+    cps: f32,
+) -> (App, Terminal<TestBackend>) {
     let home = fixture_home();
+    fixture_at_home(home, book_path, synth_ms, clip_ms, output_query, cps, None)
+}
+
+fn fixture_at_home(
+    home: PathBuf,
+    book_path: PathBuf,
+    synth_ms: u64,
+    clip_ms: u64,
+    output_query: &str,
+    cps: f32,
+    input_log: Option<&Path>,
+) -> (App, Terminal<TestBackend>) {
     let mut config = readio::config::Config::load().0;
     config.reading.mode = readio::mode::Mode::Manual;
     config.voice.enabled = false;
@@ -182,7 +225,8 @@ fn fixture_with_query(
         "stand-in".to_string(),
         stand_in_engine(&home, synth_ms, clip_ms),
     );
-    config.reading.speed = 46.0;
+    config.reading.speed = cps;
+    config.input_log = input_log.map(|path| path.display().to_string());
     config.effort = readio::config::EffortConfig::default();
     let _ = config.save();
 
@@ -271,6 +315,29 @@ fn start_reading_aloud(app: &mut App, terminal: &mut Terminal<TestBackend>) {
     });
 }
 
+/// The activity strip models an interrupted agent turn. Speech may be the
+/// current projection of that turn, but exposing an audio-specific pause here
+/// makes the generic interrupt affordance change meaning between modes.
+#[test]
+fn speech_uses_the_generic_interruption_copy() {
+    let _guard = exclusive();
+    let (mut app, mut terminal) = fixture(long_chapters(common::isolated_home()));
+    start_reading_aloud(&mut app, &mut terminal);
+
+    app.on_key(KeyEvent::from(KeyCode::Esc));
+    tick(&mut app, &mut terminal);
+    let view = screen(&terminal);
+
+    assert!(
+        view.contains("已中断"),
+        "speech should look like an interrupted agent turn:\n{view}"
+    );
+    assert!(
+        !view.contains("朗读已暂停") && !view.contains("朗读已中断"),
+        "the activity strip should not expose the speech implementation:\n{view}"
+    );
+}
+
 /// Characters of the passage now on screen.
 fn shown(app: &App) -> Option<usize> {
     app.turn.streaming_passage().map(|(_, chars)| chars)
@@ -308,11 +375,12 @@ fn a_passage_shows_nothing_until_its_first_clip_exists() {
 
 /// Token reveal is a projection of the playback PTS, not a second pacer.
 ///
-/// The opening utterance says `第1章`, whose source prefix is the six-character
-/// heading `## 第1章`. Its clip is exactly two seconds long, so just after one
-/// second exactly half that source belongs on screen. The old independent
-/// character clock clamps itself to four characters per second and has already
-/// run ahead here.
+/// The opening utterance says `第1章`, inside the six-character source heading
+/// `## 第1章`. The renderer interprets rather than displays the Markdown prefix,
+/// but the reveal queue still addresses the raw source: audio start consumes
+/// `## ` at once, then the clip's two seconds project only across the three
+/// spoken characters. The old independent character clock clamps itself to
+/// four characters per second and has already run ahead here.
 #[test]
 fn token_reveal_samples_the_global_playback_position() {
     let _guard = exclusive();
@@ -327,27 +395,114 @@ fn token_reveal_samples_the_global_playback_position() {
     });
 
     until(&mut app, &mut terminal, "half of the opening clip", |app| {
-        app.voice_position()
-            .is_some_and(|position| position.elapsed >= Duration::from_millis(1_050))
+        app.voice_position().is_some_and(|position| {
+            position.elapsed.as_nanos().saturating_mul(2) >= position.duration.as_nanos()
+        })
     });
     let position = app.voice_position().expect("a playback position");
     let (_, source, _) = app.turn.passage_in_flight().expect("the opening passage");
-    assert_eq!(
-        &source[position.range.0..position.range.1],
-        "第1章",
-        "the fixture's opening utterance changed"
+    assert!(
+        source[position.range.0..position.range.1].contains("第1章"),
+        "the opening context lost its heading"
     );
-    assert_eq!(
-        source[..position.range.1].chars().count(),
-        6,
-        "the fixture's heading prefix changed"
-    );
-    let expected =
-        (6 * position.elapsed.as_millis() / position.duration.as_millis().max(1)) as usize;
+    let sentence_start = source[..position.range.0].chars().count();
+    let sentence_end = source[..position.range.1].chars().count();
+    let expected = sentence_start
+        + ((sentence_end - sentence_start) as u128 * position.elapsed.as_millis()
+            / position.duration.as_millis().max(1)) as usize;
     assert_eq!(
         shown(&app),
         Some(expected),
         "the text clock drifted away from the global playback position"
+    );
+}
+
+/// Entering read-aloud partway through a sentence must keep the text parked
+/// until the audio cursor catches up with what was already visible.
+///
+/// The old cursor treated the visible remainder as if it occupied the whole
+/// clip. With five of this seven-character sentence already on screen, that
+/// leaked the sixth character around halfway through the audio even though the
+/// voice had only reached the fourth character on its absolute timeline.
+#[test]
+fn entering_read_aloud_mid_sentence_waits_for_audio_to_catch_up() {
+    let _guard = exclusive();
+    let source = long_chapters(common::isolated_home());
+    let (mut app, mut terminal) = fixture_with_pace(source, SYNTH_MS, LONG_CLIP_MS, "", 4.0);
+
+    until(&mut app, &mut terminal, "the opening turn", |app| {
+        !app.turn.busy()
+    });
+    app.on_key(KeyEvent::from(KeyCode::Enter));
+
+    until(
+        &mut app,
+        &mut terminal,
+        "five characters of a body sentence",
+        |app| {
+            app.turn
+                .passage_in_flight()
+                .is_some_and(|(_, text, released)| {
+                    text.find("这一句是甲子。").is_some_and(|byte| {
+                        let sentence_start = text[..byte].chars().count();
+                        released == sentence_start + 5
+                    })
+                })
+        },
+    );
+    let already_visible = shown(&app).expect("a body passage is streaming");
+
+    type_line(&mut app, "/mode tts");
+    until(
+        &mut app,
+        &mut terminal,
+        "the resumed sentence's audio clock",
+        |app| {
+            app.voice_position().is_some_and(|position| {
+                position.range.1 > position.range.0
+                    && position.elapsed.as_nanos().saturating_mul(2) >= position.duration.as_nanos()
+            })
+        },
+    );
+
+    assert_eq!(
+        shown(&app),
+        Some(already_visible),
+        "text advanced before the absolute audio cursor caught up"
+    );
+}
+
+/// The opt-in diagnostic file must include the evidence needed to explain a
+/// pacing bug after it happened: the sentence boundary, clip duration, and a
+/// sampled mapping from media time to visible characters.
+#[test]
+fn diagnostic_log_records_voice_boundaries_and_clock_samples() {
+    let _guard = exclusive();
+    let source = long_chapters(common::isolated_home());
+    let home = fixture_home();
+    let log = home.join("readio.log");
+    let (mut app, mut terminal) =
+        fixture_at_home(home, source, SYNTH_MS, LONG_CLIP_MS, "", 46.0, Some(&log));
+    start_reading_aloud(&mut app, &mut terminal);
+    until(&mut app, &mut terminal, "a sampled audio clock", |app| {
+        app.voice_position()
+            .is_some_and(|position| position.elapsed >= Duration::from_millis(300))
+    });
+
+    let trace = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        trace.contains("voice enqueue") && trace.contains("range=") && trace.contains("text="),
+        "the log cannot reconstruct sentence boundaries:\n{trace}"
+    );
+    assert!(
+        trace.contains("voice started")
+            && trace.contains("duration_ms=")
+            && trace.contains("released="),
+        "the log cannot reconstruct clip start state:\n{trace}"
+    );
+    assert!(
+        trace.contains("voice clock") && trace.contains("media_ms=") && trace.contains("target="),
+        "the log cannot reconstruct the reveal clock:\n{trace}"
     );
 }
 
@@ -528,12 +683,10 @@ fn pause_and_resume_keep_the_exact_audio_pointer() {
     let source = long_chapters(common::isolated_home());
     let (mut app, mut terminal) = fixture_with(source, SYNTH_MS, LONG_CLIP_MS);
     start_reading_aloud(&mut app, &mut terminal);
-    until(
-        &mut app,
-        &mut terminal,
-        "the first spoken character",
-        |app| shown(app).is_some_and(|chars| chars > 0),
-    );
+    until(&mut app, &mut terminal, "the live audio pointer", |app| {
+        app.voice_position()
+            .is_some_and(|position| position.elapsed >= Duration::from_millis(100))
+    });
 
     app.on_key(KeyEvent::from(KeyCode::Char(' ')));
     assert!(app.turn.paused(), "space should pause the audio timeline");
@@ -542,6 +695,7 @@ fn pause_and_resume_keep_the_exact_audio_pointer() {
         "paused audio must not report itself as audible"
     );
     let held = shown(&app).expect("a passage is in flight");
+    let paused_at = app.voice_position().expect("a paused audio pointer");
     let paused_until = Instant::now() + Duration::from_millis(300);
     while Instant::now() < paused_until {
         tick(&mut app, &mut terminal);
@@ -549,6 +703,11 @@ fn pause_and_resume_keep_the_exact_audio_pointer() {
             shown(&app),
             Some(held),
             "tokens moved while the audio pointer was paused"
+        );
+        assert_eq!(
+            app.voice_position().map(|position| position.elapsed),
+            Some(paused_at.elapsed),
+            "the media cursor moved while paused"
         );
     }
 
@@ -558,7 +717,11 @@ fn pause_and_resume_keep_the_exact_audio_pointer() {
         &mut app,
         &mut terminal,
         "the held audio pointer to move",
-        |app| shown(app).is_some_and(|chars| chars > held),
+        |app| {
+            app.voice_position().is_some_and(|position| {
+                position.elapsed >= paused_at.elapsed + Duration::from_millis(100)
+            })
+        },
     );
     assert!(
         resumed.elapsed() < Duration::from_millis(650),
@@ -671,6 +834,60 @@ fn playback_rate_controls_the_live_media_clock() {
         media_advance >= Duration::from_millis(450),
         "2× was only worth {media_advance:?} of media time in {:?} of wall time",
         wall_start.elapsed()
+    );
+}
+
+/// Left and right belong to the speech transport when the composer is empty.
+/// A synthesis window may contain a whole paragraph, so this deliberately
+/// starts inside one and requires navigation to use textual sentence boundaries
+/// rather than merely skipping the entire rendered clip.
+#[test]
+fn arrow_keys_move_the_audio_and_text_to_sentence_boundaries() {
+    let _guard = exclusive();
+    let home = common::isolated_home();
+    let path = long_chapters(home);
+    let (mut app, mut terminal) = fixture_with(path, SYNTH_MS, LONG_CLIP_MS);
+    start_reading_aloud(&mut app, &mut terminal);
+    let source = app
+        .turn
+        .passage_in_flight()
+        .map(|(_, text, _)| text.to_string())
+        .expect("streaming passage");
+    let first = source.find("这一句是甲子。").expect("first sentence");
+    let second = source.find("这一句是乙丑。").expect("second sentence");
+
+    until(&mut app, &mut terminal, "the opening audio cursor", |app| {
+        app.voice_position().is_some()
+    });
+    app.on_key(KeyEvent::from(KeyCode::Right));
+    until(&mut app, &mut terminal, "the first body sentence", |app| {
+        app.voice_position()
+            .is_some_and(|position| position.range.0 == first)
+    });
+    app.on_key(KeyEvent::from(KeyCode::Right));
+    until(&mut app, &mut terminal, "the second sentence", |app| {
+        app.voice_position()
+            .is_some_and(|position| position.range.0 == second)
+    });
+    let (_, released) = app
+        .turn
+        .streaming_passage()
+        .expect("the passage stays on screen");
+    assert!(
+        released >= source[..second].chars().count(),
+        "the audio jumped but the text stayed behind"
+    );
+
+    app.on_key(KeyEvent::from(KeyCode::Left));
+    until(&mut app, &mut terminal, "the previous sentence", |app| {
+        app.voice_position()
+            .is_some_and(|position| position.range.0 == first)
+    });
+
+    let view = screen(&terminal);
+    assert!(
+        view.contains("←") && view.contains("→"),
+        "sentence transport keys should be discoverable:\n{view}"
     );
 }
 

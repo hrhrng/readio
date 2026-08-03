@@ -1,6 +1,6 @@
 [package]
 name = "readio"
-version = "0.2.0-beta.8"
+version = "0.2.0-beta.9"
 edition = "2024"
 rust-version = "1.85"
 description = "A terminal ebook reader that reads like a coding agent at work"
@@ -34,6 +34,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serde_yaml_ng = "0.10.0"
 sha2 = "0.10.9"
+sonic-rs-sys = "0.1.9"
 textwrap = "0.16.2"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 unicode-segmentation = "1.13.3"
