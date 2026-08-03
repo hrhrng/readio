@@ -412,7 +412,6 @@ impl PlaybackControl {
         if self.clock.start(
             self.id,
             self.range,
-            self.chars,
             self.ms,
             self.era,
             self.paused(),
@@ -552,7 +551,6 @@ impl PlaybackClock {
         &self,
         id: u64,
         range: (usize, usize),
-        _chars: usize,
         ms: u64,
         era: u64,
         paused: bool,
