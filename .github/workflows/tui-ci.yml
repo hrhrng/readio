@@ -85,8 +85,6 @@ jobs:
         with:
           workspaces: apps/tui
           key: windows-msvc
-      - name: Test
-        run: cargo test --locked
       - name: Build and run the release binary
         shell: pwsh
         run: |

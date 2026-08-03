@@ -75,7 +75,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $version = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { "${{ github.event.inputs.tag }}" }
+          $version = "${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.tag }}"
           $name = "readio-$version-${{ matrix.target }}.zip"
           $stage = Join-Path $env:RUNNER_TEMP "readio-package"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
@@ -136,7 +136,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { "${{ github.event.inputs.tag }}" }
+          $tag = "${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.tag }}"
           gh release download $tag --repo $env:GITHUB_REPOSITORY --pattern install.ps1 --dir $env:RUNNER_TEMP
           "READIO_TEST_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append
       - name: Install twice and run the published binary

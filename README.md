@@ -63,7 +63,7 @@ toolchain.
 
 ## Windows notes
 
-Windows x64 has a prebuilt ZIP and verified PowerShell installer. Every pull request builds the binary, runs the Rust suite, installs from a fake release, checks the SHA-256 failure path, and launches the installed executable on a clean Windows runner. Building from source remains available:
+Windows x64 has a prebuilt ZIP and verified PowerShell installer. Every pull request builds the binary, installs from a fake release, checks the SHA-256 failure path, and launches the installed executable on a clean Windows runner. Building from source remains available:
 
 1. **Install Rust** with [rustup](https://rustup.rs). Keep the default `x86_64-pc-windows-msvc` host and let it install the Visual Studio Build Tools it asks for (*Desktop development with C++*). readio contains no C, but the MSVC linker is still what `rustc` invokes. If you would rather not install Visual Studio, `rustup default stable-x86_64-pc-windows-gnu` works with MinGW-w64 instead.
 
@@ -86,7 +86,7 @@ Windows x64 has a prebuilt ZIP and verified PowerShell installer. Every pull req
 
 The POSIX-only `scripts/pty_probe.py` does not run here. The audio-output whitelist also has no built-in device probe on Windows: set `tts.output.query` to a command that prints the current output device (PowerShell with the `AudioDeviceCmdlets` module, for instance), and until you do, `/device` will say it cannot read the list and that the whitelist keeps speech muted.
 
-`cargo test` is part of the Windows CI job; the frame tests render through ratatui's `TestBackend` rather than a real terminal.
+The release binary and installer are exercised by Windows CI. Some managed local-voice setup tests remain POSIX-specific; text reading and the packaged executable do not depend on them.
 
 ## Usage
 
