@@ -75,6 +75,28 @@ jobs:
       - name: Help works under dash
         run: dash scripts/install.sh --help
 
+  windows:
+    name: windows installer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable --no-self-update
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/tui
+          key: windows-msvc
+      - name: Test
+        run: cargo test --locked
+      - name: Build and run the release binary
+        shell: pwsh
+        run: |
+          cargo build --release --locked
+          & target/release/readio.exe --version
+          & target/release/readio.exe --help
+      - name: Test the PowerShell installer end to end
+        shell: pwsh
+        run: ./scripts/test-install.ps1 -Binary target/release/readio.exe
+
   portable:
     name: release target (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
