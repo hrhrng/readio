@@ -7,11 +7,13 @@ on:
     branches: [main, master]
     paths:
       - "apps/tui/**"
+      - "skills/setup-readio/**"
       - ".github/workflows/tui-ci.yml"
       - ".github/workflows/tui-release.yml"
   pull_request:
     paths:
       - "apps/tui/**"
+      - "skills/setup-readio/**"
       - ".github/workflows/tui-ci.yml"
       - ".github/workflows/tui-release.yml"
 
@@ -71,11 +73,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Shellcheck
-        run: shellcheck --shell=sh scripts/install.sh scripts/test-release-workflow.sh
+        run: shellcheck --shell=sh scripts/install.sh scripts/test-release-workflow.sh scripts/test-setup-skill.sh
       - name: Help works under dash
         run: dash scripts/install.sh --help
       - name: Release workflow contract
         run: sh scripts/test-release-workflow.sh
+      - name: Setup skill contract
+        run: sh scripts/test-setup-skill.sh
 
   windows:
     name: windows installer

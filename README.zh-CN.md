@@ -30,6 +30,8 @@ Invoke-WebRequest https://raw.githubusercontent.com/hrhrng/readio/main/apps/tui/
 & $installer
 ```
 
+也可以让 Agent 使用仓库内置的 [setup-readio Skill](skills/setup-readio/SKILL.md)，完成受校验的安装、PATH、配置、语音选择与安全卸载；它覆盖全部受支持平台。
+
 两个安装器都会下载对应的 release 产物，并用 release 里的 `SHA256SUMS` 校验。Unix 脚本安装到 `~/.local/bin/readio`，PowerShell 安装到 `%USERPROFILE%\.local\bin\readio.exe`。都不需要 sudo、编译器或 Rust，也不会改书库和配置。卸载程序只需删除这个可执行文件；只有确实想一并清除书籍、设置和进度时才删除 `~/.readio`。
 
 从源码安装需要 Rust 1.90 及以上：

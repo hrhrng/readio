@@ -48,6 +48,8 @@ Invoke-WebRequest https://raw.githubusercontent.com/hrhrng/readio/main/apps/tui/
 & $installer
 ```
 
+Agents can follow the repository-bundled [setup-readio skill](skills/setup-readio/SKILL.md) for verified installation, PATH setup, configuration, voice selection, and safe uninstall on all supported platforms.
+
 Both installers download the matching release archive and verify it against the release's `SHA256SUMS`. The Unix script installs `~/.local/bin/readio`; PowerShell installs `%USERPROFILE%\.local\bin\readio.exe`. Neither needs sudo, a compiler, or Rust, and neither changes the library or configuration. To uninstall the program, delete that executable; remove `~/.readio` only if you also want to erase books, settings, and progress.
 
 From source, with Rust 1.90 or newer:
