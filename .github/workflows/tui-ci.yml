@@ -85,15 +85,15 @@ jobs:
         with:
           workspaces: apps/tui
           key: windows-msvc
-      - name: Build and run the release binary
+      - name: Build and run the Windows binary
         shell: pwsh
         run: |
-          cargo build --release --locked
-          & target/release/readio.exe --version
-          & target/release/readio.exe --help
+          cargo build --locked
+          & target/debug/readio.exe --version
+          & target/debug/readio.exe --help
       - name: Test the PowerShell installer end to end
         shell: pwsh
-        run: ./scripts/test-install.ps1 -Binary target/release/readio.exe
+        run: ./scripts/test-install.ps1 -Binary target/debug/readio.exe
 
   portable:
     name: release target (${{ matrix.target }})
