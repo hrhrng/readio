@@ -903,7 +903,18 @@ fn arrow_keys_move_the_audio_and_text_to_sentence_boundaries() {
             .is_some_and(|position| position.range.0 == first)
     });
 
-    let view = screen(&terminal);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let view = loop {
+        tick(&mut app, &mut terminal);
+        let view = screen(&terminal);
+        if view.contains("←") && view.contains("→") {
+            break view;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the transient mode notice never yielded to sentence transport:\n{view}"
+        );
+    };
     assert!(
         view.contains("←") && view.contains("→"),
         "sentence transport keys should be discoverable:\n{view}"
