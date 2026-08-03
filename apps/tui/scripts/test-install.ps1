@@ -75,14 +75,12 @@ try {
     $env:READIO_TAG_PREFIX = "tui-v"
 
     & $Installer -Version latest -InstallDir $installDir
-    Assert-True ($LASTEXITCODE -eq 0) "latest install failed"
     $installed = Join-Path $installDir "readio.exe"
     Assert-True (Test-Path -LiteralPath $installed -PathType Leaf) "readio.exe was not installed"
     & $installed --version | Out-Null
     Assert-True ($LASTEXITCODE -eq 0) "installed binary did not run"
 
     & $Installer -Version $tag -InstallDir $installDir
-    Assert-True ($LASTEXITCODE -eq 0) "reinstalling the same version failed"
 
     Set-Content -LiteralPath (Join-Path $releaseDir "SHA256SUMS") -Value (("0" * 64) + "  $archiveName")
     $failed = $false

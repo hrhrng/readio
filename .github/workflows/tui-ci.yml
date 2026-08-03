@@ -85,6 +85,7 @@ jobs:
         with:
           workspaces: apps/tui
           key: windows-msvc
+          cache-on-failure: true
       - name: Build and run the Windows binary
         shell: pwsh
         run: |
