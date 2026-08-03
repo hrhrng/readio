@@ -493,6 +493,10 @@ The short forms -c / -l / -m work too."),
         "Downloading {0} with {1}. Save it in Voice configuration after it finishes."),
     ("install.done", "{0} 下载完成，用了 {1} 秒。Voice 配置没有改变。",
         "{0} downloaded after {1}s. Voice configuration was not changed."),
+    ("install.deleted", "{0} 的本地模型文件已删除；Voice 配置没有改变。",
+        "Local model files for {0} were deleted. Voice configuration was not changed."),
+    ("install.delete_failed", "{0} 删除失败：{1}",
+        "Could not delete {0}: {1}"),
     // Ten columns of header, no more: the tool line has already spent its width
     // on the command. What went wrong is explained underneath.
     ("install.step_failed", "失败", "failed"),

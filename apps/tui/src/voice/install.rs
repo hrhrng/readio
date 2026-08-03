@@ -218,7 +218,7 @@ pub fn space(engine: &str) -> Option<Space> {
 }
 
 pub fn bytes(bytes: u64) -> String {
-    const UNITS: [&str; 4] = ["B", "MB", "GB", "TB"];
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut value = bytes as f64;
     let mut unit = 0;
     while value >= 1024.0 && unit + 1 < UNITS.len() {
@@ -331,14 +331,7 @@ pub fn plan(engine: &str, spec: &EngineSpec) -> Result<Plan, Blocked> {
         });
     }
 
-    let hf_models: &[&str] = match engine {
-        "moss" => &[
-            "mlx-community/MOSS-TTS-Nano-100M",
-            "mlx-community/MOSS-Audio-Tokenizer-Nano",
-        ],
-        "qwen" => &["mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16"],
-        _ => &[],
-    };
+    let hf_models = hf_models(engine);
     if !hf_models.is_empty() {
         let models = hf_models
             .iter()
@@ -347,7 +340,7 @@ pub fn plan(engine: &str, spec: &EngineSpec) -> Result<Plan, Blocked> {
             .join(", ");
         let code = format!(
             "from huggingface_hub import snapshot_download\n\
-             [snapshot_download(model_id=m) for m in [{models}]]"
+             [snapshot_download(repo_id=m) for m in [{models}]]"
         );
         steps.push(Step {
             argv: vec!["python".into(), "-c".into(), code],
@@ -525,23 +518,71 @@ pub fn model_is_ready(engine: &str, spec: &EngineSpec) -> bool {
     if !is_ready(spec) {
         return false;
     }
+    hf_models(engine).iter().all(|model| hf_cached(model))
+}
+
+fn hf_models(engine: &str) -> &'static [&'static str] {
     match engine {
-        "moss" => {
-            hf_cached("mlx-community/MOSS-TTS-Nano-100M")
-                && hf_cached("mlx-community/MOSS-Audio-Tokenizer-Nano")
-        }
-        "qwen" => hf_cached("mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16"),
-        _ => true,
+        "moss" => &[
+            "mlx-community/MOSS-TTS-Nano-100M",
+            "mlx-community/MOSS-Audio-Tokenizer-Nano",
+        ],
+        "qwen" => &["mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16"],
+        _ => &[],
     }
 }
 
 fn hf_cached(model: &str) -> bool {
-    let snapshots = hf_cache_dir()
-        .join(format!("models--{}", model.replace('/', "--")))
-        .join("snapshots");
+    let snapshots = hf_model_dir(model).join("snapshots");
     std::fs::read_dir(snapshots)
         .ok()
         .is_some_and(|mut entries| entries.next().is_some())
+}
+
+fn hf_model_dir(model: &str) -> PathBuf {
+    hf_cache_dir().join(format!("models--{}", model.replace('/', "--")))
+}
+
+/// Delete a downloaded model without removing a shared runtime.
+///
+/// MOSS and Qwen share one `qwen3-tts` Python environment, so their Hugging
+/// Face repositories are removed independently. Engines with direct model
+/// files lose only those files. Package environments and system packages stay
+/// in place: a later download can reuse them, and deleting one model cannot
+/// make another engine disappear.
+pub fn delete_model(engine: &str, spec: &EngineSpec) -> Result<usize, String> {
+    let mut targets: Vec<PathBuf> = hf_models(engine)
+        .iter()
+        .map(|model| hf_model_dir(model))
+        .collect();
+    for fetch in &spec.fetch {
+        let path = expand_tilde(&fetch.to);
+        if path.starts_with(crate::paths::home()) {
+            targets.push(path);
+        }
+    }
+    if targets.is_empty() {
+        return Err("this engine does not expose separately removable model files".to_string());
+    }
+
+    let mut removed = 0;
+    for target in targets {
+        if !target.exists() {
+            continue;
+        }
+        let result = if target.is_dir() {
+            std::fs::remove_dir_all(&target)
+        } else {
+            std::fs::remove_file(&target)
+        };
+        result.map_err(|err| format!("cannot delete {}: {err}", target.display()))?;
+        removed += 1;
+    }
+    if removed == 0 {
+        Err("no local model files were found".to_string())
+    } else {
+        Ok(removed)
+    }
 }
 
 /// Hugging Face's own cache precedence. The downloader inherits these same
@@ -1008,6 +1049,23 @@ mod tests {
     }
 
     #[test]
+    fn hugging_face_downloads_use_the_snapshot_download_repo_id_argument() {
+        let presets = presets();
+        let plan = plan("moss", &presets["moss"]).expect("moss has a managed install");
+        let download = plan
+            .steps
+            .iter()
+            .find(|step| step.line().contains("snapshot_download"))
+            .expect("moss downloads its model snapshots explicitly")
+            .line();
+
+        assert!(
+            download.contains("snapshot_download(repo_id=m)"),
+            "huggingface_hub::snapshot_download accepts repo_id, not model_id: {download}"
+        );
+    }
+
+    #[test]
     fn a_pinned_python_reaches_the_command_line() {
         let presets = presets();
         let Ok(plan) = plan("kokoro", &presets["kokoro"]) else {
@@ -1056,6 +1114,12 @@ mod tests {
             }
             .enough()
         );
+    }
+
+    #[test]
+    fn model_download_sizes_are_labeled_in_the_correct_binary_unit() {
+        assert_eq!(bytes(318 * 1024 * 1024), "318.0 MB");
+        assert_eq!(bytes(5 * 1024 * 1024 * 1024), "5.0 GB");
     }
 
     #[test]

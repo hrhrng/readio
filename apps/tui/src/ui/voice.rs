@@ -59,6 +59,7 @@ pub enum Action {
     None,
     Close,
     Install(String),
+    Delete(String),
     Save,
     FollowDefault { id: String, title: String },
 }
@@ -73,6 +74,7 @@ pub struct Workspace {
     draft: Draft,
     editing_params: bool,
     confirm_install: Option<String>,
+    confirm_delete: Option<String>,
     space_check: Option<(String, install::Space)>,
 }
 
@@ -112,6 +114,7 @@ impl Workspace {
             draft,
             editing_params: false,
             confirm_install: None,
+            confirm_delete: None,
             space_check: None,
         }
     }
@@ -162,12 +165,14 @@ impl Workspace {
             Pane::Config => Pane::Models,
         };
         self.confirm_install = None;
+        self.confirm_delete = None;
         self.space_check = None;
     }
 
     pub fn step(&mut self, delta: isize, config: &Config) {
         self.editing_params = false;
         self.confirm_install = None;
+        self.confirm_delete = None;
         self.space_check = None;
         match self.focus {
             Pane::Models => {
@@ -193,6 +198,7 @@ impl Workspace {
     }
 
     fn activate_model(&mut self, config: &Config, installing: Option<&str>) -> Action {
+        self.confirm_delete = None;
         let names = model_names(config);
         let Some(name) = names.get(self.model_at).cloned() else {
             return Action::None;
@@ -224,6 +230,32 @@ impl Workspace {
         } else {
             self.space_check = install::space(&name).map(|space| (name.clone(), space));
             self.confirm_install = Some(name);
+            Action::None
+        }
+    }
+
+    pub fn delete(&mut self, config: &Config, installing: Option<&str>) -> Action {
+        if self.focus != Pane::Models {
+            return Action::None;
+        }
+        self.confirm_install = None;
+        self.space_check = None;
+        let names = model_names(config);
+        let Some(name) = names.get(self.model_at).cloned() else {
+            return Action::None;
+        };
+        let Some(spec) = config.spec(&name) else {
+            return Action::None;
+        };
+        if installing == Some(name.as_str()) || !install::model_is_ready(&name, spec) {
+            self.confirm_delete = None;
+            return Action::None;
+        }
+        if self.confirm_delete.as_deref() == Some(name.as_str()) {
+            self.confirm_delete = None;
+            Action::Delete(name)
+        } else {
+            self.confirm_delete = Some(name);
             Action::None
         }
     }
@@ -369,6 +401,8 @@ impl Workspace {
             Action::None
         } else if self.confirm_install.take().is_some() {
             self.space_check = None;
+            Action::None
+        } else if self.confirm_delete.take().is_some() {
             Action::None
         } else {
             Action::Close
@@ -619,6 +653,7 @@ fn render_models(
     if let Some(name) = names.get(workspace.model_at)
         && let Some(spec) = config.spec(name)
     {
+        let ready = install::model_is_ready(name, spec);
         let detail = truncate(&spec.about, width.saturating_sub(2));
         lines.push(Line::styled(
             format!("  {detail}"),
@@ -724,6 +759,28 @@ fn render_models(
                         th.accent_warning
                     },
                 ),
+            ));
+        } else if workspace.confirm_delete.as_deref() == Some(name.as_str()) {
+            lines.push(Line::styled(
+                format!(
+                    "  {}",
+                    tr(
+                        "再次按 d 删除本地模型文件；配置保持不变",
+                        "Press d again to delete local model files; configuration will not change"
+                    )
+                ),
+                Style::default().fg(th.accent_warning),
+            ));
+        } else if ready {
+            lines.push(Line::styled(
+                format!(
+                    "  {}",
+                    tr(
+                        "连续按两次 d 删除本地模型文件",
+                        "Press d twice to delete local model files"
+                    )
+                ),
+                Style::default().fg(th.text_faint),
             ));
         } else if spec.pip.is_empty() && spec.system.is_empty() {
             lines.push(Line::styled(
