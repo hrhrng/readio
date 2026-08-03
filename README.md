@@ -14,6 +14,20 @@ Built in Rust as a keyboard-first TUI. Chapters follow the book's own table of c
 
 Every number on screen is a real reading — real paragraph offsets, real line ranges, real full-text search hits. Only the vocabulary is costume.
 
+## See it in action
+
+Read aloud with a local MOSS model while the spoken sentence and current word stay highlighted:
+
+![Read-aloud with synchronized text highlighting powered by the local MOSS model](docs/assets/readio/read-aloud-moss.gif)
+
+Import a book, then read it in agent-shaped turns:
+
+| Import an EPUB | Read the book |
+| --- | --- |
+| ![Importing an EPUB from the readio library](docs/assets/readio/import-epub.png) | ![Reading an EPUB in the terminal](docs/assets/readio/reading-session.png) |
+
+<sub>Captured from real readio sessions in a terminal.</sub>
+
 ```
  readio   The Shape of Attention  readio sample                   ch 1/4  ·  ctx 0.0%
    ○  3. Three  The feel of a tool  783 tok
