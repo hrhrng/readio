@@ -170,8 +170,9 @@ impl Ladder {
     }
 }
 
-/// Read-aloud engines cannot resample arbitrarily, and a reveal speed of zero is
-/// a hang, so every multiplier lands inside the same range `/rate` accepts.
+/// The embedded player and the text pacer share this supported range, and a
+/// reveal speed of zero is a hang, so every multiplier lands inside the same
+/// range `/rate` accepts.
 fn clamp(multiplier: f32) -> f32 {
     if multiplier.is_finite() {
         multiplier.clamp(0.5, 3.0)

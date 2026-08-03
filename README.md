@@ -1,6 +1,6 @@
 # readio
 
-**A terminal reader with the interaction grammar of a coding agent.** Press enter and it thinks, issues a tool call, and streams the next passage of your book.
+**An open-source terminal ebook reader and local TTS audiobook player disguised as an AI coding agent.** Read EPUB, PDF, Markdown and plain text without leaving the terminal: press enter and it thinks, issues a tool call, then streams the next passage of your book. It looks like coding; the book is real.
 
 [![tui-ci](https://github.com/hrhrng/readio/actions/workflows/tui-ci.yml/badge.svg?branch=main)](https://github.com/hrhrng/readio/actions/workflows/tui-ci.yml)
 [![release](https://img.shields.io/github/v/release/hrhrng/readio?include_prereleases&filter=tui-v*&label=release&color=6f5ec7)](https://github.com/hrhrng/readio/releases)
@@ -10,7 +10,7 @@
 
 [中文文档](README.zh-CN.md)
 
-EPUB, text-layer PDF, Markdown and plain text. Chapters as the book's own table of contents defines them, italics kept, covers and illustrations drawn in the terminal. Read-aloud through a local model of your choice, with the spoken sentence and the sounded character highlighted. One 4 MB binary with no bundled model, no assets, no runtime dependencies, and no environment variables.
+Built in Rust as a keyboard-first TUI. Chapters follow the book's own table of contents, italics stay italic, and covers and illustrations are drawn in the terminal. Read-aloud uses a local model of your choice, with the spoken sentence and sounded character highlighted. The core is one 4 MB binary with no bundled model, assets, runtime dependencies or required cloud account.
 
 Every number on screen is a real reading — real paragraph offsets, real line ranges, real full-text search hits. Only the vocabulary is costume.
 
@@ -30,7 +30,7 @@ Every number on screen is a real reading — real paragraph offsets, real line r
 
    The first time I noticed that attention has a shap▌
 ╭────────────────────────────────────────────────────────────────────────────────────╮
-│❯ enter to keep reading, or ask a question / type a command                         │
+│❯ enter to keep reading; / opens commands                                           │
 ╰────────────────────────────────────────────────────────────────────────────────────╯
   ⠼ One  Attention in eighty co…  ·  esc to stop  ·  ↑↓ … ⸬ readio-1  64 tok  ·  0:06
 ```
@@ -96,28 +96,35 @@ readio book.md -m      # move: relocate the file into the library
 
 Copies land in `~/.readio/books`. Use `readio --home <dir>` to keep a separate library. With no book to hand, `/sample` opens a short built-in text.
 
-**Enter reads the next passage. Anything you type is treated as a question and runs a full-text search.**
+**Enter reads the next passage. Slash commands act on the book; `/find <term>` searches it.** A bare number chooses from the library or the search results currently on screen. Other text stays in the composer until it becomes a command, so a typo never turns into an accidental whole-book search.
 
 | Key | Action |
 | --- | --- |
-| `enter` | keep reading; again mid-passage to rush it to the end |
-| `esc` | interrupt |
-| `↑` `↓` · wheel · `pgup` `pgdn` · `home` `end` | scroll |
+| `enter` | keep reading or resume; mid-turn, hurry the turn while spoken text still follows the voice |
+| `esc` | interrupt and hold your place; `enter` resumes |
+| `space` | play/pause when the composer is empty; in Read-aloud the audio cursor is exact |
+| `shift+tab` | cycle Manual → Auto → Read-aloud |
+| `↑` `↓` · wheel · `pgup` `pgdn` · `home` `end` | scroll; at the bottom in Manual, load the next passage |
+| `←` `→` | previous or next sentence in Read-aloud; otherwise move through the composer |
+| `[` `]` | slower or faster Read-aloud playback |
 | `^t` · `^o` | fold or unfold reasoning · tool calls |
-| `^s` · `^r` | toggle read-aloud · cycle its speed (0.75× → 2×) |
+| `^s` | enter Read-aloud; press again to return to the previous mode |
+| `^r` | move to the next reasoning-effort level; higher effort reads more slowly |
 | `^g` · `^b` | jump to the next · previous search hit |
-| `^p` `^n` · `^l` · `^c` `^d` | input history · clear · quit |
+| `^p` `^n` · `^l` | input history · clear the screen |
+| `^c` · `^d` | discard a running turn / confirm quit · quit immediately |
 
 | Command | Purpose |
 | --- | --- |
-| `/lib` `/open <n>` `/import <path>` `/forget <n>` | manage the library |
-| `/toc` `/goto <n>` `/next` `/prev` | move between chapters |
+| `/lib` `/open <n>` `/import <path>` `/forget <n>` `/sample` | manage the library |
+| `/toc` `/plan` `/goto <n>` `/next` `/prev` | choose or move between chapters |
 | `/find <term>` | search the whole book; type a number to jump to that hit |
 | `/mark [note]` `/marks [n]` `/unmark <n>` | keep a place, list places, drop one |
-| `/auto` `/speed <n>` | keep reading unattended · reveal speed |
-| `/context` `/progress` `/plan` | where you are |
-| `/tts [engine]` `/voice [auto|zh|en|<name>]` `/rate <0.5-3>` `/device` | which voice reads to you, installing one, audio output |
-| `/lang en\|zh` `/help` `/quit` | interface language · help · exit |
+| `/mode [manual\|auto\|aloud]` `/auto` | choose a reading mode · toggle Manual/Auto |
+| `/effort [level]` `/rate <0.5-3>` `/speed <n>` | reading effort · retune its multiplier · base reveal speed |
+| `/voice` (`/tts` alias) `/device` | download and configure voices · restrict audio output |
+| `/context` `/progress` | session readout · one-line position |
+| `/lang en\|zh` `/clear` `/help` `/quit` | interface language · clear · help · exit |
 
 ## What the interface pretends to be
 
@@ -127,7 +134,7 @@ Copies land in `~/.readio/books`. Use `readio --home <dir>` to keep a separate l
 | Characters in a passage | `735 tok`, a token count |
 | Time since you opened the book | `0:15`, a session clock |
 | Fetching the next passage | a tool call: `● Read book.epub#ch1  L1-9  ·  0.3s` |
-| Full-text search | the question you asked, with real hit counts |
+| Full-text search | the `/find` you asked for, with real hit counts |
 
 ## Reading a book as the book is written
 
@@ -143,51 +150,48 @@ readio follows the file rather than the filesystem.
 
 ## Search
 
-`/find <term>` — or simply a question typed at the prompt — searches the whole book and counts **every** occurrence, not one per paragraph. The header reports what a reader wants to know before deciding whether to look: `pattern: memory · 45 matches · 30 lines · showing 12`. Matching ignores case and treats full-width punctuation and Latin letters as their ASCII equivalents, so a term typed on an English keyboard still finds text typeset in Chinese.
+`/find <term>` searches the whole book and counts **every** occurrence, not one per paragraph. The header reports what a reader wants to know before deciding whether to look: `pattern: memory · 45 matches · 30 lines · showing 12`. Matching ignores case and treats full-width punctuation and Latin letters as their ASCII equivalents, so a term typed on an English keyboard still finds text typeset in Chinese.
 
 Type the number of a hit to jump there; `^g` and `^b` walk forward and back through the list and say so when they wrap. Arriving at a hit lights the term deeply inside its lightly washed sentence — the same two-level highlight read-aloud uses — so the eye lands on the word rather than on the paragraph.
 
-A question in Chinese rarely reads as a search term, so readio narrows it before searching: interrogative tails such as 是什么样子 or 怎么 are stripped, then progressively shorter windows of the remaining text are tried, widest first. What comes back is the answer to the longest phrase that actually occurs in the book.
+A natural-language question may be passed explicitly to `/find`. A Chinese question rarely reads as a search term, so readio narrows it before searching: interrogative tails such as 是什么样子 or 怎么 are stripped, then progressively shorter windows of the remaining text are tried, widest first. What comes back is the longest phrase that actually occurs in the book.
 
 ## Read-aloud
 
-readio ships no speech model. It drives whichever engine you have installed through command templates in the config file, so changing models is an edit rather than a new release.
+readio ships no speech model, and a fresh install selects none. `/voice` opens one workspace with two deliberately separate panes: the left downloads and validates models; the right assigns a ready model, voice, language and parameters globally or to one selected book. A download never changes configuration, and saving configuration never starts a hidden download. Enter Read-aloud separately with `shift+tab`, `^s` or `/mode aloud`.
 
 | Engine | Size · licence | Notes |
 | --- | --- | --- |
-| `kokoro` | 82M · Apache-2.0 | default; best voice here, and it stays loaded |
-| `espeak` | ~4M · GPL-3.0 | instant and robotic; one `brew`/`apt` package, nothing to download |
-| `piper` | ~15M · GPL-3.0 | fastest neural voice to first sound; text on stdin |
-| `supertonic` | 99M · MIT | pure ONNX, no torch, 31 languages |
-| `openai` | — | any OpenAI-compatible `/v1/audio/speech` endpoint |
+| `moss` | 120M · Apache-2.0 | recommended Mandarin audiobook voice on Apple Silicon; resident |
+| `kokoro` | 82M · Apache-2.0 | recommended English voice (`af_heart`); resident |
+| `qwen` | 0.6B · Apache-2.0 | optional Mandarin alternative; larger and stiffer |
+| `espeak` | non-neural · GPL-3.0 | multilingual, instant and robotic; one system package |
+| `piper` | ~7–32M · GPL-3.0 | voice-specific Chinese or English; fast neural first sound |
+| `supertonic` | 99M · MIT | multilingual, English strongest; pure ONNX, no torch |
+| `openai` | remote service | any compatible `/v1/audio/speech` endpoint |
 
-`/tts` asks which voice, and answers the part you cannot know from a list: whether you already have it. Picking an engine you have switches to it and starts reading; picking one you do not installs it — with whichever of `uv`, `pipx` and `pip` you turn out to have, the Python version the package insists on, and the voice model it does not ship. Every command is written out before it runs, and shown running:
+Before a model download, readio shows its estimated size and the free space it found, then asks for confirmation. It installs a pinned standalone `uv`, managed Python builds, tool environments and launchers below the platform user cache; no system Python, `uv`, `pip` or `pipx` is required. It deliberately leaves the normal uv and Hugging Face cache locations alone, so downloads already on the machine remain cache hits. Every command is written out before it runs, and shown running:
 
 ```
-● Bash uv tool install --python 3.12 kokoro-tts  1/1  ·  24.8s
+● Bash UV_TOOL_DIR=…/readio/runtime/tools …/readio/runtime/bin/uv
+  tool install --managed-python --python 3.12 kokoro-tts  3/5  ·  24.8s
   Installed 61 packages in 3.42s
    + kokoro-tts==0.9.4
 
-○ kokoro is installed (25s). Read-aloud is on: kokoro · zf_xiaoxiao
+○ kokoro downloaded after 25s. Voice configuration was not changed.
 ```
 
-If the command lands somewhere that is not on your PATH — `uv` and `pipx` both like `~/.local/bin` — readio records where it went instead of asking you to edit a shell profile. `openai` is the exception: it is a server you run yourself, and readio says so rather than pretending it can install it.
+`openai` is the exception: it is a server you run yourself, and readio says so rather than pretending it can install it. `/tts` remains an alias for opening the same Voice workspace; it is not a second switch.
 
-A multilingual model still has to be told which language it is looking at, and its default is rarely yours: `kokoro-tts` assumes `en-us`, so Chinese handed to it unannounced is sounded out with English letter-to-sound rules — the same eighteen-character sentence takes 13.6 seconds that way and 4.1 seconds said properly. readio decides per sentence instead, from the text, and moves the voice with the language, because in Kokoro they are one decision rather than two. A bilingual chapter switches mid-page with nothing to set:
-
-```
-❯ auto (active)  match each passage as it comes
-  en             pin this language, read by af_heart
-  zh             pin this language, read by zf_xiaoxiao
-```
-
-`auto` is a row in `/voice` rather than only a value in the config file, because a setting that can only be turned on is a trap: before it existed, `/voice af_heart` was a one-way door out of automatic that only a text editor could reopen.
+A multilingual model still has to be told which language it is looking at, and its default is rarely yours: `kokoro-tts` assumes `en-us`, so Chinese handed to it unannounced is sounded out with English letter-to-sound rules. Language, engine and voice are therefore explicit global or per-book choices in the Voice form. Text never changes them sentence by sentence.
 
 While a passage is spoken, its sentence is washed lightly and the word or character being sounded is washed deeply, and the reveal speed follows each clip's real duration rather than a guess.
 
-Speed works the way an audiobook app's does. `^r` cycles 0.75×, 1×, 1.25×, 1.5×, 2× — the same ladder the web player offers — and `/rate` takes any value from 0.5 to 3. The multiplier sits in the status line next to the engine while audio is playing. Because clips are *rendered* at a speed rather than resampled on playback, a change throws away everything already prefetched and re-queues from the start of the sentence you are hearing, so the new speed arrives within a sentence instead of at the next passage.
+Speed works the way an audiobook app's does. In Read-aloud, `[` and `]` step through 0.75×, 1×, 1.25×, 1.5× and 2×; `/rate` accepts any value from 0.5 to 3 for the current effort level, while `^r` cycles the named effort levels used by both text and voice. The embedded player changes tempo through libsonic while preserving pitch. Canonical 1× clips, the current audio pointer, the synthesis cache and everything already prefetched remain valid across a speed change.
 
-Sentences are rendered ahead of playback — `tts.prefetch`, two by default — on a thread of their own, so a sentence boundary is not a hole the length of your engine's synthesis time. The boundary between two paragraphs is covered as well: readio asks the turn where it is going, and has the opening sentence of the next paragraph rendered underneath the last clip of this one, rather than starting it cold into silence.
+Space pauses at the live PCM frame and resumes from the same audio millisecond. `←` and `→` move to the previous or next textual sentence without leaving Read-aloud. Token reveal and both highlight levels sample the same presentation clock as the audio, so pausing, seeking and changing speed cannot make text run on by itself.
+
+Sentences are rendered ahead of playback on a thread of their own. `voice.prefetch`, eight by default, is a hard sentence cap; inside it a playback-aware controller targets roughly 24 seconds of runway and renders farther ahead at faster live speeds. The boundary between two paragraphs is covered as well: readio asks the turn where it is going and warms the next paragraph's opening sentence underneath the current one.
 
 Engines that support it are kept running rather than started per sentence, which is most of what makes a local model usable: Kokoro took 8.4 seconds for a short sentence through its command line and takes 0.5–0.8 as a resident process with its phonemizer cached. If you would rather have sound instantly than have it beautiful, `espeak` says the same sentence in 0.03 and installs from one `brew` or `apt` package.
 
@@ -197,13 +201,13 @@ And read-aloud does not degrade. If the voice breaks — engine gone, device not
 
 ## Configuration
 
-One file, `~/.readio/config.yaml`, written with comments on first run. readio reads no environment variables. The interface is English by default; set `language: zh` for Chinese. Commands like `/speed`, `/voice`, `/rate` and `/device` write their changes back to the same file.
+One file, `~/.readio/config.yaml`, written with comments on first run. readio reads no environment variables. The interface is English by default; set `language: zh` for Chinese. Commands such as `/mode`, `/effort`, `/speed`, `/voice`, `/rate`, `/lang` and `/device` write their changes back to the same file.
 
 ## Development
 
 ```sh
 cd apps/tui
-cargo test                                     # 333 tests
+cargo test                                     # full Rust suite
 python3 scripts/pty_probe.py 96 24 "wait:0.6,type:/sample,key:enter,wait:2"
 ```
 

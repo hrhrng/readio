@@ -132,18 +132,22 @@ One multiplier drives both worlds: text appears at `reading.speed × multiplier`
 
 The numbers belong to the reader, not to readio. All six live under `effort.multipliers` in the config file; `/rate <0.5-3.0>` retunes the level in force and writes it back, so `/effort xhigh` then `/rate 0.9` is how someone makes their slow gear their own; `/speed <n>` moves the base the multipliers scale. `/effort` with no argument opens the ladder above the composer, each level showing the multiplier behind it and `(active)` on the one in force — the one place the costume and the honest numbers sit side by side.
 
-Clips are rendered at a speed rather than resampled at playback, so a level change throws away everything prefetched and re-queues from the start of the sentence that was playing: the reader hears the new pace within a sentence instead of at the next passage.
+Speech clips are rendered and cached once as canonical 1× audio. The embedded
+player applies the effort multiplier at the live playback cursor through
+libsonic, preserving pitch while leaving the current pointer, prefetched queue
+and synthesis cache intact. A level change therefore takes effect immediately
+without asking the model to say the sentence again.
 
 ## The command menu
 
 The menu has two levels, because a value is as hard to remember as a command.
 
 1. `/` and a partial name offers commands: name, argument shape, and a one-line description.
-2. `/name ` offers that command's answers. For a fixed set — `/effort`, `/mode`, `/lang`, `/voice` — those are the levels, modes, languages, voices and engines, each with what it means and `(active)` on the one in force; nobody should have to know that `xhigh` is spelled without a hyphen, or which of their engines the config calls `piper`. For a command whose answers are the reader's own things — `/open`, `/goto`, `/marks`, `/unmark` — they are their books, chapters and bookmarks. For `/import` they are files and directories, read from the disk.
+2. `/name ` offers that command's answers. For a fixed set — `/effort`, `/mode`, `/lang` — those are the levels, modes and languages, each with what it means and `(active)` on the one in force; nobody should have to know that `xhigh` is spelled without a hyphen. For a command whose answers are the reader's own things — `/open`, `/goto`, `/marks`, `/unmark` — they are their books, chapters and bookmarks. For `/import` they are files and directories, read from the disk. `/voice` is deliberately larger than an argument menu and opens its two-pane workspace instead.
 
 `↑` `↓` move, `tab` completes the highlighted row, `⏎` runs it — or completes it, when the command cannot run without an argument. The bracket in `args` is what decides: `<n>` means `⏎` completes, `[n]` means the bare form does something worth seeing. Value rows are built per frame rather than declared, because half of what they say — which level is active, what multiplier it stands for, which engines are installed — is a fact about the reader's config.
 
-The same list is what a key opens. `^r`, a bare `/effort`, launching with a library, or `/goto` with no number all raise a **select**: the same rows, anchored above the composer, `↑` `↓` to choose and `⏎` to confirm. A select keeps its own narrowing text rather than borrowing the prompt line, because writing `/effort ` into the composer to hold the state throws away whatever the reader was halfway through typing. Two rules make it safe: a select never touches what the reader was typing, and `/` always begins a command — the library select is open the moment readio starts, so the first thing anyone types would otherwise be eaten by a filter.
+A bare `/effort`, `/toc` or `/plan`, launching with a library, and `/goto` with no number all raise a **select**: rows anchored above the composer, `↑` `↓` to choose and `⏎` to confirm. (`^r` is the fast path and advances to the next effort immediately.) A select keeps its own narrowing text rather than borrowing the prompt line, because writing a command into the composer to hold the state throws away whatever the reader was halfway through typing. Two rules make it safe: a select never touches what the reader was typing, and `/` always begins a command — the library select is open the moment readio starts, so the first thing anyone types would otherwise be eaten by a filter.
 
 That is also why no command prints a numbered listing into the transcript any more. Sixteen books in the log with "type 7" underneath is a listing pretending to be a control: it costs a screenful, it goes stale as soon as anything changes, and it cannot be navigated. The transcript keeps the book and what happened to it; the questions live where they are answered.
 
@@ -383,25 +387,33 @@ The global timeline, token reveal and highlight all hold at that acknowledged
 position. It does not cancel or re-queue the sentence, so another space
 continues from the same audio millisecond without repeating what was already
 heard. `esc` followed by `⏎` uses the same held audio pointer while a
-Read-aloud turn is interrupted.
+Read-aloud turn is interrupted. `←` and `→` resolve that pointer back onto the
+source and move to the previous or next textual sentence without changing
+reading mode.
 
-Speed applies at synthesis, not at playback: resampling would change the voice along with the tempo. The cost is that a speed change invalidates everything already prefetched, so `set_effort` flushes the pipeline, notes where the sentence in progress began, and re-queues from there. A change is heard within a sentence rather than at the next passage.
+Speed applies at playback, not synthesis. The embedded output passes canonical
+1× PCM through libsonic, whose time stretching changes tempo without raising or
+lowering the voice. `Speaker::set_rate` updates the one presentation clock and
+the playback-aware runway calculation; it does not flush the clip on the air,
+the prefetched queue or the durable synthesis cache.
 
-Sentences are rendered ahead of playback on a thread of their own, `voice.prefetch` of them (two by default), so a sentence boundary is not a hole the length of the engine's synthesis time:
+Sentences are rendered ahead of playback on a thread of their own.
+`voice.prefetch` is a hard sentence cap (eight by default); within that bound
+the controller uses the live media cursor and playback rate to target roughly
+24 seconds of wall-clock runway. Faster playback therefore renders farther
+ahead without turning a long chapter into an unbounded second audiobook:
 
 ```
-render thread ──push──▶ queue (capacity = prefetch) ──pop──▶ playback thread
-                          ▲                                      │
-                          └── flush(): drop clips, delete wavs ───┘
+render thread ──push──▶ queue (cap = 8, target ≈ 24 s) ──pop──▶ player ──sonic──▶ device
+                          ▲
+                          └── stop/jump/engine change: flush stale work
 ```
 
-The queue is a `Mutex<VecDeque>` with two condition variables rather than a bounded channel, because a bounded channel cannot be emptied by a third party — the render thread would block sending a clip nobody wants. A locked queue lets `stop()` take the lock, delete the scratch wavs, and wake both threads. Each job carries an `era`; `flush()` bumps it and both threads discard work from an older era, so cancelling never means killing a thread.
+The queue is a `Mutex<VecDeque>` with two condition variables rather than a bounded channel, because a bounded channel cannot be emptied by a third party — the render thread would block sending a clip nobody wants. A locked queue lets `stop()` take the lock, delete stale scratch wavs, and wake both threads. Each job carries an `era`; `flush()` bumps it and both threads discard work from an older era, so cancelling never means killing a thread. Transport changes such as pause and playback rate only wake the runway controller; they do not create a new era.
 
 That covers every boundary inside a paragraph. It cannot cover the boundary *between* two of them, because until the next turn starts the next paragraph does not exist: the reader waits out a thinking line, a tool call and then a whole synthesis, in silence, every few hundred characters. Rendering ahead has nothing to render.
 
 So the turn is asked where it is going while it is still running. `Step::Advance` sits at the back of its queue for the whole turn, which makes it an honest answer; when the voice is down to its last clip and no more speech is queued, `App::render_ahead` works out the paragraph that comes next, takes its opening sentence, and sends it to the engine as `Command::Warm`. The render thread keeps it in a slot of its own — outside the prefetch queue, which belongs to the passage already begun — and hands it over the moment that sentence is asked for in earnest. Nothing is displayed early and no step runs out of order; the only thing that moves is the engine's work, into the time when the engine has nothing else to do.
-
-Measured with a stand-in engine that takes two seconds a sentence, on a book of one-sentence chapters so the window is almost nothing but boundaries: silence fell from 43% of frames to 18%, and the longest unbroken gap from 3.3 s to 1.3 s — which is the thinking line and the tool call, and those are meant to be there. On a real Kokoro reading Chinese, the reveal goes from 170 to 240 words in the same 75 seconds, with no stall at all after the model has loaded.
 
 ### Output allowlist
 
@@ -481,13 +493,15 @@ The host directory:
 | `esc` | interrupt the turn, keeping your place; `⏎` carries on |
 | `space` | pause / resume at the same audio position |
 | `[` · `]` | slower · faster Read-aloud |
+| `←` · `→` | previous · next sentence in Read-aloud; otherwise move the input cursor |
 | `shift+tab` | cycle Manual → Auto → Read-aloud |
 | `/` | the command menu: `↑ ↓` to choose, `tab` completes, `⏎` runs |
 | `↑ ↓`, wheel, `pgup` `pgdn`, `home` `end` | scroll; at the bottom in manual mode, load more |
 | `^t` · `^o` | fold reasoning · tool calls |
 | `^s` · `^r` | enter Read-aloud / return to the previous mode · next reasoning effort |
 | `^g` · `^b` | next · previous search hit |
-| `^p` `^n` · `^l` · `^c` `^d` | input history · clear the screen · discard the turn, then quit |
+| `^p` `^n` · `^l` | input history · clear the screen |
+| `^c` · `^d` | discard a running turn / confirm quit · quit immediately |
 
 | Area | Commands |
 | --- | --- |

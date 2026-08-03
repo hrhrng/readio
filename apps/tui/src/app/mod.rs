@@ -145,8 +145,8 @@ pub struct App {
     marking: Option<String>,
 }
 
-/// A select the reader did not type: `^r` reaching for the effort ladder, `/toc`
-/// asking which chapter, the library asking which book.
+/// A select the reader did not type: `/effort` reaching for the effort ladder,
+/// `/toc` asking which chapter, the library asking which book.
 ///
 /// The rows come from the same place the typed menu's do, so there is one list of
 /// answers and one way to move through it; what differs is only where the
@@ -3107,7 +3107,8 @@ impl App {
             Ok(v) if (0.5..=3.0).contains(&v) => {
                 let level = self.cfg.effort.level;
                 self.cfg.effort.multipliers.set(level, v);
-                // Re-entering the level applies it and re-queues the audio.
+                // Re-entering the level applies the new presentation rate at
+                // the live player cursor without asking synthesis to run again.
                 self.set_effort(level);
                 let times = effort::times(self.multiplier());
                 self.system(&tf("effort.tuned", &[&level.label(), &times]));
