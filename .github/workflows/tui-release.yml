@@ -40,6 +40,8 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -56,8 +58,8 @@ jobs:
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Package
-        id: package
+      - name: Package Unix archive
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -68,12 +70,22 @@ jobs:
           tar -czf "$name" \
             -C "target/${{ matrix.target }}/release" readio \
             -C "$GITHUB_WORKSPACE/apps/tui" README.md LICENSE
-          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Package Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { "${{ github.event.inputs.tag }}" }
+          $name = "readio-$version-${{ matrix.target }}.zip"
+          $stage = Join-Path $env:RUNNER_TEMP "readio-package"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/readio.exe", "README.md", "LICENSE" -Destination $stage
+          Compress-Archive -Path "$stage/*" -DestinationPath $name
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: apps/tui/${{ steps.package.outputs.name }}
+          path: apps/tui/readio-*-${{ matrix.target }}.*
           if-no-files-found: error
 
   publish:
@@ -93,7 +105,10 @@ jobs:
         working-directory: dist
         run: |
           set -euo pipefail
-          sha256sum *.tar.gz | tee SHA256SUMS
+          find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0 \
+            | sort -z \
+            | xargs -0 sha256sum \
+            | tee SHA256SUMS
 
       - name: Release
         uses: softprops/action-gh-release@v2
@@ -107,4 +122,32 @@ jobs:
           generate_release_notes: true
           files: |
             dist/*.tar.gz
+            dist/*.zip
             dist/SHA256SUMS
+            apps/tui/scripts/install.ps1
+
+  smoke-windows:
+    name: install published Windows release
+    needs: publish
+    runs-on: windows-latest
+    steps:
+      - name: Download the published installer
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { "${{ github.event.inputs.tag }}" }
+          gh release download $tag --repo $env:GITHUB_REPOSITORY --pattern install.ps1 --dir $env:RUNNER_TEMP
+          "READIO_TEST_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Install twice and run the published binary
+        shell: pwsh
+        run: |
+          $installDir = Join-Path $env:RUNNER_TEMP "readio-bin"
+          $sentinel = Join-Path $HOME ".readio/ci-sentinel"
+          New-Item -ItemType Directory -Force -Path (Split-Path $sentinel) | Out-Null
+          Set-Content -LiteralPath $sentinel -Value "keep"
+          & "$env:RUNNER_TEMP/install.ps1" -Version $env:READIO_TEST_TAG -InstallDir $installDir
+          & "$installDir/readio.exe" --version
+          & "$installDir/readio.exe" --help
+          & "$env:RUNNER_TEMP/install.ps1" -Version $env:READIO_TEST_TAG -InstallDir $installDir
+          if ((Get-Content -LiteralPath $sentinel) -ne "keep") { throw "installer changed user data" }

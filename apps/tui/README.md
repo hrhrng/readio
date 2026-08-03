@@ -568,7 +568,7 @@ still reduced to `default-features = false, features = ["deflate"]`, because
 EPUB needs only store and deflate. Linux releases use musl's compiler and
 linker to keep the result self-contained across distributions.
 
-Four archives are published: `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`. Pushing a `tui-v*` tag builds all four, writes `SHA256SUMS`, and creates the release (`.github/workflows/tui-release.yml`). Windows and anything else builds from source; see the repository README.
+Five archives are published: `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, and `x86_64-pc-windows-msvc`. Pushing a `tui-v*` tag builds them, writes `SHA256SUMS`, creates the release, then installs and runs the published Windows artifact on a clean runner (`.github/workflows/tui-release.yml`).
 
 Releases are on a beta channel: tags look like `tui-v0.Y.0-beta.N` and anything with `-beta` or `-rc` is flagged as a prerelease. `install.sh` therefore reads the releases *list* rather than `/releases/latest`, which skips prereleases and would find nothing while the newest release is a beta.
 
