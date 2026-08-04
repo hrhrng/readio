@@ -6,7 +6,7 @@
 [![release](https://img.shields.io/github/v/release/hrhrng/readio?include_prereleases&filter=tui-v*&label=release&color=6f5ec7)](https://github.com/hrhrng/readio/releases)
 [![license](https://img.shields.io/badge/license-MIT-6f5ec7)](LICENSE)
 [![rust](https://img.shields.io/badge/rust-1.90%2B-6f5ec7)](https://www.rust-lang.org)
-![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-6f5ec7)
+![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-6f5ec7)
 
 [English](README.md)
 
