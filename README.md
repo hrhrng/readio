@@ -16,7 +16,7 @@ Every number on screen is a real reading — real paragraph offsets, real line r
 
 ## See it in action
 
-Read aloud with a local MOSS model while the spoken sentence and current word stay highlighted:
+Read aloud with a local tts model while the spoken sentence and current word stay highlighted:
 
 ![Read-aloud with synchronized text highlighting powered by the local MOSS model](docs/assets/readio/read-aloud-moss.gif)
 
