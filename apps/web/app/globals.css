@@ -1,6 +1,13 @@
 @import "tailwindcss";
 
 @theme {
+  --color-primary: var(--readio-primary);
+  --color-highlight: var(--readio-highlight);
+  --color-canvas: var(--readio-canvas);
+  --color-sidebar: var(--readio-sidebar);
+  --color-selected: var(--readio-selected);
+  --color-ink: var(--readio-ink);
+
   --color-surface: var(--surface);
   --color-surface-sidebar: var(--surface-sidebar);
   --color-surface-card: var(--surface-card);
@@ -18,20 +25,28 @@
 }
 
 :root {
-  --surface: #FFFFFF;
-  --surface-sidebar: #F5F5F7;
-  --surface-card: #FFFFFF;
-  --surface-hover: #F0F0F0;
-  --surface-active: rgba(0, 0, 0, 0.05);
-  --text-primary: #1D1D1F;
-  --text-secondary: #86868B;
-  --text-tertiary: #AEAEB2;
-  --accent: #6B8F71;
-  --border: #E5E5EA;
-  --badge-new: #6B8F71;
-  --highlight-sentence: color-mix(in srgb, var(--accent) 15%, #FFFFFF);
+  /* Readio — Clover Green / 三叶草绿 */
+  --readio-primary: #397548;
+  --readio-highlight: #BFD9C4;
+  --readio-canvas: #FCFCF8;
+  --readio-sidebar: #F7F7F2;
+  --readio-selected: #E0EBE1;
+  --readio-ink: #292929;
+
+  --surface: var(--readio-canvas);
+  --surface-sidebar: var(--readio-sidebar);
+  --surface-card: var(--readio-canvas);
+  --surface-hover: color-mix(in srgb, var(--readio-selected) 55%, var(--readio-canvas));
+  --surface-active: var(--readio-selected);
+  --text-primary: var(--readio-ink);
+  --text-secondary: #70706C;
+  --text-tertiary: #9A9A94;
+  --accent: var(--readio-primary);
+  --border: #E5E5DF;
+  --badge-new: var(--readio-primary);
+  --highlight-sentence: var(--readio-selected);
   --highlight-word: inherit;
-  --highlight-word-bg: color-mix(in srgb, var(--accent) 40%, #FFFFFF);
+  --highlight-word-bg: var(--readio-highlight);
 }
 
 .dark {
