@@ -3,9 +3,10 @@
 pub mod flow;
 pub mod turn;
 
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -14,9 +15,15 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::widgets::{Block as UiBlock, Widget};
+use readio_sdk::diagnostics::DiagnosticCategory;
+use readio_sdk::playback::{
+    PlaybackEffect, PlaybackEvent, PlaybackPolicy, PlaybackState, PlaybackStatus,
+};
+use serde_json::json;
 
 use crate::book::Book;
 use crate::config::{self, Chosen, Config};
+use crate::diagnostics::{DiagnosticLog, support_bundle_path, unix_time_milliseconds};
 use crate::effort::{self, Effort};
 use crate::i18n::{t, tf};
 use crate::library::{Library, Mode};
@@ -32,7 +39,6 @@ use crate::ui::prompt::Prompt;
 use crate::ui::scrollback::Scrollback;
 use crate::ui::voice as voice_ui;
 use crate::voice::device::{self, Gate, Verdict};
-use crate::voice::sentence::Unit;
 use crate::voice::{
     self, PlaybackPosition, Speaker, SpeechEvent, command::CommandSynth, install, sentence,
 };
@@ -54,6 +60,30 @@ const RUSH_CPS: f32 = 2_400.0;
 /// Coalesce a burst of sentence-navigation keys into one pipeline restart.
 const SPEECH_SEEK_DEBOUNCE: Duration = Duration::from_millis(120);
 
+fn diagnostic_document_format(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "epub" => "epub",
+        "pdf" => "pdf",
+        "md" | "markdown" => "markdown",
+        "html" | "htm" => "html",
+        _ => "plain_text",
+    }
+}
+
+fn wall_clock_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
 pub struct App {
     pub sb: Scrollback,
     pub prompt: Prompt,
@@ -67,6 +97,9 @@ pub struct App {
     pub quit: bool,
     show_help: bool,
     notice: Option<(String, Instant)>,
+    /// Why the current pause happened, when it was an automatic policy rather
+    /// than the reader pressing esc/space.
+    pause_reason: Option<String>,
     /// The next reading turn should explain that it restored progress.
     resumed: bool,
     /// Manual, automatic or read-aloud.
@@ -124,12 +157,16 @@ pub struct App {
     /// restart. Kept separate so later text runs in the same turn cannot reuse
     /// the one-shot restore offset.
     restoring_speech: Option<SpeechCheckpoint>,
-    /// Opt-in main-thread diagnostics. Voice callbacks never touch this file;
-    /// their events are recorded only after `pump_speech` receives them.
+    /// Explicit developer-only raw trace. It may include keys and short book
+    /// excerpts, so it is never used as the shareable support bundle.
     trace: Option<TraceLog>,
+    /// Bounded product facts whose only export path is Rust Core redaction.
+    diagnostics: DiagnosticLog,
     /// Last quarter-second media sample written, so a 30fps UI does not become
     /// a 30-lines-per-second log writer.
     voice_trace_sample: Option<(u64, (usize, usize), u128)>,
+    /// Correlates provider and playback facts for one read-aloud run.
+    voice_diagnostic_operation: Option<String>,
     /// The worker has nothing left to say; acted on once the last clip's own
     /// duration has elapsed.
     idle: bool,
@@ -154,6 +191,9 @@ pub struct App {
     /// Term to highlight in the next passage that contains it, set when a jump
     /// lands on a hit.
     marking: Option<String>,
+    /// Portable wall-clock sleep deadline. Rust Core decides when it fires;
+    /// the terminal only pauses its effects and shows the remaining time.
+    sleep_timer: PlaybackState,
 }
 
 /// A select the reader did not type: `/effort` reaching for the effort ladder,
@@ -227,6 +267,13 @@ fn opening_words(book: &Book, pos: Pos) -> String {
 /// thirteen chapters into seventy-one, and index 3 is suddenly a different page.
 /// The character offset does not move, so it decides whenever the two disagree.
 fn restore(book: &Book, saved: &Progress) -> Pos {
+    if let Some((chapter, para)) = saved
+        .locator
+        .as_ref()
+        .and_then(|locator| book.restore_text_locator(locator))
+    {
+        return Pos { chapter, para };
+    }
     let chapter = saved.chapter.min(book.chapters.len().saturating_sub(1));
     let by_index = Pos {
         chapter,
@@ -247,16 +294,34 @@ struct Cursor {
     id: u64,
     /// Byte range of the sentence inside that passage.
     sentence: (usize, usize),
-    /// Words or characters, in passage coordinates.
-    units: Vec<Unit>,
+    /// Zero-based sentence/utterance index in the active passage.
+    diagnostic_sentence_index: u64,
+    /// Shared Rust sentence/word index for this audio clip.
+    highlight: sentence::HighlightPlan,
     /// Character positions the clip owns on the passage reveal timeline:
     /// its sentence start and sentence-end ceiling. This stays absolute even
     /// when read-aloud begins after part of the sentence is already visible;
     /// the audio cursor then catches up instead of stretching the remainder
     /// over the whole clip.
     reveal: (usize, usize),
-    /// Last unit shown, so the scrollback is only touched when it changes.
-    shown: Option<(usize, usize)>,
+    /// Last Rust target shown, so the scrollback is only touched when it changes.
+    shown: Option<Highlight>,
+}
+
+impl Cursor {
+    fn highlight_at(&self, progress: f32) -> Option<Highlight> {
+        let target = self.highlight.at(progress)?;
+        let absolute = |range: (usize, usize)| {
+            (
+                range.0.saturating_add(self.sentence.0),
+                range.1.saturating_add(self.sentence.0),
+            )
+        };
+        Some(Highlight {
+            sentence: absolute(target.sentence),
+            word: target.word.map(absolute),
+        })
+    }
 }
 
 struct PendingSpeechSeek {
@@ -323,6 +388,7 @@ impl App {
             quit: false,
             show_help: false,
             notice: None,
+            pause_reason: None,
             resumed: false,
             mode,
             speech,
@@ -349,7 +415,9 @@ impl App {
             speech_checkpoint: None,
             restoring_speech: None,
             trace,
+            diagnostics: DiagnosticLog::load_persisted().unwrap_or_default(),
             voice_trace_sample: None,
+            voice_diagnostic_operation: None,
             idle: false,
             gate: None,
             find: None,
@@ -357,6 +425,7 @@ impl App {
             menu_at: 0,
             select: None,
             voice_workspace: None,
+            sleep_timer: PlaybackState::new(1),
         };
 
         if app.cfg.voice.output.is_active() {
@@ -399,7 +468,16 @@ impl App {
     /// Make `book` the open one, restoring its saved position.
     fn adopt(&mut self, book: Book) {
         self.save_progress();
-        let saved = self.store.get(&book.id).cloned();
+        let saved = if matches!(book.source, crate::book::Source::Sample) {
+            let sample = crate::book::sample::definition();
+            let saved = self
+                .store
+                .migrate_book_key(&book.id, &sample.legacy_item_ids);
+            let _ = self.store.save();
+            saved
+        } else {
+            self.store.get(&book.id).cloned()
+        };
         let pos = saved
             .as_ref()
             .map(|p| restore(&book, p))
@@ -524,6 +602,8 @@ impl App {
             self.notice = None;
         }
 
+        self.poll_sleep_timer();
+
         // Resolve an output-device change before the turn gets even one frame
         // to advance. A blocked read-aloud turn must stop; pumping first would
         // reveal tokens at the text clock and become a one-frame Auto fallback.
@@ -591,6 +671,99 @@ impl App {
                 Effect::Finished => self.on_turn_finished(),
             }
         }
+    }
+
+    fn poll_sleep_timer(&mut self) {
+        if self.sleep_timer.sleep_deadline_unix_ms.is_none() {
+            return;
+        }
+        let mut state = self.sleep_timer.clone();
+        state.status = PlaybackStatus::Playing;
+        let generation = state.generation;
+        let transition = readio_sdk::playback::reduce(
+            &PlaybackPolicy::default(),
+            state,
+            PlaybackEvent::ClockTick {
+                generation,
+                monotonic_ms: self.started.elapsed().as_millis() as u64,
+                unix_ms: wall_clock_unix_ms(),
+                audio_position_ms: self
+                    .voice_position()
+                    .map_or(0, |position| position.elapsed.as_millis() as u64),
+            },
+        );
+        let fired = transition
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, PlaybackEffect::PauseAudio));
+        self.sleep_timer = transition.state;
+        if !fired {
+            return;
+        }
+        if self.turn.busy() && !self.turn.paused() {
+            self.pause();
+        }
+        self.save_progress();
+        self.pause_reason = Some(t("sleep.elapsed").to_string());
+    }
+
+    fn sleep_command(&mut self, arg: &str) {
+        let arg = arg.trim();
+        if matches!(arg, "off" | "clear" | "cancel" | "取消" | "关闭") {
+            let transition = readio_sdk::playback::reduce(
+                &PlaybackPolicy::default(),
+                self.sleep_timer.clone(),
+                PlaybackEvent::SleepTimerCleared,
+            );
+            self.sleep_timer = transition.state;
+            self.notice(t("sleep.cleared"));
+            return;
+        }
+
+        let (extend, value) = arg
+            .strip_prefix('+')
+            .map_or((false, arg), |value| (true, value));
+        let Ok(minutes) = value.parse::<f64>() else {
+            self.system(t("sleep.usage"));
+            return;
+        };
+        let duration_ms = minutes * 60_000.0;
+        if !duration_ms.is_finite() || duration_ms <= 0.0 || duration_ms > 7.0 * 86_400_000.0 {
+            self.system(t("sleep.usage"));
+            return;
+        }
+        let now = wall_clock_unix_ms();
+        let base = if extend {
+            self.sleep_timer
+                .sleep_deadline_unix_ms
+                .filter(|deadline| *deadline > now)
+                .unwrap_or(now)
+        } else {
+            now
+        };
+        let deadline = base.saturating_add(duration_ms.round() as i64);
+        let transition = readio_sdk::playback::reduce(
+            &PlaybackPolicy::default(),
+            self.sleep_timer.clone(),
+            PlaybackEvent::SleepTimerSet {
+                deadline_unix_ms: deadline,
+            },
+        );
+        self.sleep_timer = transition.state;
+        self.notice(&tf(
+            if extend {
+                "sleep.extended"
+            } else {
+                "sleep.set"
+            },
+            &[&value],
+        ));
+    }
+
+    fn sleep_remaining(&self) -> Option<Duration> {
+        let deadline = self.sleep_timer.sleep_deadline_unix_ms?;
+        let remaining = deadline.saturating_sub(wall_clock_unix_ms()).max(0) as u64;
+        Some(Duration::from_millis(remaining))
     }
 
     fn on_turn_finished(&mut self) {
@@ -666,6 +839,15 @@ impl App {
         if let Some(trace) = self.trace.as_mut() {
             trace.write(elapsed, &message);
         }
+    }
+
+    fn voice_operation_id(&mut self) -> String {
+        if let Some(operation_id) = self.voice_diagnostic_operation.as_ref() {
+            return operation_id.clone();
+        }
+        let operation_id = self.diagnostics.begin_operation();
+        self.voice_diagnostic_operation = Some(operation_id.clone());
+        operation_id
     }
 
     // ── audio output whitelist ───────────────────────────────────────────────
@@ -1116,6 +1298,7 @@ impl App {
         if utterances.is_empty() {
             return false;
         }
+        let _ = self.voice_operation_id();
         for utterance in &utterances {
             self.trace(format!(
                 "voice enqueue id={id} range={}..{} chars={} from_byte={from} text={:?}",
@@ -1270,10 +1453,15 @@ impl App {
                     chars,
                     ms,
                 } => {
-                    if self.sb.set_highlight(id, Some(Highlight::new(range))) {
+                    self.cursor = self.build_cursor(id, range, ms);
+                    let highlight = self
+                        .cursor
+                        .as_ref()
+                        .and_then(|cursor| cursor.highlight_at(0.0))
+                        .unwrap_or_else(|| Highlight::new(range));
+                    if self.sb.set_highlight(id, Some(highlight)) {
                         self.lit = Some(id);
                     }
-                    self.cursor = self.build_cursor(id, range, ms);
                     self.follow_clip(id, range, chars, ms);
                     let released = self
                         .turn
@@ -1292,6 +1480,23 @@ impl App {
                         self.voice_runway(),
                         self.multiplier()
                     ));
+                    let provider = self.speaker.as_ref().map_or_else(
+                        || "unknown".to_string(),
+                        |speaker| speaker.engine().to_string(),
+                    );
+                    let operation_id = self.voice_operation_id();
+                    self.diagnostics.record_fact(
+                        operation_id,
+                        "tui-tts",
+                        DiagnosticCategory::Tts,
+                        "provider_completed",
+                        BTreeMap::from([
+                            ("provider".to_string(), json!(provider)),
+                            ("audio_duration_ms".to_string(), json!(ms)),
+                            ("phase".to_string(), json!("synthesis")),
+                            ("outcome".to_string(), json!("completed")),
+                        ]),
+                    );
                 }
                 SpeechEvent::Finished { id } => {
                     self.trace(format!(
@@ -1305,6 +1510,36 @@ impl App {
                 }
                 SpeechEvent::Failed { message } => {
                     self.trace(format!("voice failed message={message:?}"));
+                    let provider = self.speaker.as_ref().map_or_else(
+                        || "unknown".to_string(),
+                        |speaker| speaker.engine().to_string(),
+                    );
+                    let operation_id = self.voice_operation_id();
+                    self.diagnostics.record_fact(
+                        operation_id.clone(),
+                        "tui-tts",
+                        DiagnosticCategory::Tts,
+                        "provider_failed",
+                        BTreeMap::from([
+                            ("provider".to_string(), json!(provider.clone())),
+                            ("phase".to_string(), json!("synthesis")),
+                            ("outcome".to_string(), json!("failed")),
+                            ("reason_code".to_string(), json!("provider_failed")),
+                        ]),
+                    );
+                    self.diagnostics.record_fact(
+                        operation_id,
+                        "tui-player",
+                        DiagnosticCategory::Fallback,
+                        "provider_fallback_stopped",
+                        BTreeMap::from([
+                            ("from_provider".to_string(), json!(provider)),
+                            ("to_provider".to_string(), json!("none")),
+                            ("attempt".to_string(), json!(1)),
+                            ("outcome".to_string(), json!("stopped")),
+                            ("reason_code".to_string(), json!("provider_failed")),
+                        ]),
+                    );
                     self.lose_the_voice(&message);
                 }
             }
@@ -1428,22 +1663,21 @@ impl App {
             return None;
         }
         let slice = &text[range.0..range.1];
-        let units: Vec<Unit> = sentence::units(slice)
-            .into_iter()
-            .map(|unit| Unit {
-                range: (unit.range.0 + range.0, unit.range.1 + range.0),
-                chars: unit.chars,
-            })
-            .collect();
-        if units.is_empty() || ms == 0 {
+        let highlight = sentence::HighlightPlan::new(slice)?;
+        if ms == 0 {
             return None;
         }
         let reveal_from = text[..range.0].chars().count();
         let reveal_to = text[..range.1].chars().count();
+        let diagnostic_sentence_index = sentence::split(text)
+            .iter()
+            .position(|utterance| utterance.range == range)
+            .unwrap_or(0) as u64;
         Some(Cursor {
             id,
             sentence: range,
-            units,
+            diagnostic_sentence_index,
+            highlight,
             reveal: (reveal_from, reveal_to),
             shown: None,
         })
@@ -1471,6 +1705,7 @@ impl App {
             ((span as u128 * elapsed) / duration).min(span as u128) as usize
         };
         let target = cursor.reveal.0 + advanced;
+        let sentence_index = cursor.diagnostic_sentence_index;
         self.turn
             .reveal_passage_to(position.id, target, &mut self.sb);
         self.save_live_speech_checkpoint(&position);
@@ -1497,6 +1732,31 @@ impl App {
                 self.voice_runway(),
                 self.multiplier()
             ));
+            let operation_id = self.voice_operation_id();
+            self.diagnostics.record_fact(
+                operation_id,
+                "tui-player",
+                DiagnosticCategory::Playback,
+                "clock_sample",
+                BTreeMap::from([
+                    ("mode".to_string(), json!("read_aloud")),
+                    ("generation".to_string(), json!(position.id)),
+                    ("sentence_index".to_string(), json!(sentence_index)),
+                    (
+                        "media_position_ms".to_string(),
+                        json!(position.elapsed.as_millis() as u64),
+                    ),
+                    (
+                        "media_duration_ms".to_string(),
+                        json!(position.duration.as_millis() as u64),
+                    ),
+                    (
+                        "playback_rate_milli".to_string(),
+                        json!((self.multiplier() * 1_000.0).round() as u64),
+                    ),
+                    ("playing".to_string(), json!(!position.finished)),
+                ]),
+            );
         }
     }
 
@@ -1549,9 +1809,15 @@ impl App {
         // A clip that has played out: drop the word, keep the sentence lit until
         // the next one starts, and only then admit to being idle.
         if position.finished {
-            let (id, sentence) = (cursor.id, cursor.sentence);
+            let id = cursor.id;
+            let state = cursor.highlight_at(1.0).map(|mut state| {
+                state.word = None;
+                state
+            });
             self.cursor = None;
-            self.sb.set_highlight(id, Some(Highlight::new(sentence)));
+            if let Some(state) = state {
+                self.sb.set_highlight(id, Some(state));
+            }
             if self.idle {
                 self.idle = false;
                 self.speech_done();
@@ -1560,17 +1826,13 @@ impl App {
         }
         let progress =
             position.elapsed.as_secs_f32() / position.duration.as_secs_f32().max(f32::EPSILON);
-        let Some(unit) = sentence::unit_at(&cursor.units, progress) else {
+        let Some(state) = cursor.highlight_at(progress) else {
             return;
         };
-        if cursor.shown == Some(unit.range) {
+        if cursor.shown == Some(state) {
             return;
         }
-        cursor.shown = Some(unit.range);
-        let state = Highlight {
-            sentence: cursor.sentence,
-            word: Some(unit.range),
-        };
+        cursor.shown = Some(state);
         let id = cursor.id;
         self.sb.set_highlight(id, Some(state));
     }
@@ -1649,6 +1911,7 @@ impl App {
             speaker.stop();
         }
         self.speech_done();
+        self.voice_diagnostic_operation = None;
     }
 
     pub fn draw(&mut self, frame: &mut Frame<'_>) {
@@ -1705,6 +1968,7 @@ impl App {
             paused: self.turn.paused(),
             tick: self.tick,
             notice: self.notice.as_ref().map(|(m, _)| m.as_str()),
+            pause_reason: self.pause_reason.as_deref(),
             scrolled: self.sb.scrolled_away(),
             scroll_percent: self.sb.scroll_percent(),
             has_book: self.book.is_some(),
@@ -1713,6 +1977,7 @@ impl App {
             speaking: highlight.as_deref(),
             audio_model: audio_model.as_deref(),
             audio_muted: self.speech && !self.audio_permitted(),
+            sleep_remaining: self.sleep_remaining(),
         };
 
         if let Some(workspace) = self.voice_workspace.as_ref() {
@@ -2214,6 +2479,7 @@ impl App {
         if !self.turn.busy() || self.turn.paused() {
             return;
         }
+        self.pause_reason = None;
         // The mode is a setting, not a consequence: pausing holds the place
         // without demoting auto-scroll to manual. Read-aloud keeps the live
         // player and its audio cursor; stopping and re-queueing here would
@@ -2231,6 +2497,7 @@ impl App {
         if !self.turn.paused() {
             return;
         }
+        self.pause_reason = None;
         if self.speech {
             if let Some(speaker) = self.speaker.as_ref() {
                 speaker.resume();
@@ -2511,6 +2778,21 @@ impl App {
                 self.sb.clear();
                 self.notice(t("cmd.cleared"));
             }
+            "diagnostics" | "support" => {
+                let generated_at = unix_time_milliseconds();
+                let path = support_bundle_path(generated_at);
+                match self.diagnostics.write_support_bundle(&path, generated_at) {
+                    Ok(bundle) => self.system(&tf(
+                        "cmd.diagnostics_saved",
+                        &[
+                            &paths::display(&path),
+                            &bundle.events.len(),
+                            &bundle.redaction.dropped_field_count,
+                        ],
+                    )),
+                    Err(error) => self.system(&tf("cmd.diagnostics_failed", &[&error])),
+                }
+            }
             "import" | "i" => {
                 if arg.is_empty() {
                     // "Which file?" is answered by the path menu, and a path is
@@ -2633,6 +2915,7 @@ impl App {
                     None => self.system(t("mode.usage")),
                 },
             },
+            "sleep" | "timer" => self.sleep_command(arg),
             // `/auto` is the explicit Auto/Manual shortcut. From Read-aloud it
             // deliberately chooses Auto; only failures are forbidden from
             // making that decision on the reader's behalf.
@@ -3523,8 +3806,48 @@ impl App {
             self.system(t("cmd.usage_import"));
             return;
         }
+        let operation_id = self.diagnostics.begin_operation();
+        let document_format = diagnostic_document_format(&path);
+        let byte_count = std::fs::metadata(&path).map_or(0, |metadata| metadata.len());
+        let started = Instant::now();
         match self.library.import(&path, mode) {
             Ok((entry, book)) => {
+                let duration_ms = started.elapsed().as_millis() as u64;
+                self.diagnostics.record_fact(
+                    operation_id.clone(),
+                    "tui-library",
+                    DiagnosticCategory::Import,
+                    "import_completed",
+                    BTreeMap::from([
+                        ("source_kind".to_string(), json!("file")),
+                        ("document_format".to_string(), json!(document_format)),
+                        ("byte_count".to_string(), json!(byte_count)),
+                        ("duration_ms".to_string(), json!(duration_ms)),
+                        ("outcome".to_string(), json!("completed")),
+                    ]),
+                );
+                self.diagnostics.record_fact(
+                    operation_id,
+                    "tui-parser",
+                    DiagnosticCategory::Parsing,
+                    "parse_completed",
+                    BTreeMap::from([
+                        ("document_format".to_string(), json!(document_format)),
+                        ("byte_count".to_string(), json!(byte_count)),
+                        (
+                            "block_count".to_string(),
+                            json!(
+                                book.chapters
+                                    .iter()
+                                    .map(|chapter| chapter.paras.len() as u64)
+                                    .sum::<u64>()
+                            ),
+                        ),
+                        ("chapter_count".to_string(), json!(book.chapters.len())),
+                        ("duration_ms".to_string(), json!(duration_ms)),
+                        ("outcome".to_string(), json!("completed")),
+                    ]),
+                );
                 let index = self
                     .library
                     .entries
@@ -3545,6 +3868,23 @@ impl App {
                 self.adopt(book);
             }
             Err(err) => {
+                self.diagnostics.record_fact(
+                    operation_id,
+                    "tui-library",
+                    DiagnosticCategory::Import,
+                    "import_failed",
+                    BTreeMap::from([
+                        ("source_kind".to_string(), json!("file")),
+                        ("document_format".to_string(), json!(document_format)),
+                        ("byte_count".to_string(), json!(byte_count)),
+                        (
+                            "duration_ms".to_string(),
+                            json!(started.elapsed().as_millis() as u64),
+                        ),
+                        ("outcome".to_string(), json!("failed")),
+                        ("reason_code".to_string(), json!("import_failed")),
+                    ]),
+                );
                 self.sb.push(Block::Event(Event::Failed {
                     message: tf("lib.import_failed", &[&format!("{err:#}")]),
                 }));
@@ -3608,6 +3948,7 @@ impl App {
             chars_read: book.chars_before(self.pos.chapter, self.pos.para) as u64,
             sessions: previous.sessions.max(1),
             updated: now_secs(),
+            locator: book.create_text_locator(self.pos.chapter, self.pos.para),
             speech: self.speech_checkpoint.clone().filter(|checkpoint| {
                 checkpoint.chapter == self.pos.chapter && checkpoint.para == self.pos.para
             }),

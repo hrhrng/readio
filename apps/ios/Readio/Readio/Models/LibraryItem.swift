@@ -60,7 +60,10 @@ enum ReadingStatus: String, Sendable {
 /// - `content_format`: Hint about content encoding (e.g., "html" for rich web content)
 struct LibraryItem: Codable, Identifiable, Sendable {
     let id: String
+    var legacyItemIds: [String]? = nil
+    var locale: String? = nil
     let title: String
+    var author: String? = nil
     let content: String
     let type: LibraryItemType
     let progress: Int
@@ -74,6 +77,9 @@ struct LibraryItem: Codable, Identifiable, Sendable {
     let speed: Double?
     let currentChapter: String?
     let contentFormat: String?
+    var markdownSource: String? = nil
+    var isBuiltinSample: Bool? = nil
+    var importRecord: ReadioImportRecord? = nil
 
     // MARK: - Computed Properties
 
@@ -92,7 +98,10 @@ struct LibraryItem: Codable, Identifiable, Sendable {
     // The API uses snake_case JSON keys; we map them to Swift camelCase properties.
     enum CodingKeys: String, CodingKey {
         case id
+        case legacyItemIds = "legacy_item_ids"
+        case locale
         case title
+        case author
         case content
         case type
         case progress
@@ -106,5 +115,8 @@ struct LibraryItem: Codable, Identifiable, Sendable {
         case speed
         case currentChapter = "current_chapter"
         case contentFormat = "content_format"
+        case markdownSource = "markdown_source"
+        case isBuiltinSample = "is_builtin_sample"
+        case importRecord = "import_record"
     }
 }

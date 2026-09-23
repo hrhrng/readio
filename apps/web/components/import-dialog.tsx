@@ -1,239 +1,229 @@
-"use client";
+"use client"
 
-import { useState, useRef, useCallback } from "react";
-import { X, Upload, Link, FileText, Loader2 } from "lucide-react";
-import { importFile, importUrl } from "@/lib/api";
-import { useSWRConfig } from "swr";
+import { useCallback, useEffect, useRef, useState } from "react"
+import { createPortal } from "react-dom"
+import { FileText, Link, Loader2, Upload, X } from "lucide-react"
+import { useSWRConfig } from "swr"
+import { importFile, importUrl } from "@/lib/api"
+import { InlineFeedback } from "./feedback"
+import { useToast } from "./toast-provider"
+import { useLocale } from "./locale-provider"
 
 interface ImportDialogProps {
-  open: boolean;
-  onClose: () => void;
+  open: boolean
+  onClose: () => void
 }
 
-const ACCEPTED_EXTENSIONS = ".txt,.pdf,.epub,.docx";
-const ACCEPTED_TYPES = [
-  "text/plain",
-  "application/pdf",
-  "application/epub+zip",
-  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-];
+const ACCEPTED_EXTENSIONS = ".txt,.pdf,.epub,.docx"
 
 export function ImportDialog({ open, onClose }: ImportDialogProps) {
-  const { mutate } = useSWRConfig();
-  const [tab, setTab] = useState<"file" | "url">("file");
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [dragActive, setDragActive] = useState(false);
-  const [url, setUrl] = useState("");
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const overlayRef = useRef<HTMLDivElement>(null);
+  const { t } = useLocale()
+  const { mutate } = useSWRConfig()
+  const { showToast } = useToast()
+  const [tab, setTab] = useState<"file" | "url">("file")
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [dragActive, setDragActive] = useState(false)
+  const [url, setUrl] = useState("")
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+    if (!open) return
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !loading) onClose()
+    }
+    document.addEventListener("keydown", handleKeyDown)
+    return () => document.removeEventListener("keydown", handleKeyDown)
+  }, [loading, onClose, open])
 
   const revalidate = useCallback(() => {
-    // Revalidate all library queries without clearing cached data
     mutate(
       (key: unknown) =>
         Array.isArray(key) &&
         (key[0] === "library-items" || key[0] === "search")
-    );
-  }, [mutate]);
+    )
+  }, [mutate])
 
   const handleFileImport = useCallback(
     async (file: File) => {
-      setLoading(true);
-      setError(null);
+      setLoading(true)
+      setError(null)
       try {
-        await importFile(file);
-        revalidate();
-        onClose();
-      } catch (err) {
-        setError(err instanceof Error ? err.message : "Import failed");
+        await importFile(file)
+        revalidate()
+        onClose()
+        showToast("library.imported", t("import.fileAdded", { name: file.name }))
+      } catch (caught) {
+        setError(caught instanceof Error ? caught.message : t("import.failed"))
       } finally {
-        setLoading(false);
+        setLoading(false)
       }
     },
-    [revalidate, onClose]
-  );
+    [onClose, revalidate, showToast, t]
+  )
 
   const handleUrlImport = useCallback(async () => {
-    const trimmed = url.trim();
-    if (!trimmed) return;
-    setLoading(true);
-    setError(null);
+    const trimmed = url.trim()
+    if (!trimmed) return
+
+    setLoading(true)
+    setError(null)
     try {
-      await importUrl(trimmed);
-      revalidate();
-      setUrl("");
-      onClose();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Import failed");
+      await importUrl(trimmed)
+      revalidate()
+      setUrl("")
+      onClose()
+      showToast("library.imported", t("import.urlAdded"))
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : t("import.failed"))
     } finally {
-      setLoading(false);
+      setLoading(false)
     }
-  }, [url, revalidate, onClose]);
+  }, [onClose, revalidate, showToast, t, url])
 
   const handleDrop = useCallback(
-    (e: React.DragEvent) => {
-      e.preventDefault();
-      setDragActive(false);
-      const file = e.dataTransfer.files[0];
-      if (file) handleFileImport(file);
+    (event: React.DragEvent) => {
+      event.preventDefault()
+      setDragActive(false)
+      const file = event.dataTransfer.files[0]
+      if (file) handleFileImport(file)
     },
     [handleFileImport]
-  );
+  )
 
-  const handleFileChange = useCallback(
-    (e: React.ChangeEvent<HTMLInputElement>) => {
-      const file = e.target.files?.[0];
-      if (file) handleFileImport(file);
-      // Reset so the same file can be selected again
-      e.target.value = "";
-    },
-    [handleFileImport]
-  );
+  if (!open) return null
 
-  if (!open) return null;
-
-  return (
+  return createPortal(
     <div
-      ref={overlayRef}
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
-      onClick={(e) => {
-        if (e.target === overlayRef.current && !loading) onClose();
-      }}
-      onKeyDown={(e) => {
-        if (e.key === "Escape" && !loading) onClose();
+      className="ui-overlay"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget && !loading) onClose()
       }}
     >
-      <div className="bg-surface-card rounded-2xl shadow-xl max-w-md w-full mx-4 overflow-hidden">
-        {/* Header */}
-        <div className="flex items-center justify-between px-6 pt-5 pb-4">
-          <h2 className="text-lg font-semibold text-text-primary">
-            Import Content
+      <section
+        className="ui-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="import-dialog-title"
+      >
+        <header className="ui-modal-header">
+          <h2 id="import-dialog-title" className="ui-modal-title">
+            {t("import.dialogTitle")}
           </h2>
           <button
+            type="button"
             onClick={onClose}
             disabled={loading}
-            className="w-8 h-8 flex items-center justify-center rounded-lg hover:bg-surface-hover transition-colors text-text-secondary cursor-pointer"
-            aria-label="Close"
+            className="ui-icon-button"
+            aria-label={t("import.closeDialog")}
           >
-            <X size={18} />
+            <X className="ui-icon" aria-hidden="true" />
           </button>
-        </div>
+        </header>
 
-        {/* Tabs */}
-        <div className="flex gap-1 px-6 mb-4">
-          <button
-            onClick={() => {
-              setTab("file");
-              setError(null);
-            }}
-            className={`flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg transition-colors cursor-pointer ${
-              tab === "file"
-                ? "bg-accent/10 text-accent"
-                : "text-text-secondary hover:bg-surface-hover"
-            }`}
-          >
-            <Upload size={16} />
-            File
-          </button>
-          <button
-            onClick={() => {
-              setTab("url");
-              setError(null);
-            }}
-            className={`flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg transition-colors cursor-pointer ${
-              tab === "url"
-                ? "bg-accent/10 text-accent"
-                : "text-text-secondary hover:bg-surface-hover"
-            }`}
-          >
-            <Link size={16} />
-            URL
-          </button>
-        </div>
+        <div className="ui-modal-body form-stack">
+          <div className="import-tabs" role="tablist" aria-label={t("import.method")}>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={tab === "file"}
+              onClick={() => {
+                setTab("file")
+                setError(null)
+              }}
+              className="import-tab"
+            >
+              <Upload className="ui-icon-sm" aria-hidden="true" />
+              {t("import.fileTab")}
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={tab === "url"}
+              onClick={() => {
+                setTab("url")
+                setError(null)
+              }}
+              className="import-tab"
+            >
+              <Link className="ui-icon-sm" aria-hidden="true" />
+              {t("import.urlTab")}
+            </button>
+          </div>
 
-        {/* Content */}
-        <div className="px-6 pb-6">
           {tab === "file" ? (
-            <>
-              <div
-                className={`relative border-2 border-dashed rounded-xl p-8 text-center transition-colors ${
-                  dragActive
-                    ? "border-accent bg-accent/5"
-                    : "border-border hover:border-text-tertiary"
-                } ${loading ? "pointer-events-none opacity-50" : "cursor-pointer"}`}
-                onDragOver={(e) => {
-                  e.preventDefault();
-                  setDragActive(true);
-                }}
-                onDragLeave={() => setDragActive(false)}
-                onDrop={handleDrop}
-                onClick={() => fileInputRef.current?.click()}
-              >
-                {loading ? (
-                  <Loader2
-                    size={32}
-                    className="mx-auto text-accent animate-spin"
-                  />
-                ) : (
-                  <FileText
-                    size={32}
-                    className="mx-auto text-text-tertiary mb-3"
-                  />
-                )}
-                <p className="text-sm text-text-primary font-medium mt-2">
-                  {loading
-                    ? "Importing..."
-                    : "Drop file here or click to browse"}
-                </p>
-                <p className="text-xs text-text-tertiary mt-2">
-                  TXT, PDF, EPUB, DOCX
-                </p>
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  className="hidden"
-                  accept={ACCEPTED_EXTENSIONS}
-                  onChange={handleFileChange}
-                />
-              </div>
-            </>
-          ) : (
-            <div className="space-y-3">
+            <div
+              className="import-dropzone"
+              data-active={dragActive}
+              data-loading={loading}
+              onDragOver={(event) => {
+                event.preventDefault()
+                setDragActive(true)
+              }}
+              onDragLeave={() => setDragActive(false)}
+              onDrop={handleDrop}
+              onClick={() => !loading && fileInputRef.current?.click()}
+              role="button"
+              tabIndex={loading ? -1 : 0}
+              onKeyDown={(event) => {
+                if ((event.key === "Enter" || event.key === " ") && !loading) {
+                  fileInputRef.current?.click()
+                }
+              }}
+            >
+              {loading ? (
+                <Loader2 className="ui-icon-lg animate-spin" aria-hidden="true" />
+              ) : (
+                <FileText className="ui-icon-lg" aria-hidden="true" />
+              )}
+              <strong>{loading ? t("import.inProgress") : t("import.dropFile")}</strong>
+              <span>TXT, PDF, EPUB, or DOCX</span>
               <input
-                type="url"
-                value={url}
-                onChange={(e) => setUrl(e.target.value)}
-                placeholder="https://example.com/article"
-                disabled={loading}
-                className="w-full px-4 py-3 rounded-xl bg-surface border border-border text-sm text-text-primary placeholder:text-text-tertiary focus:outline-none focus:ring-2 focus:ring-accent/50 disabled:opacity-50"
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") handleUrlImport();
+                ref={fileInputRef}
+                type="file"
+                className="sr-only"
+                accept={ACCEPTED_EXTENSIONS}
+                onChange={(event) => {
+                  const file = event.target.files?.[0]
+                  if (file) handleFileImport(file)
+                  event.target.value = ""
                 }}
               />
+            </div>
+          ) : (
+            <div className="form-stack">
+              <label className="form-field">
+                <span className="form-label">{t("import.articleUrl")}</span>
+                <input
+                  type="url"
+                  value={url}
+                  onChange={(event) => setUrl(event.target.value)}
+                  placeholder="https://example.com/article"
+                  disabled={loading}
+                  className="ui-input"
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") handleUrlImport()
+                  }}
+                />
+              </label>
               <button
+                type="button"
                 onClick={handleUrlImport}
                 disabled={loading || !url.trim()}
-                className="w-full py-3 rounded-xl bg-accent text-white text-sm font-medium hover:bg-accent/90 transition-colors disabled:opacity-50 cursor-pointer flex items-center justify-center gap-2"
+                className="ui-button ui-button--primary"
               >
-                {loading ? (
-                  <>
-                    <Loader2 size={16} className="animate-spin" />
-                    Importing...
-                  </>
-                ) : (
-                  "Import URL"
+                {loading && (
+                  <Loader2 className="ui-icon-sm animate-spin" aria-hidden="true" />
                 )}
+                {loading ? t("import.inProgress") : t("import.importUrl")}
               </button>
             </div>
           )}
 
-          {/* Error */}
-          {error && (
-            <p className="mt-3 text-sm text-red-500 text-center">{error}</p>
-          )}
+          {error && <InlineFeedback tone="danger">{error}</InlineFeedback>}
         </div>
-      </div>
-    </div>
-  );
+      </section>
+    </div>,
+    document.body
+  )
 }

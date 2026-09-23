@@ -43,6 +43,9 @@ import UniformTypeIdentifiers
 /// idle → importing (with progress) → success (with "Open" option) / error (with retry)
 struct ImportView: View {
 
+    @Bindable var router: AppleAppRouter
+    @Environment(\.readioTheme) private var theme
+
     // MARK: - State
 
     /// The view model managing import operations (file upload, URL scraping).
@@ -50,9 +53,6 @@ struct ImportView: View {
 
     /// Controls the visibility of the system file picker sheet.
     @State private var showingFilePicker = false
-
-    /// Controls navigation to the reader view after a successful import.
-    @State private var navigateToReader = false
 
     // MARK: - Body
 
@@ -76,6 +76,8 @@ struct ImportView: View {
             }
             .padding()
         }
+        .background(theme.canvas.ignoresSafeArea())
+        .tint(theme.accent)
         .navigationTitle("Import")
         // MARK: File Picker Modifier
         // `.fileImporter` presents the system document picker when `showingFilePicker` is true.
@@ -87,10 +89,10 @@ struct ImportView: View {
         ) { result in
             handleFileImportResult(result)
         }
-        // Navigate to the reader when an item is successfully imported
-        .navigationDestination(isPresented: $navigateToReader) {
-            if let item = viewModel.importedItem {
-                ReaderView(itemId: item.id)
+        .task(id: router.fileImportRequest) {
+            let request = router.fileImportRequest
+            if router.consumeFileImportRequest(request) {
+                showingFilePicker = true
             }
         }
     }
@@ -121,34 +123,34 @@ struct ImportView: View {
                 // Large folder icon
                 Image(systemName: "doc.badge.plus")
                     .font(.system(size: 40))
-                    .foregroundStyle(.accentColor)
+                    .foregroundStyle(theme.accent)
 
                 Text("Import File")
                     .font(.headline)
-                    .foregroundStyle(.primary)
+                    .foregroundStyle(theme.ink)
 
                 Text("EPUB, PDF, or TXT files")
                     .font(.subheadline)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(theme.secondaryInk)
 
                 // Supported format badges
                 HStack(spacing: 8) {
-                    FormatBadge(text: "EPUB", color: .indigo)
-                    FormatBadge(text: "PDF", color: .red)
-                    FormatBadge(text: "TXT", color: .gray)
+                    FormatBadge(text: "EPUB", color: theme.sidebarSelected)
+                    FormatBadge(text: "PDF", color: theme.sidebarSelected)
+                    FormatBadge(text: "TXT", color: theme.sidebarSelected)
                 }
             }
             .frame(maxWidth: .infinity)
             .padding(.vertical, 32)
             .background(
                 RoundedRectangle(cornerRadius: 16)
-                    .fill(Color(.secondarySystemGroupedBackground))
+                    .fill(theme.raised)
                     .overlay(
                         RoundedRectangle(cornerRadius: 16)
                             .strokeBorder(
                                 style: StrokeStyle(lineWidth: 2, dash: [8, 4])
                             )
-                            .foregroundStyle(Color(.separator))
+                            .foregroundStyle(theme.accent.opacity(0.55))
                     )
             )
         }
@@ -170,8 +172,7 @@ struct ImportView: View {
 
                 TextField("https://example.com/article", text: $viewModel.urlInput)
                     .textFieldStyle(.roundedBorder)
-                    .keyboardType(.URL)
-                    .textInputAutocapitalization(.never)
+                    .readioURLInputTraits()
                     .autocorrectionDisabled()
                     .disabled(viewModel.isImporting)
             }
@@ -227,7 +228,7 @@ struct ImportView: View {
             .padding(.vertical, 24)
             .background(
                 RoundedRectangle(cornerRadius: 12)
-                    .fill(Color(.secondarySystemGroupedBackground))
+                    .fill(.background)
             )
 
         } else if let importedItem = viewModel.importedItem {
@@ -250,7 +251,7 @@ struct ImportView: View {
                 HStack(spacing: 12) {
                     // Open the imported item in the reader
                     Button {
-                        navigateToReader = true
+                        router.openReader(itemID: importedItem.id)
                     } label: {
                         Label("Open Book", systemImage: "book.fill")
                             .fontWeight(.medium)
@@ -271,7 +272,7 @@ struct ImportView: View {
             .padding(.vertical, 24)
             .background(
                 RoundedRectangle(cornerRadius: 12)
-                    .fill(Color(.secondarySystemGroupedBackground))
+                    .fill(.background)
             )
 
         } else if let error = viewModel.importError {
@@ -302,7 +303,7 @@ struct ImportView: View {
             .padding(.vertical, 24)
             .background(
                 RoundedRectangle(cornerRadius: 12)
-                    .fill(Color(.secondarySystemGroupedBackground))
+                    .fill(.background)
             )
         }
     }
@@ -313,7 +314,7 @@ struct ImportView: View {
     private func dividerWithLabel(_ label: String) -> some View {
         HStack {
             Rectangle()
-                .fill(Color(.separator))
+                .fill(.separator)
                 .frame(height: 1)
 
             Text(label)
@@ -322,7 +323,7 @@ struct ImportView: View {
                 .layoutPriority(1) // Prevent the text from being compressed
 
             Rectangle()
-                .fill(Color(.separator))
+                .fill(.separator)
                 .frame(height: 1)
         }
     }
@@ -369,6 +370,20 @@ struct ImportView: View {
     }
 }
 
+private extension View {
+    /// URL-entry traits are meaningful on touch keyboards only. Keeping this
+    /// modifier at the platform boundary lets the form itself stay shared.
+    @ViewBuilder
+    func readioURLInputTraits() -> some View {
+        #if os(iOS)
+        keyboardType(.URL)
+            .textInputAutocapitalization(.never)
+        #else
+        self
+        #endif
+    }
+}
+
 // MARK: - FormatBadge
 /// A small pill badge displaying a file format name (e.g., "EPUB", "PDF").
 /// Used in the file import section to show supported formats.
@@ -393,6 +408,6 @@ private struct FormatBadge: View {
 
 #Preview {
     NavigationStack {
-        ImportView()
+        ImportView(router: AppleAppRouter())
     }
 }

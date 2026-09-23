@@ -1,146 +1,59 @@
-//! EPUB loading: container → OPF → spine → XHTML documents.
+//! TUI projection of the shared Rust SDK EPUB publication.
 //!
-//! The whole archive is slurped into memory up front. EPUBs are a few
-//! megabytes at worst, and holding the bytes lets us resolve hrefs
-//! case-insensitively without fighting the zip reader's borrow rules.
+//! Package parsing, spine order, navigation anchors, author emphasis, image
+//! identity, and safety budgets live in the shared Rust Core. This module owns only the
+//! terminal-shaped projection: TOC targets become `Chapter` slices and image
+//! bytes are materialized as files for the terminal decoder.
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
-use quick_xml::Reader;
-use quick_xml::events::Event;
+use readio_sdk::ReadioSdk;
+use readio_sdk::documents::{Block, BlockKind, MediaAsset};
+use readio_sdk::media::{ParsedEpub, ParsedEpubChapter, ParsedEpubTocEntry};
 
 use super::{Book, Chapter, Para, Source, html, media};
 
 pub fn load(path: &Path) -> Result<Book> {
-    let file =
-        std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
-    let mut archive = zip::ZipArchive::new(file)
-        .with_context(|| format!("{} is not a valid EPUB (zip) file", path.display()))?;
+    let bytes = std::fs::read(path).with_context(|| format!("cannot open {}", path.display()))?;
+    let publication = ReadioSdk::new()
+        .media
+        .parse_epub(&bytes)
+        .with_context(|| format!("{} is not a readable EPUB", path.display()))?;
 
-    let mut entries: HashMap<String, Vec<u8>> = HashMap::new();
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
-        if entry.is_dir() {
-            continue;
-        }
-        let name = entry.name().to_string();
-        let mut bytes = Vec::new();
-        entry.read_to_end(&mut bytes)?;
-        entries.insert(normalize(&name), bytes);
-    }
-
-    let container = read_str(&entries, "META-INF/container.xml")
-        .ok_or_else(|| anyhow!("EPUB is missing META-INF/container.xml"))?;
-    let opf_path = find_attr(&container, "rootfile", "full-path")
-        .ok_or_else(|| anyhow!("EPUB container.xml has no rootfile"))?;
-    let opf = read_str(&entries, &opf_path)
-        .ok_or_else(|| anyhow!("EPUB package file {opf_path} not found"))?;
-    let base = parent_dir(&opf_path);
-
-    let package = parse_opf(&opf);
-    let mut chapters = Vec::new();
-
-    // The table of contents, in reading order. Its entries are the chapters a
-    // reader believes the book has: several of them routinely point into one
-    // spine document, and a document nobody linked to is a chapter of its own.
-    let toc = package
-        .toc_href
-        .as_ref()
-        .and_then(|href| read_str(&entries, &join(&base, href)))
-        .map(|doc| parse_toc(&doc))
-        .unwrap_or_default();
-
-    // Which classes the book's stylesheets emphasise with. Converted EPUBs put
-    // their italics here rather than in `<em>`, so without this a whole book can
-    // come out flat.
-    let mut classes = crate::book::css::Classes::new();
-    for (name, bytes) in &entries {
-        if name.ends_with(".css") {
-            classes.extend(crate::book::css::scan(&String::from_utf8_lossy(bytes)));
-        }
-    }
-
-    // Illustrations are extracted once, up front: rendering then only opens
-    // plain files, and a book with no images pays nothing for the attempt.
-    let images = extracted_images(path, &entries);
-    let cover = package.cover_href.as_ref().and_then(|href| {
-        let full = join(&base, href);
-        images
-            .get(&normalize(&full))
-            .map(|file| crate::book::Cover {
-                file: file.clone(),
-                href: full,
-            })
-    });
-
-    // Fabricated line numbers continue across a document that holds several
-    // chapters: two Read calls on one file should not both start at line 1.
-    let mut line_cursor = 1usize;
-    let mut previous_doc = String::new();
-
-    for idref in &package.spine {
-        let Some(item) = package.manifest.get(idref) else {
-            continue;
-        };
-        if !item.media_type.contains("html") {
-            continue;
-        }
-        let full = join(&base, &item.href);
-        let Some(doc) = read_str(&entries, &full) else {
-            continue;
-        };
-        let parsed = html::to_document_styled(&doc, &classes);
-        let mut paras = parsed.paras;
-        resolve_images(&mut paras, &full, &images);
-        if paras.is_empty() {
-            continue;
-        }
-        if full != previous_doc {
-            line_cursor = 1;
-            previous_doc = full.clone();
-        }
-
-        for cut in cuts(&toc, item, &full, &parsed.anchors, paras.len()) {
-            let piece: Vec<Para> = paras[cut.from..cut.to].to_vec();
-            // A spine document need not announce its own name. Prefer what the
-            // ToC calls it, then its first heading, and only then fall back — to
-            // a section number, never to the filename, because `index_split_004`
-            // is a fact about the publisher's toolchain and not about the book.
-            let title = cut
-                .label
-                .or_else(|| html::first_heading(&piece).filter(|h| h.chars().count() <= 60))
-                .map(|title| title.trim().to_string())
-                .filter(|title| !title.is_empty())
-                .unwrap_or_else(|| crate::i18n::tf("book.section", &[&(chapters.len() + 1)]));
-            let href = match &cut.fragment {
-                Some(fragment) => format!("{full}#{fragment}"),
-                None => full.clone(),
-            };
-            let chapter = Chapter {
-                title,
-                href,
-                paras: piece,
-                first_line: line_cursor,
-            };
-            line_cursor += chapter.line_count().saturating_sub(1);
-            chapters.push(chapter);
-        }
-    }
-
+    let extracted = extract_terminal_images(path, &publication);
+    let chapters = project_chapters(&publication, &extracted);
     if chapters.is_empty() {
         return Err(anyhow!("EPUB contains no readable chapters"));
     }
 
-    let title = package
+    let cover = publication.cover_asset_id.as_deref().and_then(|asset_id| {
+        let asset = publication
+            .assets
+            .iter()
+            .find(|asset| asset.id == asset_id)?;
+        let file = terminal_asset_path(&extracted, &asset.href)?.clone();
+        Some(super::Cover {
+            file,
+            href: asset.href.clone(),
+        })
+    });
+
+    let title = publication
         .title
-        .unwrap_or_else(|| file_stem(&path.to_string_lossy()));
+        .clone()
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or_else(|| {
+            path.file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or("book")
+                .to_string()
+        });
     Ok(Book {
         id: String::new(),
         title,
-        author: package.author,
+        author: publication.author,
         path: Some(path.to_path_buf()),
         source: Source::Epub,
         chapters,
@@ -148,411 +61,159 @@ pub fn load(path: &Path) -> Result<Book> {
     })
 }
 
-/// Where one spine document is cut into chapters.
-struct Cut {
-    from: usize,
-    to: usize,
-    label: Option<String>,
-    fragment: Option<String>,
-}
-
-/// Split points for a document: one per ToC entry pointing into it, plus a
-/// leading piece for whatever comes before the first of them.
-///
-/// An unresolvable fragment falls back to the start of the document, but only
-/// while the start is still unclaimed. A ToC line whose anchor the document does
-/// not contain is usually just naming the file — `c2.xhtml#top` where nothing is
-/// called `top` — and that name is worth keeping. Once something else names the
-/// start, a second unresolvable entry has nothing left to say, and guessing
-/// would move text into the wrong chapter.
-fn cuts(
-    toc: &[TocEntry],
-    item: &Item,
-    full: &str,
-    anchors: &std::collections::HashMap<String, usize>,
-    len: usize,
-) -> Vec<Cut> {
-    let (by_href, by_full) = (normalize(&item.href), normalize(full));
-    let mut points: Vec<(usize, Option<String>, Option<String>)> = Vec::new();
-    for entry in toc.iter().filter(|e| e.doc == by_href || e.doc == by_full) {
-        let (at, fragment) = match &entry.fragment {
-            None => (0, None),
-            Some(fragment) => match anchors.get(fragment) {
-                Some(&at) if at < len => (at, Some(fragment.clone())),
-                _ if points.is_empty() => (0, None),
-                _ => continue,
-            },
-        };
-        if points.iter().any(|(existing, _, _)| *existing == at) {
-            continue;
-        }
-        points.push((at, Some(entry.label.clone()), fragment));
-    }
-    points.sort_by_key(|(at, _, _)| *at);
-    if points.first().map(|(at, _, _)| *at) != Some(0) {
-        points.insert(0, (0, None, None));
-    }
-
-    let mut out = Vec::with_capacity(points.len());
-    for index in 0..points.len() {
-        let (from, label, fragment) = points[index].clone();
-        let to = points.get(index + 1).map(|(at, _, _)| *at).unwrap_or(len);
-        if to > from {
-            out.push(Cut {
-                from,
-                to,
-                label,
-                fragment,
-            });
-        }
-    }
-    out
-}
-
-/// Extract the archive's images into the host directory, keyed by archive path.
-///
-/// A book without pictures, or an unwritable cache, simply yields an empty map:
-/// missing illustrations must never stop a book from opening.
-fn extracted_images(path: &Path, entries: &HashMap<String, Vec<u8>>) -> BTreeMap<String, PathBuf> {
-    let has_images = entries.keys().any(|key| media::looks_like_image_name(key));
-    if !has_images {
+/// The SDK intentionally returns byte-free asset IDs. A terminal image widget
+/// needs a path, so extraction stays an adapter effect and cannot influence
+/// which archive entries become semantic blocks.
+fn extract_terminal_images(path: &Path, publication: &ParsedEpub) -> BTreeMap<String, PathBuf> {
+    if publication.assets.is_empty() {
         return BTreeMap::new();
     }
-    let dest = crate::paths::images_dir().join(crate::book::synthetic_id(&path.to_string_lossy()));
-    media::extract_epub_images(path, &dest).unwrap_or_default()
+    let destination =
+        crate::paths::images_dir().join(crate::book::synthetic_id(&path.to_string_lossy()));
+    media::extract_epub_images(path, &destination).unwrap_or_default()
 }
 
-/// Point every image paragraph at the file that was extracted for it, and drop
-/// the ones with nothing behind them — a caption for a picture that cannot be
-/// shown is worse than no picture.
-fn resolve_images(paras: &mut Vec<Para>, doc_href: &str, images: &BTreeMap<String, PathBuf>) {
-    paras.retain_mut(|para| {
-        let Para::Image { src, alt } = para else {
-            return true;
-        };
-        let raw = src.to_string_lossy().into_owned();
-        let key = media::resolve_href(doc_href, &raw);
-        match images.get(&key) {
-            Some(file) => {
-                *src = file.clone();
-                true
+fn project_chapters(
+    publication: &ParsedEpub,
+    extracted: &BTreeMap<String, PathBuf>,
+) -> Vec<Chapter> {
+    let mut projected = Vec::new();
+    for source in &publication.chapters {
+        let mut line_cursor = 1_usize;
+        for cut in chapter_cuts(source, &publication.toc) {
+            let piece = project_blocks(
+                &source.document.blocks[cut.from..cut.to],
+                &source.document.assets,
+                extracted,
+            );
+            if piece.is_empty() {
+                continue;
             }
-            // An unresolvable image with a caption still says something.
-            None => {
-                if alt.trim().is_empty() {
-                    false
-                } else {
-                    *para = Para::Text(alt.clone().into());
-                    true
-                }
-            }
+            let title = cut
+                .title
+                .filter(|title| !title.trim().is_empty())
+                .or_else(|| html::first_heading(&piece).filter(|title| title.chars().count() <= 60))
+                .unwrap_or_else(|| source.title.clone());
+            let chapter = Chapter {
+                title,
+                href: cut.href.unwrap_or_else(|| source.href.clone()),
+                paras: piece,
+                first_line: line_cursor,
+            };
+            line_cursor += chapter.line_count().saturating_sub(1);
+            projected.push(chapter);
         }
-    });
-}
-
-// ── OPF ──────────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Default)]
-struct Package {
-    title: Option<String>,
-    author: Option<String>,
-    manifest: HashMap<String, Item>,
-    spine: Vec<String>,
-    toc_href: Option<String>,
-    /// Href of the cover image, from either EPUB 3's `properties="cover-image"`
-    /// or EPUB 2's `<meta name="cover" content="…">`.
-    cover_href: Option<String>,
-}
-
-#[derive(Debug)]
-struct Item {
-    href: String,
-    media_type: String,
-}
-
-fn parse_opf(opf: &str) -> Package {
-    let mut pkg = Package::default();
-    let mut reader = Reader::from_str(opf);
-    reader.config_mut().trim_text(true);
-    let mut buf = Vec::new();
-    // Which metadata element we are inside, if any.
-    let mut field: Option<&'static str> = None;
-    let mut toc_id: Option<String> = None;
-    let mut nav_href: Option<String> = None;
-    let mut cover_id: Option<String> = None;
-    let mut cover_href: Option<String> = None;
-
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                let tag = local(e.name().as_ref());
-                let attrs = attrs(&e);
-                match tag.as_str() {
-                    "title" => field = Some("title"),
-                    "creator" => field = Some("creator"),
-                    "item" => {
-                        let id = attrs.get("id").cloned().unwrap_or_default();
-                        let href = attrs.get("href").cloned().unwrap_or_default();
-                        let media_type = attrs.get("media-type").cloned().unwrap_or_default();
-                        let properties = attrs.get("properties").cloned().unwrap_or_default();
-                        if properties.split_whitespace().any(|p| p == "nav") {
-                            nav_href = Some(href.clone());
-                        }
-                        if properties.split_whitespace().any(|p| p == "cover-image") {
-                            cover_href = Some(href.clone());
-                        }
-                        if !id.is_empty() {
-                            pkg.manifest.insert(id, Item { href, media_type });
-                        }
-                    }
-                    // EPUB 2 named its cover in the metadata instead.
-                    "meta" => {
-                        if attrs.get("name").is_some_and(|name| name == "cover")
-                            && let Some(id) = attrs.get("content")
-                        {
-                            cover_id = Some(id.clone());
-                        }
-                    }
-                    "spine" => {
-                        if let Some(toc) = attrs.get("toc") {
-                            toc_id = Some(toc.clone());
-                        }
-                    }
-                    "itemref" => {
-                        // `linear="no"` marks a document as out of the reading
-                        // order — notes, adverts, a duplicate cover page. It is
-                        // still reachable in the file; it is not part of the read.
-                        let linear = attrs.get("linear").map(String::as_str).unwrap_or("yes");
-                        if let Some(idref) = attrs.get("idref")
-                            && !linear.eq_ignore_ascii_case("no")
-                        {
-                            pkg.spine.push(idref.clone());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Ok(Event::Text(e)) => {
-                if let Some(which) = field.take() {
-                    let value = e.decode().map(|c| c.trim().to_string()).unwrap_or_default();
-                    if value.is_empty() {
-                        continue;
-                    }
-                    match which {
-                        "title" if pkg.title.is_none() => pkg.title = Some(value),
-                        "creator" if pkg.author.is_none() => pkg.author = Some(value),
-                        _ => {}
-                    }
-                }
-            }
-            Ok(Event::End(_)) => field = None,
-            Ok(Event::Eof) | Err(_) => break,
-            _ => {}
-        }
-        buf.clear();
     }
-
-    pkg.toc_href = toc_id
-        .and_then(|id| pkg.manifest.get(&id).map(|i| i.href.clone()))
-        .or(nav_href);
-    pkg.cover_href = cover_href.or_else(|| {
-        cover_id
-            .and_then(|id| pkg.manifest.get(&id).map(|item| item.href.clone()))
-            .filter(|href| !href.is_empty())
-    });
-    pkg
+    projected
 }
 
-/// One line of the table of contents, in reading order.
-///
-/// `fragment` is the part after the `#`, and the reason this is a list rather
-/// than a map: several entries routinely point into the same spine document, and
-/// each of them is a chapter as far as the reader is concerned.
-#[derive(Debug, Clone)]
-struct TocEntry {
-    doc: String,
-    fragment: Option<String>,
-    label: String,
-}
-
-/// The table of contents, in order, from either an NCX or an EPUB 3 nav doc.
-fn parse_toc(doc: &str) -> Vec<TocEntry> {
-    let mut out: Vec<TocEntry> = Vec::new();
-    let mut reader = Reader::from_str(doc);
-    reader.config_mut().check_end_names = false;
-    reader.config_mut().trim_text(true);
-    let mut buf = Vec::new();
-    // NCX: <navLabel><text>T</text></navLabel><content src="H"/>
-    // Nav: <a href="H">T</a>
-    let mut pending_label: Option<String> = None;
-    let mut in_text = false;
-    let mut anchor: Option<(String, String)> = None;
-
-    let mut push = |href: &str, label: String| {
-        let label = label.trim().to_string();
-        if label.is_empty() {
-            return;
-        }
-        let entry = TocEntry {
-            doc: normalize(strip_fragment(href)),
-            fragment: fragment_of(href),
-            label,
-        };
-        // A ToC that names the same point twice is not two chapters.
-        if !out
-            .iter()
-            .any(|e| e.doc == entry.doc && e.fragment == entry.fragment)
-        {
-            out.push(entry);
-        }
-    };
-
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                let tag = local(e.name().as_ref());
-                let attrs = attrs(&e);
-                match tag.as_str() {
-                    "text" => in_text = true,
-                    "content" => {
-                        if let (Some(src), Some(label)) = (attrs.get("src"), pending_label.take()) {
-                            push(src, label);
-                        }
+fn project_blocks(
+    blocks: &[Block],
+    assets: &[MediaAsset],
+    extracted: &BTreeMap<String, PathBuf>,
+) -> Vec<Para> {
+    let assets = assets
+        .iter()
+        .map(|asset| (asset.id.as_str(), asset))
+        .collect::<HashMap<_, _>>();
+    blocks
+        .iter()
+        .filter_map(|block| match &block.kind {
+            BlockKind::Heading { level } => Some(Para::Heading {
+                level: *level,
+                text: block.text.clone(),
+            }),
+            BlockKind::Paragraph => Some(Para::Text(html::project_rich_text(
+                &block.text,
+                &block.inline_spans,
+            ))),
+            BlockKind::Quote => Some(Para::Quote(html::project_rich_text(
+                &block.text,
+                &block.inline_spans,
+            ))),
+            BlockKind::Code => Some(Para::Code(block.text.clone())),
+            BlockKind::Image { asset_id } => {
+                let asset = assets.get(asset_id.as_str())?;
+                match terminal_asset_path(extracted, &asset.source) {
+                    Some(file) => Some(Para::Image {
+                        src: file.clone(),
+                        alt: asset.alt.clone(),
+                    }),
+                    None if !asset.alt.trim().is_empty() => {
+                        Some(Para::Text(asset.alt.clone().into()))
                     }
-                    "a" => {
-                        if let Some(href) = attrs.get("href") {
-                            anchor = Some((href.clone(), String::new()));
-                        }
-                    }
-                    _ => {}
+                    None => None,
                 }
             }
-            Ok(Event::Text(e)) => {
-                let value = e.decode().map(|c| c.trim().to_string()).unwrap_or_default();
-                if value.is_empty() {
-                    continue;
-                }
-                if in_text {
-                    pending_label = Some(value.clone());
-                }
-                if let Some((_, label)) = anchor.as_mut() {
-                    label.push_str(&value);
-                }
-            }
-            Ok(Event::End(e)) => {
-                let tag = local(e.name().as_ref());
-                if tag == "text" {
-                    in_text = false;
-                }
-                if tag == "a"
-                    && let Some((href, label)) = anchor.take()
-                {
-                    push(&href, label);
-                }
-            }
-            Ok(Event::Eof) | Err(_) => break,
-            _ => {}
-        }
-        buf.clear();
-    }
-    out
-}
-
-// ── path + attribute helpers ─────────────────────────────────────────────────
-
-fn attrs(e: &quick_xml::events::BytesStart<'_>) -> HashMap<String, String> {
-    e.attributes()
-        .flatten()
-        .filter_map(|a| {
-            let key = local(a.key.as_ref());
-            let value = a
-                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
-                .ok()?
-                .into_owned();
-            Some((key, value))
         })
         .collect()
 }
 
-fn local(raw: &[u8]) -> String {
-    let name = String::from_utf8_lossy(raw);
-    name.rsplit(':')
-        .next()
-        .unwrap_or(&name)
-        .to_ascii_lowercase()
+fn terminal_asset_path<'a>(
+    extracted: &'a BTreeMap<String, PathBuf>,
+    archive_href: &str,
+) -> Option<&'a PathBuf> {
+    extracted.get(&media::resolve_href("", archive_href))
 }
 
-/// Single-pass scan for the first `<tag attr="…">` in a document.
-fn find_attr(doc: &str, tag: &str, attr: &str) -> Option<String> {
-    let mut reader = Reader::from_str(doc);
-    let mut buf = Vec::new();
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                if local(e.name().as_ref()) == tag
-                    && let Some(v) = attrs(&e).get(attr)
-                {
-                    return Some(v.clone());
-                }
-            }
-            Ok(Event::Eof) | Err(_) => return None,
-            _ => {}
+#[derive(Debug)]
+struct ChapterCut {
+    from: usize,
+    to: usize,
+    title: Option<String>,
+    href: Option<String>,
+}
+
+/// A TOC can point several times into one spine document. The SDK supplies
+/// stable block IDs; this adapter merely slices the terminal's chapter view at
+/// those already-resolved boundaries.
+fn chapter_cuts(chapter: &ParsedEpubChapter, toc: &[ParsedEpubTocEntry]) -> Vec<ChapterCut> {
+    let block_indexes = chapter
+        .document
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| (block.id.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut points = Vec::new();
+    for entry in toc.iter().filter(|entry| entry.chapter_id == chapter.id) {
+        let index = match entry.block_id.as_deref() {
+            Some(block_id) => match block_indexes.get(block_id) {
+                Some(index) => *index,
+                None => continue,
+            },
+            None => 0,
+        };
+        if points
+            .iter()
+            .any(|(existing, _, _): &(usize, String, String)| *existing == index)
+        {
+            continue;
         }
-        buf.clear();
+        points.push((index, entry.title.clone(), entry.href.clone()));
     }
-}
-
-fn read_str(entries: &HashMap<String, Vec<u8>>, name: &str) -> Option<String> {
-    let bytes = entries.get(&normalize(name))?;
-    Some(String::from_utf8_lossy(bytes).into_owned())
-}
-
-/// Lowercase, forward-slashed, `./`-free key for archive lookups.
-fn normalize(name: &str) -> String {
-    let slashed = name.replace('\\', "/");
-    let mut parts: Vec<&str> = Vec::new();
-    for part in slashed.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                parts.pop();
-            }
-            p => parts.push(p),
-        }
+    points.sort_by_key(|(index, _, _)| *index);
+    if points.first().map(|(index, _, _)| *index) != Some(0) {
+        points.insert(0, (0, String::new(), chapter.href.clone()));
     }
-    parts.join("/").to_ascii_lowercase()
-}
-
-fn parent_dir(path: &str) -> String {
-    match path.rfind('/') {
-        Some(i) => path[..i].to_string(),
-        None => String::new(),
+    if points.is_empty() {
+        points.push((0, String::new(), chapter.href.clone()));
     }
-}
 
-fn join(base: &str, href: &str) -> String {
-    let href = strip_fragment(href);
-    if base.is_empty() || href.starts_with('/') {
-        return href.trim_start_matches('/').to_string();
-    }
-    format!("{base}/{href}")
-}
-
-fn strip_fragment(href: &str) -> &str {
-    href.split('#').next().unwrap_or(href)
-}
-
-/// The part after the `#`, which is what turns a ToC line into a chapter.
-fn fragment_of(href: &str) -> Option<String> {
-    href.split_once('#')
-        .map(|(_, fragment)| fragment.trim().to_string())
-        .filter(|fragment| !fragment.is_empty())
-}
-
-fn file_stem(path: &str) -> String {
-    let name = path.rsplit('/').next().unwrap_or(path);
-    name.rsplit_once('.')
-        .map(|(s, _)| s)
-        .unwrap_or(name)
-        .to_string()
+    points
+        .iter()
+        .enumerate()
+        .filter_map(|(position, (from, title, href))| {
+            let to = points
+                .get(position + 1)
+                .map(|(next, _, _)| *next)
+                .unwrap_or(chapter.document.blocks.len());
+            (to > *from).then(|| ChapterCut {
+                from: *from,
+                to,
+                title: (!title.is_empty()).then(|| title.clone()),
+                href: Some(href.clone()),
+            })
+        })
+        .collect()
 }

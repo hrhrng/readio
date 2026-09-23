@@ -1,4 +1,4 @@
-//! Command-line surface: `readio [文件] [-c | -l | -m] [--home <目录>]`.
+//! Command-line surface: local reading plus explicit `readio cloud …` opt-in.
 //!
 //! Kept in the library rather than in `main.rs` so the parsing rules — mode
 //! flags in any position, conflicting flags, a mode with no file — are testable.
@@ -24,12 +24,25 @@ pub struct Args {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Parsed {
     Run(Args),
+    Cloud(CloudCommand),
     Help,
     Version,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloudCommand {
+    Login { server: String },
+    Logout,
+    Status,
+    Sync,
+}
+
 /// Parse arguments (already stripped of the program name).
 pub fn parse(args: &[String]) -> Result<Parsed, String> {
+    if args.first().is_some_and(|arg| arg == "cloud") {
+        return parse_cloud(&args[1..]);
+    }
+
     let mut path: Option<String> = None;
     let mut mode: Option<Mode> = None;
     let mut home: Option<String> = None;
@@ -89,6 +102,28 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
         mode: mode.unwrap_or_default(),
         home,
     }))
+}
+
+fn parse_cloud(args: &[String]) -> Result<Parsed, String> {
+    const DEFAULT_SERVER: &str = "https://cloud.read-io.com";
+    match args {
+        [command] if command == "login" => Ok(Parsed::Cloud(CloudCommand::Login {
+            server: DEFAULT_SERVER.to_string(),
+        })),
+        [command, flag, server] if command == "login" && flag == "--server" => {
+            if !(server.starts_with("https://") || server.starts_with("http://")) {
+                return Err("cloud server must be an http(s) URL".to_string());
+            }
+            Ok(Parsed::Cloud(CloudCommand::Login {
+                server: server.trim_end_matches('/').to_string(),
+            }))
+        }
+        [command] if command == "logout" => Ok(Parsed::Cloud(CloudCommand::Logout)),
+        [command] if command == "status" => Ok(Parsed::Cloud(CloudCommand::Status)),
+        [command] if command == "sync" => Ok(Parsed::Cloud(CloudCommand::Sync)),
+        [] => Err("cloud needs one of: login, logout, status, sync".to_string()),
+        _ => Err("unknown cloud command; use login, logout, status, or sync".to_string()),
+    }
 }
 
 pub fn usage() -> String {
@@ -216,5 +251,36 @@ mod tests {
                 "usage is missing {fragment}:\n{text}"
             );
         }
+    }
+
+    #[test]
+    fn cloud_commands_are_explicit_and_never_look_like_book_paths() {
+        assert_eq!(
+            run(&["cloud", "login"]),
+            Ok(Parsed::Cloud(CloudCommand::Login {
+                server: "https://cloud.read-io.com".to_string(),
+            }))
+        );
+        assert_eq!(
+            run(&["cloud", "login", "--server", "http://127.0.0.1:8787"]),
+            Ok(Parsed::Cloud(CloudCommand::Login {
+                server: "http://127.0.0.1:8787".to_string(),
+            }))
+        );
+        assert_eq!(
+            run(&["cloud", "sync"]),
+            Ok(Parsed::Cloud(CloudCommand::Sync))
+        );
+        assert_eq!(
+            run(&["cloud", "status"]),
+            Ok(Parsed::Cloud(CloudCommand::Status))
+        );
+        assert_eq!(
+            run(&["cloud", "logout"]),
+            Ok(Parsed::Cloud(CloudCommand::Logout))
+        );
+        assert!(run(&["cloud"]).is_err());
+        assert!(run(&["cloud", "login", "--server"]).is_err());
+        assert!(run(&["cloud", "destroy-everything"]).is_err());
     }
 }

@@ -1,65 +1,130 @@
-"use client";
+"use client"
 
-interface TOCItem {
-  id: string;
-  title: string;
-  depth?: number; // 0 = top-level, 1+ = indented sub-items
+import { ChevronLeft, ChevronRight } from "lucide-react"
+import { useLocale } from "../locale-provider"
+
+export interface TOCItem {
+  id: string
+  title: string
+  depth?: number
+  sentenceIndex?: number | null
 }
 
 interface TOCPanelProps {
-  items: TOCItem[];
-  onItemClick: (index: number) => void;
-  activeIndex?: number;
+  items: TOCItem[]
+  currentSentenceIndex: number
+  onNavigate: (sentenceIndex: number) => void
+  onItemClick?: (index: number) => void
+  activeIndex?: number
 }
 
-export function TOCPanel({ items, onItemClick, activeIndex }: TOCPanelProps) {
+export function TOCPanel({
+  items,
+  currentSentenceIndex,
+  onNavigate,
+  onItemClick,
+  activeIndex,
+}: TOCPanelProps) {
+  const { t } = useLocale()
+  if (items.length === 0) {
+    return <p className="reader-toc-empty">{t("reader.noToc")}</p>
+  }
+
+  const projectedActiveIndex = activeIndex ?? items.reduce(
+    (selected, item, index) =>
+      item.sentenceIndex != null && item.sentenceIndex <= currentSentenceIndex
+        ? index
+        : selected,
+    -1
+  )
+  const chapterTargets = items.filter(
+    (item) => (item.depth ?? 0) === 0 && item.sentenceIndex != null
+  )
+  const activeChapterIndex = chapterTargets.reduce(
+    (selected, item, index) =>
+      item.sentenceIndex! <= currentSentenceIndex ? index : selected,
+    -1
+  )
+  const previousChapter =
+    activeChapterIndex > 0 ? chapterTargets[activeChapterIndex - 1] : null
+  const nextChapter =
+    activeChapterIndex < chapterTargets.length - 1
+      ? chapterTargets[activeChapterIndex + 1]
+      : null
+
   return (
-    <nav className="w-64 max-h-[calc(100vh-3.5rem-96px)] overflow-y-auto bg-surface-card backdrop-blur-xl rounded-xl shadow-xl py-2 px-2">
-      {items.length === 0 ? (
-        <p className="px-3 py-4 text-sm text-text-tertiary">
-          No table of contents available.
-        </p>
-      ) : (
-        <ul>
-          {items.map((item, idx) => {
-            const isActive = idx === activeIndex;
-            const depth = item.depth ?? 0;
-
-            return (
-              <li key={`${item.id}-${idx}`}>
-                <button
-                  onClick={() => onItemClick(idx)}
-                  className={`
-                    group relative w-full text-left py-1.5 pr-3 rounded-lg
-                    transition-all duration-200 cursor-pointer
-                    focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent
-                    ${isActive
-                      ? "bg-accent/10 text-accent"
-                      : "text-text-primary hover:bg-surface-hover"
-                    }
-                  `}
-                  style={{ paddingLeft: `${10 + depth * 14}px` }}
-                >
-                  {/* Active indicator bar */}
-                  {isActive && (
-                    <span className="absolute left-1 top-1/2 -translate-y-1/2 w-[3px] h-4 rounded-full bg-accent" />
-                  )}
-
-                  <span
-                    className={`
-                      block text-[13px] leading-snug line-clamp-2
-                      ${isActive ? "font-medium" : ""}
-                      ${depth > 0 && !isActive ? "text-text-secondary group-hover:text-text-primary" : ""}
-                    `}
-                  >
-                    {item.title}
-                  </span>
-                </button>
-              </li>
-            );
-          })}
-        </ul>
+    <nav aria-label={t("reader.toc")}>
+      {chapterTargets.length > 1 && (
+        <div
+          className="reader-toc-chapter-navigation"
+          aria-label={t("reader.chapterNavigation")}
+        >
+          <button
+            type="button"
+            className="ui-button ui-button--quiet reader-toc-step"
+            aria-label={t("reader.previousChapter")}
+            disabled={!previousChapter}
+            onClick={() => {
+              if (previousChapter?.sentenceIndex != null) {
+                onNavigate(previousChapter.sentenceIndex)
+              }
+            }}
+          >
+            <ChevronLeft className="ui-icon" aria-hidden="true" />
+            <span>{t("reader.previous")}</span>
+          </button>
+          <span
+            className="reader-toc-chapter-position"
+            role="status"
+            aria-live="polite"
+          >
+            {t("reader.chapterPosition", {
+              current: Math.max(1, activeChapterIndex + 1),
+              total: chapterTargets.length,
+            })}
+          </span>
+          <button
+            type="button"
+            className="ui-button ui-button--quiet reader-toc-step"
+            aria-label={t("reader.nextChapter")}
+            disabled={!nextChapter}
+            onClick={() => {
+              if (nextChapter?.sentenceIndex != null) {
+                onNavigate(nextChapter.sentenceIndex)
+              }
+            }}
+          >
+            <span>{t("reader.next")}</span>
+            <ChevronRight className="ui-icon" aria-hidden="true" />
+          </button>
+        </div>
       )}
+      <ul className="reader-toc">
+        {items.map((item, index) => {
+          const isActive = index === projectedActiveIndex
+          const depth = Math.min(item.depth ?? 0, 4)
+
+          return (
+            <li key={`${item.id}-${index}`}>
+              <button
+                type="button"
+                onClick={() => {
+                  if (item.sentenceIndex != null) {
+                    onNavigate(item.sentenceIndex)
+                  } else {
+                    onItemClick?.(index)
+                  }
+                }}
+                className="reader-toc-item"
+                data-active={isActive}
+                data-depth={depth}
+              >
+                <span className="line-clamp-2">{item.title}</span>
+              </button>
+            </li>
+          )
+        })}
+      </ul>
     </nav>
-  );
+  )
 }

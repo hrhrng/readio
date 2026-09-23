@@ -88,7 +88,7 @@ struct TOCView: View {
     ///
     /// **Inactive chapter:** Shows standard primary text with a dimmer circle indicator.
     private func tocEntryRow(_ entry: TOCEntry) -> some View {
-        let isCurrent = entry.id == currentChapterId
+        let isCurrent = (entry.chapterId ?? entry.id) == currentChapterId
 
         return Button {
             onSelectChapter(entry.id)
@@ -97,13 +97,15 @@ struct TOCView: View {
                 // Leading indicator — filled circle for current, empty for others
                 Image(systemName: isCurrent ? "circle.fill" : "circle")
                     .font(.system(size: 8))
-                    .foregroundStyle(isCurrent ? .accentColor : .quaternary)
+                    .foregroundStyle(
+                        isCurrent ? Color.accentColor : Color.secondary.opacity(0.4)
+                    )
 
                 // Chapter title
                 Text(entry.title)
                     .font(.subheadline)
                     .fontWeight(isCurrent ? .semibold : .regular)
-                    .foregroundStyle(isCurrent ? .accentColor : .primary)
+                    .foregroundStyle(isCurrent ? Color.accentColor : Color.primary)
                     .lineLimit(2)
                     .multilineTextAlignment(.leading)
 
@@ -113,10 +115,11 @@ struct TOCView: View {
                 if isCurrent {
                     Image(systemName: "speaker.wave.2.fill")
                         .font(.caption)
-                        .foregroundStyle(.accentColor)
+                        .foregroundStyle(Color.accentColor)
                 }
             }
             .padding(.vertical, 4)
+            .padding(.leading, CGFloat(min(entry.depth ?? 0, 4)) * 12)
             .contentShape(Rectangle()) // Make the entire row tappable
         }
         .buttonStyle(.plain)

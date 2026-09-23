@@ -23,68 +23,52 @@ struct ContentView: View {
     /// - `.compact`: iPhone portrait, iPhone landscape (non-Plus), iPad slide-over
     /// - `.regular`: iPad full-screen, iPad split-view (2/3+), iPhone Plus landscape
     @Environment(\.horizontalSizeClass) private var sizeClass
+    @Environment(\.readioTheme) private var theme
 
-    // MARK: - State
+    // MARK: - Navigation
 
-    /// The currently selected tab in the iPhone TabView layout.
-    @State private var selectedTab: Tab = .home
+    /// Each window owns its own router. Native commands receive the focused
+    /// window's instance through `FocusedValues` rather than a process singleton.
+    @State private var router = AppleAppRouter()
 
-    /// The currently selected sidebar item in the iPad NavigationSplitView layout.
-    /// Optional because nothing may be selected when the sidebar first appears.
-    @State private var selectedSidebarItem: SidebarItem? = .home
-
-    // MARK: - Tab / Sidebar Enums
-
-    /// Represents the four top-level navigation destinations in the TabView.
-    enum Tab: Hashable {
-        case home
-        case library
-        case importItem
-        case settings
-    }
-
-    /// Represents sidebar navigation items for the iPad layout.
-    /// Conforms to `CaseIterable` for easy sidebar list generation and `Identifiable`
-    /// for SwiftUI's `List` selection binding.
-    enum SidebarItem: String, CaseIterable, Identifiable {
-        case home
-        case library
-        case importItem
-        case settings
-
-        var id: String { rawValue }
-
-        /// Human-readable label displayed in the sidebar row.
-        var title: String {
-            switch self {
-            case .home: return "Home"
-            case .library: return "Library"
-            case .importItem: return "Import"
-            case .settings: return "Settings"
-            }
-        }
-
-        /// SF Symbol name for the sidebar row icon.
-        var icon: String {
-            switch self {
-            case .home: return "house.fill"
-            case .library: return "books.vertical.fill"
-            case .importItem: return "square.and.arrow.down"
-            case .settings: return "gearshape.fill"
-            }
-        }
-    }
+    /// Scene-scoped persistence keeps independent macOS windows on their own
+    /// destination when the system restores them.
+    @SceneStorage("readio.rootDestination") private var storedDestination =
+        AppleAppDestination.home.rawValue
 
     // MARK: - Body
 
     var body: some View {
-        if sizeClass == .regular {
-            // MARK: iPad Layout — NavigationSplitView
-            iPadLayout
-        } else {
-            // MARK: iPhone Layout — TabView
-            iPhoneLayout
+        Group {
+            if let readerItemID = router.readerItemID {
+                ReaderView(itemId: readerItemID) {
+                    router.closeReader()
+                }
+            } else {
+                switch AppleRootLayoutPolicy.presentation(horizontalSizeClass: sizeClass) {
+                case .split:
+                    // MARK: iPad/macOS Layout — NavigationSplitView
+                    iPadLayout
+                case .compactTabs:
+                    // MARK: iPhone Layout — TabView
+                    iPhoneLayout
+                }
+            }
         }
+        .tint(theme.accent)
+        .foregroundStyle(theme.ink)
+        .background(theme.canvas.ignoresSafeArea())
+        .readioDesktopMinimumSize()
+        .task {
+            _ = try? await AppleCloudService.shared.syncIfConnected()
+        }
+        .onAppear {
+            router.restoreDestination(rawValue: storedDestination)
+        }
+        .onChange(of: router.destination) { _, destination in
+            storedDestination = destination.rawValue
+        }
+        .focusedSceneValue(\.readioAppRouter, router)
     }
 
     // MARK: - iPad Layout
@@ -96,30 +80,37 @@ struct ContentView: View {
     /// If no item is selected, a placeholder is shown.
     private var iPadLayout: some View {
         NavigationSplitView {
-            SidebarView(selection: $selectedSidebarItem)
+            SidebarView(selection: sidebarSelection)
         } detail: {
             // Wrap detail in NavigationStack so child views can push
             // (e.g., BookCardView → ReaderView) within the detail column.
             NavigationStack {
-                switch selectedSidebarItem {
+                switch router.destination {
                 case .home:
-                    HomeView()
+                    HomeView(onOpenReader: router.openReader)
                 case .library:
-                    LibraryView()
+                    LibraryView(
+                        onImport: { router.navigate(to: .importItem) },
+                        onOpenReader: router.openReader
+                    )
                 case .importItem:
-                    ImportView()
+                    ImportView(router: router)
                 case .settings:
                     SettingsView()
-                case nil:
-                    // No selection — show a gentle welcome placeholder
-                    ContentUnavailableView(
-                        "Welcome to Readio",
-                        systemImage: "book.fill",
-                        description: Text("Select a section from the sidebar to get started.")
-                    )
                 }
             }
         }
+    }
+
+    private var sidebarSelection: Binding<AppleAppDestination?> {
+        Binding(
+            get: { router.destination },
+            set: { destination in
+                if let destination {
+                    router.navigate(to: destination)
+                }
+            }
+        )
     }
 
     // MARK: - iPhone Layout
@@ -131,7 +122,7 @@ struct ContentView: View {
     /// navigating from a BookCard to ReaderView in the Home tab leaves the
     /// Library tab's navigation stack untouched.
     private var iPhoneLayout: some View {
-        TabView(selection: $selectedTab) {
+        TabView(selection: $router.destination) {
             // MARK: Home Tab
             NavigationStack {
                 HomeView()
@@ -139,7 +130,7 @@ struct ContentView: View {
             .tabItem {
                 Label("Home", systemImage: "house.fill")
             }
-            .tag(Tab.home)
+            .tag(AppleAppDestination.home)
 
             // MARK: Library Tab
             NavigationStack {
@@ -148,16 +139,16 @@ struct ContentView: View {
             .tabItem {
                 Label("Library", systemImage: "books.vertical.fill")
             }
-            .tag(Tab.library)
+            .tag(AppleAppDestination.library)
 
             // MARK: Import Tab
             NavigationStack {
-                ImportView()
+                ImportView(router: router)
             }
             .tabItem {
                 Label("Import", systemImage: "square.and.arrow.down")
             }
-            .tag(Tab.importItem)
+            .tag(AppleAppDestination.importItem)
 
             // MARK: Settings Tab
             NavigationStack {
@@ -166,8 +157,19 @@ struct ContentView: View {
             .tabItem {
                 Label("Settings", systemImage: "gearshape.fill")
             }
-            .tag(Tab.settings)
+            .tag(AppleAppDestination.settings)
         }
+    }
+}
+
+private extension View {
+    @ViewBuilder
+    func readioDesktopMinimumSize() -> some View {
+        #if os(macOS)
+        frame(minWidth: 1_080, minHeight: 720)
+        #else
+        self
+        #endif
     }
 }
 

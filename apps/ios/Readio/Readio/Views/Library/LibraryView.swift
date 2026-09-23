@@ -1,241 +1,371 @@
 import SwiftUI
 
-// MARK: - LibraryView
-/// The main library screen showing all imported items in a filterable, sortable grid.
-///
-/// **Layout:**
-/// ```
-/// ┌──────────────────────────────────────┐
-/// │  Library                 (nav title) │
-/// ├──────────────────────────────────────┤
-/// │  🔍 Search books...                  │
-/// │                                      │
-/// │  [All] [EPUB] [PDF] [TXT] [Web]      │  ← Filter tabs
-/// │                                      │
-/// │  ┌─────┐ ┌─────┐ ┌─────┐           │
-/// │  │Card │ │Card │ │Card │           │  ← Adaptive grid
-/// │  └─────┘ └─────┘ └─────┘           │
-/// │  ┌─────┐ ┌─────┐ ┌─────┐           │
-/// │  │Card │ │Card │ │Card │           │
-/// │  └─────┘ └─────┘ └─────┘           │
-/// │                                      │
-/// │  ⏳ Loading more...                  │  ← Pagination indicator
-/// └──────────────────────────────────────┘
-/// ```
-///
-/// **Features:**
-/// - Search bar with debounced server-side search
-/// - Filter tabs to narrow by document type (EPUB, PDF, TXT, Web)
-/// - Sort menu accessible from the toolbar (date, title, progress)
-/// - Adaptive grid layout (minimum 160pt columns) for all screen sizes
-/// - Infinite scroll pagination — loads the next page when the last item appears
-/// - Pull-to-refresh for manual reload
-/// - Swipe-to-delete on grid items
-/// - Full-screen empty state when no items match the current filter/search
+/// Cover-led collection surface shared by iPad and macOS. Search and filtering
+/// remain available, but stay quiet until requested so the library reads like a
+/// shelf rather than a dashboard.
 struct LibraryView: View {
+    @Environment(\.horizontalSizeClass) private var sizeClass
+    @Environment(\.readioTheme) private var theme
+    @Environment(\.locale) private var locale
 
-    // MARK: - State
-
-    /// The view model managing library data, pagination, search, and filtering.
     @State private var viewModel = LibraryViewModel()
-
-    /// Controls whether the grid displays in list mode vs. grid mode.
-    /// Persisted across app launches via `@AppStorage`.
+    @State private var isShowingBuiltinSample = false
+    @State private var isSearchVisible = false
+    @State private var pendingDeletion: LibraryItemSummary?
     @AppStorage("libraryViewStyle") private var isListView = false
 
-    /// The columns configuration for the adaptive grid.
-    /// Minimum 160pt per column ensures cards look good on all screen sizes.
-    private let gridColumns = [
-        GridItem(.adaptive(minimum: 160, maximum: 200), spacing: 16)
-    ]
+    private let onImport: (() -> Void)?
+    private let onOpenReader: ((String) -> Void)?
 
-    // MARK: - Body
+    init(
+        onImport: (() -> Void)? = nil,
+        onOpenReader: ((String) -> Void)? = nil
+    ) {
+        self.onImport = onImport
+        self.onOpenReader = onOpenReader
+    }
+
+    private var isCompact: Bool { sizeClass == .compact }
+    private var pageGutter: CGFloat { isCompact ? 20 : 48 }
+    private var cardWidth: CGFloat { isCompact ? 150 : ReadioAppleLayout.bookCoverWidth }
+    private var gridColumns: [GridItem] {
+        [
+            GridItem(
+                .adaptive(minimum: cardWidth, maximum: isCompact ? 180 : 220),
+                spacing: isCompact ? 18 : 44,
+                alignment: .top
+            )
+        ]
+    }
 
     var body: some View {
-        VStack(spacing: 0) {
-            // MARK: Search Bar
-            searchBar
+        ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
+                pageHeader
 
-            // MARK: Filter Tabs
-            filterTabs
+                if isSearchVisible {
+                    searchAndFilters
+                        .padding(.top, 24)
+                }
 
-            // MARK: Content Area
-            if viewModel.isLoading && viewModel.items.isEmpty {
-                // First load — show loading placeholder
-                loadingView
-            } else if viewModel.items.isEmpty {
-                // No items match current filter/search
-                emptyStateView
-            } else {
-                // Normal content — grid or list of items
-                contentView
+                if viewModel.isLoading && viewModel.items.isEmpty {
+                    loadingView
+                } else if viewModel.items.isEmpty {
+                    emptyStateView
+                } else {
+                    if let item = viewModel.continueReadingItem {
+                        continueReadingStrip(item)
+                            .padding(.top, 36)
+                    }
+
+                    shelfHeader
+                        .padding(.top, 42)
+                        .padding(.bottom, 24)
+
+                    collection
+                }
             }
+            .frame(maxWidth: ReadioAppleLayout.libraryContentMaxWidth, alignment: .leading)
+            .padding(.horizontal, pageGutter)
+            .padding(.top, isCompact ? 24 : 52)
+            .padding(.bottom, 48)
+            .frame(maxWidth: .infinity, alignment: .top)
         }
-        .navigationTitle("Library")
-        .toolbar {
-            // MARK: Toolbar — Sort Menu & View Toggle
-            ToolbarItemGroup(placement: .topBarTrailing) {
-                sortMenu
-                viewToggleButton
+        .scrollContentBackground(.hidden)
+        .background(theme.canvas.ignoresSafeArea())
+        .tint(theme.accent)
+        .navigationTitle("")
+        .navigationDestination(for: String.self) { itemID in
+            ReaderView(itemId: itemID)
+        }
+        .navigationDestination(isPresented: $isShowingBuiltinSample) {
+            if let itemID = AppleBuiltinSampleEntry.destinationItemID(
+                libraryIsEmpty: true,
+                searchOrFilterIsActive: false
+            ) {
+                ReaderView(itemId: itemID)
             }
         }
         .task {
-            // Initial data load when the view appears.
             await viewModel.loadItems()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .readioReplicaDidSync)) { _ in
+            Task { await viewModel.refresh() }
+        }
+        .alert(item: $pendingDeletion) { item in
+            let presentation = LibraryForgetPresentation.resolve(
+                itemTitle: item.title,
+                ownership: item.importRecord?.ownership,
+                locale: locale
+            )
+            return Alert(
+                title: Text(presentation.title),
+                message: Text(presentation.message),
+                primaryButton: .destructive(Text(presentation.actionLabel)) {
+                    Task { try? await viewModel.deleteItem(id: item.id) }
+                },
+                secondaryButton: .cancel()
+            )
+        }
     }
 
-    // MARK: - Search Bar
+    // MARK: - Header
 
-    /// A search field that triggers server-side search with debouncing.
-    ///
-    /// The `searchQuery` binding on `viewModel` is debounced internally (typically
-    /// 300ms) so we don't flood the server with requests on every keystroke.
-    private var searchBar: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "magnifyingglass")
-                .foregroundStyle(.secondary)
-
-            TextField("Search books...", text: $viewModel.searchQuery)
-                .textFieldStyle(.plain)
-                .autocorrectionDisabled()
-                .textInputAutocapitalization(.never)
-                .submitLabel(.search)
-                .onSubmit {
-                    // The ViewModel's search(_:) method takes a query parameter.
-                    // We pass the current searchQuery value.
-                    Task { await viewModel.search(viewModel.searchQuery) }
-                }
-
-            // Clear button — only shown when there is text to clear
-            if !viewModel.searchQuery.isEmpty {
-                Button {
-                    viewModel.searchQuery = ""
-                    // Clearing the query and reloading shows all items again.
-                    Task { await viewModel.search("") }
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.secondary)
-                }
+    @ViewBuilder
+    private var pageHeader: some View {
+        if isCompact {
+            VStack(alignment: .leading, spacing: 20) {
+                titleBlock
+                headerActions
+            }
+        } else {
+            HStack(alignment: .top, spacing: 24) {
+                titleBlock
+                Spacer(minLength: 32)
+                headerActions
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(Color(.secondarySystemGroupedBackground))
-        )
-        .padding(.horizontal)
-        .padding(.top, 8)
     }
 
-    // MARK: - Filter Tabs
+    private var titleBlock: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Library")
+                .font(.system(size: isCompact ? 34 : 42, weight: .bold, design: .rounded))
+                .tracking(-1.2)
+                .foregroundStyle(theme.ink)
 
-    /// Horizontally scrolling filter pills for document type filtering.
-    ///
-    /// "All" shows everything; tapping a specific type (EPUB, PDF, etc.) sets
-    /// `viewModel.selectedType` which triggers a filtered reload from the server.
-    private var filterTabs: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                // "All" filter — clears the type filter
-                FilterChip(
-                    title: "All",
-                    isSelected: viewModel.selectedType == nil,
-                    action: {
+            Text(librarySummary)
+                .font(.system(size: 16, weight: .regular))
+                .foregroundStyle(theme.secondaryInk)
+        }
+    }
+
+    private var librarySummary: String {
+        let bookLabel = AppleLocalization.string(
+            viewModel.totalItems == 1 ? "library.book.singular" : "library.book.plural",
+            defaultValue: viewModel.totalItems == 1 ? "book" : "books",
+            locale: locale
+        )
+        let progressLabel = AppleLocalization.string(
+            "library.inProgress",
+            defaultValue: "in progress",
+            locale: locale
+        )
+        return "\(viewModel.totalItems) \(bookLabel) · \(viewModel.inProgressTotal) \(progressLabel)"
+    }
+
+    private var headerActions: some View {
+        HStack(spacing: 10) {
+            Button {
+                withAnimation(.easeOut(duration: 0.18)) {
+                    isSearchVisible.toggle()
+                }
+            } label: {
+                Image(systemName: "magnifyingglass")
+                    .frame(width: 40, height: 40)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(isSearchVisible ? theme.accent : theme.secondaryInk)
+            .accessibilityLabel(
+                AppleLocalization.string(
+                    isSearchVisible ? "Hide search" : "Show search",
+                    defaultValue: isSearchVisible ? "Hide search" : "Show search",
+                    locale: locale
+                )
+            )
+
+            viewToggleButton
+
+            if let onImport {
+                Button(action: onImport) {
+                    Label("Import", systemImage: "plus")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(theme.onAccent)
+                        .padding(.horizontal, 18)
+                        .frame(height: 44)
+                        .background {
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(theme.accent)
+                        }
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut("o", modifiers: .command)
+            }
+        }
+    }
+
+    // MARK: - Search and filters
+
+    private var searchAndFilters: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 10) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(theme.secondaryInk)
+
+                TextField("Search books", text: $viewModel.searchQuery)
+                    .textFieldStyle(.plain)
+                    .autocorrectionDisabled()
+                    .readioSearchInputTraits()
+                    .submitLabel(.search)
+                    .onSubmit {
+                        Task { await viewModel.search(viewModel.searchQuery) }
+                    }
+
+                if !viewModel.searchQuery.isEmpty {
+                    Button {
+                        viewModel.searchQuery = ""
+                        Task { await viewModel.search("") }
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(theme.secondaryInk)
+                    .accessibilityLabel("Clear search")
+                }
+            }
+            .padding(.horizontal, 12)
+            .frame(maxWidth: 420)
+            .frame(height: 40)
+            .background(theme.raised)
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(theme.border, lineWidth: 1)
+            }
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    FilterChip(
+                        title: String(localized: "All", locale: locale),
+                        isSelected: viewModel.selectedType == nil
+                    ) {
                         viewModel.selectedType = nil
                         Task { await viewModel.loadItems() }
                     }
-                )
 
-                // One chip per document type.
-                // Note: viewModel.selectedType is String? (not LibraryItemType?),
-                // so we compare and assign the raw string value.
-                ForEach(LibraryItemType.allCases, id: \.self) { type in
-                    FilterChip(
-                        title: type.rawValue.uppercased(),
-                        isSelected: viewModel.selectedType == type.rawValue,
-                        action: {
+                    ForEach(LibraryItemType.allCases, id: \.self) { type in
+                        FilterChip(
+                            title: type.rawValue.uppercased(),
+                            isSelected: viewModel.selectedType == type.rawValue
+                        ) {
                             viewModel.selectedType = type.rawValue
                             Task { await viewModel.loadItems() }
                         }
-                    )
+                    }
                 }
             }
-            .padding(.horizontal)
-            .padding(.vertical, 10)
         }
     }
 
-    // MARK: - Content View (Grid / List)
+    // MARK: - Continue reading
 
-    /// The main scrollable content area containing the library items.
-    /// Supports both grid and list layouts, toggled by the toolbar button.
-    private var contentView: some View {
-        ScrollView {
-            if isListView {
-                // MARK: List Layout
-                LazyVStack(spacing: 0) {
-                    ForEach(viewModel.items) { item in
-                        NavigationLink(value: item.id) {
-                            BookListRow(item: item)
-                        }
-                        .buttonStyle(.plain)
-                        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                            deleteSwipeButton(for: item)
-                        }
-
-                        Divider()
-                            .padding(.leading, 80)
-                    }
-
-                    // Pagination trigger — load more when the last item appears
-                    paginationTrigger
+    private func continueReadingStrip(_ item: LibraryItemSummary) -> some View {
+        HStack(spacing: isCompact ? 14 : 22) {
+            CoverImageView(
+                coverImage: item.coverImage,
+                title: item.title,
+                size: CGSize(width: isCompact ? 48 : 64, height: isCompact ? 72 : 96),
+                loadEpubAsset: { assetID in
+                    try await LibraryService().loadEpubAsset(itemID: item.id, assetID: assetID)
                 }
-            } else {
-                // MARK: Grid Layout
-                LazyVGrid(columns: gridColumns, spacing: 20) {
-                    ForEach(viewModel.items) { item in
-                        NavigationLink(value: item.id) {
-                            BookCardView(item: item)
-                                .contextMenu {
-                                    deleteContextMenuButton(for: item)
-                                }
-                        }
-                        .buttonStyle(.plain)
-                    }
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
 
-                    // Pagination trigger — load more when the last item appears
-                    paginationTrigger
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Continue reading")
+                    .font(.system(size: 14))
+                    .foregroundStyle(theme.secondaryInk)
+
+                Text(item.title)
+                    .font(.system(size: isCompact ? 17 : 20, weight: .semibold))
+                    .foregroundStyle(theme.ink)
+                    .lineLimit(1)
+
+                progressBar(item.progress, height: 4)
+                    .frame(maxWidth: isCompact ? 180 : 360)
+            }
+
+            Spacer(minLength: 8)
+
+            if !isCompact {
+                readerLink(itemID: item.id) {
+                    HStack(spacing: 10) {
+                        Text("Resume")
+                            .font(.system(size: 15, weight: .semibold))
+                        Image(systemName: "arrow.right")
+                    }
+                    .foregroundStyle(theme.accent)
+                    .padding(.horizontal, 20)
+                    .frame(height: 48)
+                    .background(theme.raised)
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                 }
-                .padding(.horizontal)
-                .padding(.top, 8)
+                .buttonStyle(.plain)
             }
         }
-        .refreshable {
-            await viewModel.refresh()
-        }
-        .navigationDestination(for: String.self) { itemId in
-            ReaderView(itemId: itemId)
+        .padding(.horizontal, isCompact ? 16 : 24)
+        .padding(.vertical, isCompact ? 16 : 18)
+        .background(theme.selected)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    // MARK: - Shelf
+
+    private var shelfHeader: some View {
+        HStack {
+            Text("Recently added")
+                .font(.system(size: 22, weight: .semibold))
+                .foregroundStyle(theme.ink)
+
+            Spacer()
+            sortMenu
         }
     }
 
-    // MARK: - Pagination Trigger
+    @ViewBuilder
+    private var collection: some View {
+        if isListView {
+            LazyVStack(spacing: 0) {
+                ForEach(viewModel.items) { item in
+                    readerLink(itemID: item.id) {
+                        BookListRow(item: item)
+                    }
+                    .buttonStyle(.plain)
+                    .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                        deleteButton(for: item)
+                    }
 
-    /// An invisible view placed at the bottom of the list/grid.
-    /// When it appears on screen, triggers loading the next page of results.
+                    Divider()
+                        .overlay(theme.border)
+                        .padding(.leading, 76)
+                }
+                paginationTrigger
+            }
+        } else {
+            LazyVGrid(columns: gridColumns, alignment: .leading, spacing: isCompact ? 32 : 48) {
+                ForEach(viewModel.items) { item in
+                    readerLink(itemID: item.id) {
+                        BookCardView(item: item, cardWidth: cardWidth)
+                            .contextMenu {
+                                deleteButton(for: item)
+                            }
+                    }
+                    .buttonStyle(.plain)
+                }
+                paginationTrigger
+            }
+        }
+    }
+
     private var paginationTrigger: some View {
         Group {
             if viewModel.isLoading {
-                // Show a loading spinner at the bottom while fetching the next page
-                HStack {
-                    Spacer()
-                    ProgressView()
-                        .padding()
-                    Spacer()
-                }
-            } else {
-                // Invisible trigger — `.onAppear` fires when this view scrolls into the viewport
+                ProgressView()
+                    .tint(theme.accent)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 20)
+            } else if viewModel.hasMorePages {
                 Color.clear
                     .frame(height: 1)
                     .onAppear {
@@ -245,194 +375,242 @@ struct LibraryView: View {
         }
     }
 
-    // MARK: - Sort Menu
-
-    /// Toolbar menu for selecting sort criteria and direction.
-    /// Options: Date (newest/oldest), Title (A-Z/Z-A), Progress (most/least).
     private var sortMenu: some View {
         Menu {
-            Section("Sort By") {
-                Button {
-                    viewModel.sortBy = "date"
-                    viewModel.sortOrder = "desc"
-                    Task { await viewModel.loadItems() }
-                } label: {
-                    Label("Newest First", systemImage: "calendar.badge.clock")
-                    if viewModel.sortBy == "date" && viewModel.sortOrder == "desc" {
-                        Image(systemName: "checkmark")
-                    }
-                }
-
-                Button {
-                    viewModel.sortBy = "date"
-                    viewModel.sortOrder = "asc"
-                    Task { await viewModel.loadItems() }
-                } label: {
-                    Label("Oldest First", systemImage: "calendar")
-                    if viewModel.sortBy == "date" && viewModel.sortOrder == "asc" {
-                        Image(systemName: "checkmark")
-                    }
-                }
-
-                Divider()
-
-                Button {
-                    viewModel.sortBy = "title"
-                    viewModel.sortOrder = "asc"
-                    Task { await viewModel.loadItems() }
-                } label: {
-                    Label("Title A-Z", systemImage: "textformat.abc")
-                    if viewModel.sortBy == "title" && viewModel.sortOrder == "asc" {
-                        Image(systemName: "checkmark")
-                    }
-                }
-
-                Button {
-                    viewModel.sortBy = "title"
-                    viewModel.sortOrder = "desc"
-                    Task { await viewModel.loadItems() }
-                } label: {
-                    Label("Title Z-A", systemImage: "textformat.abc")
-                    if viewModel.sortBy == "title" && viewModel.sortOrder == "desc" {
-                        Image(systemName: "checkmark")
-                    }
-                }
-
-                Divider()
-
-                Button {
-                    viewModel.sortBy = "progress"
-                    viewModel.sortOrder = "desc"
-                    Task { await viewModel.loadItems() }
-                } label: {
-                    Label("Most Progress", systemImage: "chart.bar.fill")
-                    if viewModel.sortBy == "progress" && viewModel.sortOrder == "desc" {
-                        Image(systemName: "checkmark")
-                    }
-                }
+            Section("Sort") {
+                sortButton("Newest first", by: "created_at", order: "desc")
+                sortButton("Oldest first", by: "created_at", order: "asc")
+                sortButton("Title A–Z", by: "title", order: "asc")
+                sortButton("Most progress", by: "progress", order: "desc")
             }
         } label: {
-            Image(systemName: "arrow.up.arrow.down")
+            Image(systemName: "ellipsis")
+                .font(.system(size: 18, weight: .medium))
+                .foregroundStyle(theme.secondaryInk)
+                .frame(width: 40, height: 40)
+                .contentShape(Rectangle())
+        }
+        .readioQuietMenuStyle()
+        .accessibilityLabel("Sort library")
+    }
+
+    private func sortButton(
+        _ title: LocalizedStringKey,
+        by field: String,
+        order: String
+    ) -> some View {
+        Button {
+            viewModel.sortBy = field
+            viewModel.sortOrder = order
+            Task { await viewModel.loadItems() }
+        } label: {
+            Text(title)
+            if viewModel.sortBy == field && viewModel.sortOrder == order {
+                Image(systemName: "checkmark")
+            }
         }
     }
 
-    // MARK: - View Toggle Button
-
-    /// Toggles between grid and list display modes.
     private var viewToggleButton: some View {
         Button {
-            withAnimation(.easeInOut(duration: 0.2)) {
+            withAnimation(.easeOut(duration: 0.18)) {
                 isListView.toggle()
             }
         } label: {
-            Image(systemName: isListView ? "square.grid.2x2" : "list.bullet")
+            Image(systemName: isListView ? "list.bullet" : "square.grid.2x2")
+                .frame(width: 40, height: 40)
+                .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
+        .foregroundStyle(theme.secondaryInk)
+        .accessibilityLabel(
+            AppleLocalization.string(
+                isListView ? "Show grid" : "Show list",
+                defaultValue: isListView ? "Show grid" : "Show list",
+                locale: locale
+            )
+        )
     }
 
-    // MARK: - Delete Actions
-
-    /// Swipe-to-delete button for list rows.
-    /// The ViewModel's `deleteItem(id:)` throws on server error, but we handle
-    /// errors silently here (the ViewModel shows an error state internally).
-    private func deleteSwipeButton(for item: LibraryItemSummary) -> some View {
+    private func deleteButton(for item: LibraryItemSummary) -> some View {
         Button(role: .destructive) {
-            Task { try? await viewModel.deleteItem(id: item.id) }
+            pendingDeletion = item
         } label: {
-            Label("Delete", systemImage: "trash")
+            Label(
+                AppleLocalization.string(
+                    item.importRecord?.ownership == .link ? "Remove" : "Delete",
+                    defaultValue: item.importRecord?.ownership == .link ? "Remove" : "Delete",
+                    locale: locale
+                ),
+                systemImage: "trash"
+            )
         }
     }
 
-    /// Context menu delete button for grid cards.
-    private func deleteContextMenuButton(for item: LibraryItemSummary) -> some View {
-        Button(role: .destructive) {
-            Task { try? await viewModel.deleteItem(id: item.id) }
-        } label: {
-            Label("Delete", systemImage: "trash")
-        }
-    }
+    // MARK: - States
 
-    // MARK: - Loading View
-
-    /// Full-screen loading placeholder shown during the initial data fetch.
     private var loadingView: some View {
-        VStack {
-            Spacer()
-            ProgressView("Loading library...")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-            Spacer()
+        HStack(spacing: isCompact ? 18 : 44) {
+            ForEach(0..<(isCompact ? 2 : 3), id: \.self) { _ in
+                VStack(alignment: .leading, spacing: 10) {
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(theme.hover)
+                        .aspectRatio(2.0 / 3.0, contentMode: .fit)
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(theme.hover)
+                        .frame(height: 16)
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(theme.hover)
+                        .frame(width: 90, height: 12)
+                }
+                .frame(width: cardWidth)
+            }
         }
+        .redacted(reason: .placeholder)
+        .padding(.top, 48)
     }
 
-    // MARK: - Empty State
-
-    /// Shown when no items match the current filter or search query.
-    /// Message varies based on whether a search/filter is active.
     private var emptyStateView: some View {
-        VStack {
-            Spacer()
+        Group {
             if !viewModel.searchQuery.isEmpty {
                 EmptyStateView(
                     icon: "magnifyingglass",
-                    title: "No Results",
-                    message: "No items match \"\(viewModel.searchQuery)\". Try a different search term."
+                    title: AppleLocalization.string(
+                        "library.noResults",
+                        defaultValue: "No results",
+                        locale: locale
+                    ),
+                    message: AppleLocalization.formatted(
+                        "library.noBooksMatch.format",
+                        defaultValue: "No books match “%1$@”. Try another search.",
+                        locale: locale,
+                        arguments: [viewModel.searchQuery]
+                    )
                 )
-            } else if let typeFilter = viewModel.selectedType {
+            } else if let type = viewModel.selectedType {
                 EmptyStateView(
                     icon: "doc",
-                    title: "No \(typeFilter.uppercased()) Items",
-                    message: "You haven't imported any \(typeFilter.uppercased()) files yet."
+                    title: AppleLocalization.formatted(
+                        "library.noTypeBooks.format",
+                        defaultValue: "No %1$@ books",
+                        locale: locale,
+                        arguments: [type.uppercased()]
+                    ),
+                    message: AppleLocalization.formatted(
+                        "library.importType.format",
+                        defaultValue: "Import a %1$@ file to add it to this shelf.",
+                        locale: locale,
+                        arguments: [type.uppercased()]
+                    )
                 )
             } else {
                 EmptyStateView(
-                    icon: "book.closed.fill",
-                    title: "Your Library is Empty",
-                    message: "Import files or paste a URL to start building your library."
-                )
+                    icon: "book.closed",
+                    title: String(localized: "Your library is empty", locale: locale),
+                    message: String(
+                        localized: "Import a book or open the built-in sample to start reading.",
+                        locale: locale
+                    ),
+                    actionLabel: String(localized: "Open Sample", locale: locale)
+                ) {
+                    guard let itemID = AppleBuiltinSampleEntry.destinationItemID(
+                        libraryIsEmpty: true,
+                        searchOrFilterIsActive: false
+                    ) else { return }
+                    if let onOpenReader {
+                        onOpenReader(itemID)
+                    } else {
+                        isShowingBuiltinSample = true
+                    }
+                }
             }
-            Spacer()
+        }
+        .frame(maxWidth: .infinity, minHeight: 460)
+    }
+
+    private func progressBar(_ progress: Int, height: CGFloat) -> some View {
+        GeometryReader { geometry in
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(theme.highlight.opacity(0.72))
+                Capsule()
+                    .fill(theme.accent)
+                    .frame(width: geometry.size.width * CGFloat(min(max(progress, 0), 100)) / 100)
+            }
+        }
+        .frame(height: height)
+        .accessibilityLabel(
+            AppleLocalization.formatted(
+                "reader.percentRead.format",
+                defaultValue: "%1$lld percent read",
+                locale: locale,
+                arguments: [progress]
+            )
+        )
+    }
+
+    @ViewBuilder
+    private func readerLink<Label: View>(
+        itemID: String,
+        @ViewBuilder label: () -> Label
+    ) -> some View {
+        if let onOpenReader {
+            Button {
+                onOpenReader(itemID)
+            } label: {
+                label()
+            }
+        } else {
+            NavigationLink(value: itemID) {
+                label()
+            }
         }
     }
 }
 
-// MARK: - FilterChip
-/// A small pill-shaped button used as a filter tab in the library toolbar.
-///
-/// Selected state uses the accent color with white text; unselected uses
-/// a subtle background with primary text. Animates the transition.
-struct FilterChip: View {
+private extension View {
+    @ViewBuilder
+    func readioSearchInputTraits() -> some View {
+        #if os(iOS)
+        textInputAutocapitalization(.never)
+        #else
+        self
+        #endif
+    }
 
-    /// The label text displayed inside the chip.
+    @ViewBuilder
+    func readioQuietMenuStyle() -> some View {
+        #if os(macOS)
+        menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+        #else
+        self
+        #endif
+    }
+}
+
+private struct FilterChip: View {
+    @Environment(\.readioTheme) private var theme
     let title: String
-
-    /// Whether this chip is currently the active filter.
     let isSelected: Bool
-
-    /// Action to perform when the chip is tapped.
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
             Text(title)
-                .font(.subheadline)
-                .fontWeight(isSelected ? .semibold : .medium)
-                .foregroundStyle(isSelected ? .white : .primary)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 6)
-                .background(
-                    Capsule()
-                        .fill(isSelected ? Color.accentColor : Color(.secondarySystemGroupedBackground))
-                )
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(isSelected ? theme.ink : theme.secondaryInk)
+                .padding(.horizontal, 12)
+                .frame(height: 32)
+                .background(isSelected ? theme.selected : theme.hover)
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         }
         .buttonStyle(.plain)
-        .animation(.easeInOut(duration: 0.15), value: isSelected)
     }
 }
 
-// MARK: - Preview
-
 #Preview {
     NavigationStack {
-        LibraryView()
+        LibraryView(onImport: {})
     }
 }

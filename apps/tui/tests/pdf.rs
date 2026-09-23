@@ -149,10 +149,9 @@ fn a_scanned_pdf_is_refused_with_a_reason() {
 
     let error = Book::load(Some(&path)).expect_err("an image-only PDF must be refused");
     let message = format!("{error:#}");
-    assert!(
-        message.contains("扫描件") && message.contains("文字型 PDF"),
-        "the refusal has to say why, got {message}"
-    );
+    let explains_scan = (message.contains("扫描件") && message.contains("文字型 PDF"))
+        || (message.contains("scanned") && message.contains("text PDF"));
+    assert!(explains_scan, "the refusal has to say why, got {message}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

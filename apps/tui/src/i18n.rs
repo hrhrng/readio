@@ -216,6 +216,13 @@ pub const TABLE: &[(&str, &str, &str)] = &[
         "Usage: /mode manual | auto | aloud — or press shift+tab to cycle"),
     ("mode.aloud_unavailable", "TTS 不可用，已停在朗读模式；不会降级成自动滚动",
         "TTS is unavailable. Stopped in read-aloud; auto fallback is disabled"),
+    ("sleep.chip", "睡眠", "sleep"),
+    ("sleep.set", "睡眠定时：{0} 分钟后暂停", "Sleep timer: pause in {0} minutes"),
+    ("sleep.extended", "睡眠定时已延长 {0} 分钟", "Sleep timer extended by {0} minutes"),
+    ("sleep.cleared", "睡眠定时已取消", "Sleep timer cancelled"),
+    ("sleep.elapsed", "睡眠定时已到，阅读停在当前位置", "Sleep timer ended; reading paused here"),
+    ("sleep.usage", "用法：/sleep <分钟> | +<分钟> | off",
+        "Usage: /sleep <minutes> | +<minutes> | off"),
     ("cmd.needs_slash", "命令以 / 开头，比如 /find。要检索全书就用 /find <词>",
         "Commands start with a slash — /find, say. To search the book: /find <term>"),
     ("chrome.scrolled", "{0} 已上滚 {1}%", "{0} scrolled up {1}%"),
@@ -304,6 +311,9 @@ pub const TABLE: &[(&str, &str, &str)] = &[
     ("cmd.library_empty", "书库是空的。用 readio <文件> 导入，或 /sample 读内置示例。",
         "The library is empty. Import with readio <file>, or read /sample."),
     ("cmd.cleared", "已清屏", "Cleared"),
+    ("cmd.diagnostics_saved", "支持包已保存到 {0} · {1} 个事件 · 已丢弃 {2} 个非白名单字段",
+        "Support bundle saved to {0} · {1} events · {2} non-allowlisted fields dropped"),
+    ("cmd.diagnostics_failed", "支持包生成失败：{0}", "Could not create support bundle: {0}"),
     ("cmd.thinking_toggled", "思考过程已切换", "Reasoning folded / unfolded"),
     ("cmd.tools_expanded", "工具调用已展开", "Tool calls expanded"),
     ("cmd.tools_folded", "工具调用已折叠", "Tool calls folded"),
@@ -586,6 +596,9 @@ The short forms -c / -l / -m work too."),
         "{0} could not be parsed; the file may be damaged"),
     ("pdf.encrypted", "这份 PDF 有密码保护，readio 打不开",
         "this PDF is password protected, so readio cannot open it"),
+    ("pdf.scanned", "这份 PDF 看起来是扫描件（每页只有 {0} 个字符），readio 只能读文字型 PDF",
+        "this PDF appears to be scanned ({0} text characters per page); readio needs a text PDF"),
+    ("pdf.empty", "{0} 里没有可读的页面", "{0} has no readable pages"),
     ("pdf.part", "第 {0} 部分 ({1})", "Part {0} ({1})"),
     ("book.section", "第 {0} 节", "Section {0}"),
     ("media.epub_unopenable", "打不开 {0}", "cannot open {0}"),
@@ -669,6 +682,8 @@ The short forms -c / -l / -m work too."),
   readio <文件> --copy   复制一份到书库目录（-c）
   readio <文件> --link   只登记引用，文件留在原处（-l）
   readio <文件> --move   移动进书库，原位置不再保留（-m）
+  readio cloud login    登录以启用同步和云端 TTS
+  readio cloud sync     手动同步本地进度、书签和偏好
 
 支持 .epub / .pdf / .txt / .md。
 书库目录：{0}
@@ -682,6 +697,8 @@ Usage:
   readio <file> --copy   copy it into the books directory (-c)
   readio <file> --link   link it: your file stays where it is (-l)
   readio <file> --move   move it in; nothing is left behind (-m)
+  readio cloud login    sign in for sync and cloud TTS
+  readio cloud sync     sync local progress, bookmarks, and preferences
 
 Supports .epub / .pdf / .txt / .md.
 Books:    {0}

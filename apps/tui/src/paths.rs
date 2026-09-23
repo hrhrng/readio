@@ -59,6 +59,18 @@ pub fn library_file() -> PathBuf {
     home().join("library.json")
 }
 
+/// Cloud session plus sync cursor/version metadata. This file is private
+/// because it contains the bearer token granted by device authorization.
+pub fn cloud_file() -> PathBuf {
+    home().join("cloud.json")
+}
+
+/// Rust-redacted product facts shared by short-lived commands and the next
+/// interactive TUI session. The file contains no book text, URLs, or tokens.
+pub fn diagnostics_file() -> PathBuf {
+    home().join("diagnostics.json")
+}
+
 /// The one configuration file.
 pub fn config_file() -> PathBuf {
     home().join("config.yaml")

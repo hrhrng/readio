@@ -42,11 +42,15 @@ pub struct Chrome<'a> {
     pub paused: bool,
     pub tick: u64,
     pub notice: Option<&'a str>,
+    /// Automatic policy that caused this pause; manual pauses leave it empty.
+    pub pause_reason: Option<&'a str>,
     pub scrolled: bool,
     pub scroll_percent: f32,
     /// False before a book is opened, when readio is showing the library.
     pub has_book: bool,
     pub library_count: usize,
+    /// Wall-clock time left before Rust Core pauses the active reader.
+    pub sleep_remaining: Option<std::time::Duration>,
 }
 
 /// Lay a left-aligned and a right-aligned run of spans on one row.
@@ -81,13 +85,18 @@ pub fn render_header(area: Rect, buf: &mut Buffer, c: &Chrome<'_>) {
     let th = theme();
     let mut left = vec![
         Span::styled(
-            " readio ".to_string(),
+            format!(" {}", theme::BRAND_MARK),
             Style::default()
-                .fg(th.bg_base)
-                .bg(th.accent_agent)
+                .fg(th.accent_brand)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("  "),
+        Span::styled(
+            " readio".to_string(),
+            Style::default()
+                .fg(th.text_primary)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("   "),
         Span::styled(
             c.book.to_string(),
             Style::default().fg(th.text_primary).bold(),
@@ -157,7 +166,9 @@ pub fn render_activity(area: Rect, buf: &mut Buffer, c: &Chrome<'_>) {
             Style::default().fg(th.accent_warning),
         ),
         Span::styled(
-            t("chrome.paused").to_string(),
+            c.pause_reason
+                .unwrap_or_else(|| t("chrome.paused"))
+                .to_string(),
             Style::default().fg(th.accent_thinking),
         ),
     ]);
@@ -269,14 +280,24 @@ pub fn render_status(area: Rect, buf: &mut Buffer, c: &Chrome<'_>) {
     };
 
     let mode_chip = crate::mode::chip(c.mode);
-    let mut right = vec![Span::styled(
+    let mut right = Vec::new();
+    if let Some(remaining) = c.sleep_remaining {
+        let seconds = remaining
+            .as_secs()
+            .saturating_add(u64::from(remaining.subsec_millis() > 0));
+        right.push(Span::styled(
+            format!("{} {}:{:02}  ", t("sleep.chip"), seconds / 60, seconds % 60),
+            Style::default().fg(th.accent_warning),
+        ));
+    }
+    right.push(Span::styled(
         format!("{mode_chip}  "),
         Style::default().fg(if c.mode.scrolls() {
             th.accent_success
         } else {
             th.text_faint
         }),
-    )];
+    ));
     let model = c.audio_model.unwrap_or("readio-1");
     right.extend([
         Span::styled(
@@ -348,6 +369,8 @@ const HELP: &[(&str, &str, &str)] = &[
     ("^g ^b", "下一处 / 上一处命中", "next / previous hit"),
     ("/mode [manual|auto|aloud]", "手动 / 自动 / 朗读；shift+tab 循环",
         "manual / auto / read-aloud; shift+tab cycles"),
+    ("/sleep <minutes|off>", "按墙钟定时暂停；+分钟延长",
+        "pause on a wall-clock deadline; +minutes extends it"),
     ("/plan", "章节清单", "chapters as a plan"),
     ("/context", "阅读上下文", "context window readout"),
     ("/progress", "进度摘要", "one-line progress"),
@@ -367,6 +390,7 @@ const HELP: &[(&str, &str, &str)] = &[
         "reveal speed (follows the audio while reading aloud)"),
     ("/lang zh|en", "界面语言", "interface language"),
     ("/clear", "清屏，进度不受影响", "clear the screen; your place is kept"),
+    ("/diagnostics", "导出经 Rust 脱敏的支持包", "export a Rust-redacted support bundle"),
     ("/help  /quit", "这个面板 / 退出", "this panel / quit"),
 ];
 

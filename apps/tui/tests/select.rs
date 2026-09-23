@@ -280,13 +280,13 @@ fn import_offers_paths_and_walks_into_directories() {
         "and only what readio can open:\n{view}"
     );
 
-    // ⏎ on the file imports it. A markdown book is named after its file; the
-    // heading inside becomes the first chapter.
+    // ⏎ on the file imports it. Shared Reader IR keeps the authored heading as
+    // both the document title and the first chapter title.
     app.on_key(key(KeyCode::Enter));
     let view = settle(&mut app, &mut terminal);
     assert_eq!(
         app.book.as_ref().map(|b| b.title.as_str()),
-        Some("calvino"),
+        Some("看不见的城市"),
         "and the file opens:\n{view}"
     );
     // Opening a book says what was loaded and stops there — the chapter list is

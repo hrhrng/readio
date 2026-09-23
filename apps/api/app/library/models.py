@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field
 
 
 LibraryItemType = Literal['web', 'txt', 'pdf', 'epub']
@@ -64,8 +64,63 @@ class CreateLibraryItemRequest(BaseModel):
     content_format: str | None = None
 
 
-class ImportUrlRequest(BaseModel):
-    url: HttpUrl
-    title: str | None = None
-    category: LibraryItemCategory = 'imported'
-    folder_id: str = Field(default='f1', min_length=1)
+PositionAffinity = Literal['forward', 'backward']
+PositionMutationStatus = Literal['applied', 'conflict']
+
+
+class ReadingPositionMutation(BaseModel):
+    document_revision: str = Field(min_length=1, max_length=200)
+    char_offset: int = Field(ge=0, le=2**64 - 1)
+    affinity: PositionAffinity
+    observed_at_unix_ms: int = Field(ge=-(2**63), le=2**63 - 1)
+    session_id: str = Field(min_length=1, max_length=200)
+    mutation_id: str = Field(min_length=1, max_length=200)
+    base_version: int = Field(ge=0, le=2**64 - 1)
+
+
+class ReadingPositionRecord(ReadingPositionMutation):
+    version: int = Field(ge=1, le=2**64 - 1)
+
+
+class PositionCandidate(ReadingPositionRecord):
+    origin: Literal['current', 'incoming']
+
+
+class PositionMutationResponse(BaseModel):
+    status: PositionMutationStatus
+    idempotent_replay: bool = False
+    version: int = Field(ge=0, le=2**64 - 1)
+    position: ReadingPositionRecord | None = None
+    conflict_id: str | None = None
+    candidates: list[PositionCandidate] = Field(default_factory=list)
+
+
+BookmarkMutationStatus = Literal['applied', 'conflict']
+
+
+class BookmarkMutationRequest(BaseModel):
+    bookmark_id: str = Field(min_length=1, max_length=200)
+    char_offset: int = Field(ge=0, le=2**64 - 1)
+    affinity: PositionAffinity
+    note: str = Field(max_length=10_000)
+    created_at_unix_ms: int = Field(ge=-(2**63), le=2**63 - 1)
+    updated_at_unix_ms: int = Field(ge=-(2**63), le=2**63 - 1)
+    base_version: int = Field(ge=0, le=2**64 - 1)
+    mutation_id: str = Field(min_length=1, max_length=200)
+
+
+class BookmarkRecord(BaseModel):
+    id: str
+    item_id: str
+    char_offset: int = Field(ge=0, le=2**64 - 1)
+    affinity: PositionAffinity
+    note: str
+    created_at_unix_ms: int
+    updated_at_unix_ms: int
+    version: int = Field(ge=1, le=2**64 - 1)
+
+
+class BookmarkMutationResponse(BaseModel):
+    status: BookmarkMutationStatus
+    idempotent_replay: bool = False
+    bookmark: BookmarkRecord | None = None

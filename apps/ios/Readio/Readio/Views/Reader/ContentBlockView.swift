@@ -1,4 +1,9 @@
 import SwiftUI
+#if os(macOS)
+import AppKit
+#else
+import UIKit
+#endif
 
 // MARK: - ContentBlockView
 /// Renders a single EPUB content block based on its type.
@@ -36,11 +41,14 @@ struct ContentBlockView: View {
     /// The global sentence index currently being spoken by TTS.
     let currentSentenceIndex: Int
 
-    /// Word-level progress within the active sentence (0.0 to 1.0).
-    let currentWordProgress: Double
+    /// Rust-selected Unicode-scalar range within the active sentence.
+    let currentWordRange: ReadioScalarRange?
 
     /// Callback when the user taps a sentence to start playback there.
     let onSentenceClick: (Int) -> Void
+
+    /// Resolves a stable Rust EPUB asset ID from the locally persisted archive.
+    var loadImageAsset: ((String) async throws -> Data)? = nil
 
     // MARK: - Body
 
@@ -57,10 +65,9 @@ struct ContentBlockView: View {
             // Standard body text with sentence-level highlighting.
             paragraphView(sentences: sentences)
 
-        case .image(let src, let alt):
+        case .image(let src, let assetId, _, let alt):
             // MARK: Image Block
-            // Async-loaded image with an optional alt text caption below.
-            imageView(src: src, alt: alt)
+            imageView(src: src, assetId: assetId, alt: alt)
 
         case .list(let ordered, let items, _):
             // MARK: List Block
@@ -99,7 +106,8 @@ struct ContentBlockView: View {
                 SentenceTextView(
                     sentence: Sentence(index: sentence.index, text: sentence.text),
                     isActive: sentence.index == currentSentenceIndex,
-                    wordProgress: currentWordProgress,
+                    wordRange: currentWordRange,
+                    runs: sentence.runs,
                     onTap: { onSentenceClick(sentence.index) }
                 )
             }
@@ -127,7 +135,8 @@ struct ContentBlockView: View {
                 SentenceTextView(
                     sentence: Sentence(index: sentence.index, text: sentence.text),
                     isActive: sentence.index == currentSentenceIndex,
-                    wordProgress: currentWordProgress,
+                    wordRange: currentWordRange,
+                    runs: sentence.runs,
                     onTap: { onSentenceClick(sentence.index) }
                 )
             }
@@ -137,56 +146,22 @@ struct ContentBlockView: View {
 
     // MARK: - Image View
 
-    /// Renders an image block with async loading and an optional alt text caption.
-    ///
-    /// The image scales to fill the available width while maintaining its aspect ratio.
-    /// A rounded clip shape and subtle shadow give it a polished, card-like appearance.
-    private func imageView(src: String, alt: String?) -> some View {
-        VStack(alignment: .center, spacing: 6) {
-            if let url = URL(string: src) {
-                AsyncImage(url: url) { phase in
-                    switch phase {
-                    case .success(let image):
-                        image
-                            .resizable()
-                            .aspectRatio(contentMode: .fit)
-                            .clipShape(RoundedRectangle(cornerRadius: 8))
-
-                    case .failure:
-                        // Image load failed — show placeholder with icon
-                        RoundedRectangle(cornerRadius: 8)
-                            .fill(Color(.systemGray5))
-                            .frame(height: 200)
-                            .overlay {
-                                Image(systemName: "photo")
-                                    .font(.largeTitle)
-                                    .foregroundStyle(.secondary)
-                            }
-
-                    case .empty:
-                        // Loading state
-                        RoundedRectangle(cornerRadius: 8)
-                            .fill(Color(.systemGray6))
-                            .frame(height: 200)
-                            .overlay { ProgressView() }
-
-                    @unknown default:
-                        EmptyView()
-                    }
-                }
-            }
-
-            // Alt text caption
-            if let alt, !alt.isEmpty {
-                Text(alt)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .italic()
-                    .multilineTextAlignment(.center)
-            }
+    /// Renders resolved assets and remote images. Failures retain their alt text
+    /// in a compact semantic row; the reader neither fabricates a giant image nor
+    /// silently removes an element that belongs to the document.
+    @ViewBuilder
+    private func imageView(src: String?, assetId: String?, alt: String?) -> some View {
+        if let assetId, let loadImageAsset {
+            NativeEpubImage(
+                assetId: assetId,
+                alt: alt,
+                load: loadImageAsset
+            )
+        } else if let url = AppleReaderSurfacePolicy.remoteImageURL(src) {
+            RemoteReaderImage(url: url, alt: alt)
+        } else {
+            ReaderImageFallback(alt: alt)
         }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 8)
     }
 
     // MARK: - List View
@@ -212,7 +187,8 @@ struct ContentBlockView: View {
                             SentenceTextView(
                                 sentence: Sentence(index: sentence.index, text: sentence.text),
                                 isActive: sentence.index == currentSentenceIndex,
-                                wordProgress: currentWordProgress,
+                                wordRange: currentWordRange,
+                                runs: sentence.runs,
                                 onTap: { onSentenceClick(sentence.index) }
                             )
                         }
@@ -243,7 +219,8 @@ struct ContentBlockView: View {
                     SentenceTextView(
                         sentence: Sentence(index: sentence.index, text: sentence.text),
                         isActive: sentence.index == currentSentenceIndex,
-                        wordProgress: currentWordProgress,
+                        wordRange: currentWordRange,
+                        runs: sentence.runs,
                         onTap: { onSentenceClick(sentence.index) }
                     )
                 }
@@ -274,7 +251,7 @@ struct ContentBlockView: View {
                     .padding(.vertical, 2)
                     .background(
                         Capsule()
-                            .fill(Color(.systemGray5))
+                            .fill(.quaternary)
                     )
             }
 
@@ -289,10 +266,229 @@ struct ContentBlockView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
                 RoundedRectangle(cornerRadius: 8)
-                    .fill(Color(.secondarySystemGroupedBackground))
+                    .fill(.background)
             )
         }
         .padding(.vertical, 4)
+    }
+}
+
+#if os(macOS)
+private typealias ReadioPlatformImage = NSImage
+#else
+private typealias ReadioPlatformImage = UIImage
+#endif
+
+private struct ReaderResolvedImage: View {
+    let image: Image
+    let intrinsicSize: CGSize
+    let alt: String?
+
+    var body: some View {
+        VStack(alignment: .center, spacing: 6) {
+            image
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: displaySize.width, height: displaySize.height)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+
+            if !isCompactAsset, let alt, !alt.isEmpty {
+                Text(alt)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .italic()
+                    .multilineTextAlignment(.center)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, isCompactAsset ? 4 : 8)
+    }
+
+    private var displaySize: CGSize {
+        let width = max(intrinsicSize.width, 1)
+        let height = max(intrinsicSize.height, 1)
+        let scale = min(1, 720 / width, 520 / height)
+        return CGSize(width: width * scale, height: height * scale)
+    }
+
+    private var isCompactAsset: Bool {
+        intrinsicSize.height <= 48 && intrinsicSize.width <= 320
+    }
+}
+
+private struct ReaderImageLoadingPlaceholder: View {
+    @Environment(\.readioTheme) private var theme
+
+    let alt: String?
+
+    var body: some View {
+        HStack(spacing: 10) {
+            ProgressView()
+                .controlSize(.small)
+            Text(alt?.nilIfBlank ?? "Loading image…")
+                .font(.caption)
+                .foregroundStyle(theme.secondaryInk)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 36)
+        .background(theme.selected.opacity(0.55))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 6)
+        .accessibilityLabel(alt ?? "Loading illustration")
+    }
+}
+
+private struct ReaderImageFallback: View {
+    @Environment(\.readioTheme) private var theme
+
+    let alt: String?
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "photo.badge.exclamationmark")
+                .foregroundStyle(theme.accent)
+            Text(alt?.nilIfBlank ?? "Image")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(theme.ink)
+                .lineLimit(1)
+            Text("unavailable")
+                .font(.caption)
+                .foregroundStyle(theme.secondaryInk)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 36)
+        .background(theme.selected.opacity(0.55))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 6)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+private struct RemoteReaderImage: View {
+    let url: URL
+    let alt: String?
+
+    @State private var image: ReadioPlatformImage?
+    @State private var phase = AppleReaderImagePhase.loading
+
+    var body: some View {
+        Group {
+            switch AppleReaderSurfacePolicy.imagePresentation(for: phase) {
+            case .content:
+                if let image {
+                    ReaderResolvedImage(
+                        image: platformImage(image),
+                        intrinsicSize: image.size,
+                        alt: alt
+                    )
+                } else {
+                    ReaderImageFallback(alt: alt)
+                }
+            case .placeholder:
+                ReaderImageLoadingPlaceholder(alt: alt)
+            case .fallback:
+                ReaderImageFallback(alt: alt)
+            }
+        }
+        .task(id: url) {
+            phase = .loading
+            image = nil
+            do {
+                let (data, response) = try await URLSession.shared.data(from: url)
+                if let response = response as? HTTPURLResponse,
+                   !(200..<300).contains(response.statusCode) {
+                    phase = .failed
+                    return
+                }
+                guard data.count <= 16 * 1_024 * 1_024,
+                      let decoded = ReadioPlatformImage(data: data),
+                      !Task.isCancelled else {
+                    phase = .failed
+                    return
+                }
+                image = decoded
+                phase = .loaded
+            } catch is CancellationError {
+                return
+            } catch {
+                phase = .failed
+            }
+        }
+    }
+
+    private func platformImage(_ image: ReadioPlatformImage) -> Image {
+        #if os(macOS)
+        return Image(nsImage: image)
+        #else
+        return Image(uiImage: image)
+        #endif
+    }
+}
+
+private struct NativeEpubImage: View {
+    let assetId: String
+    let alt: String?
+    let load: (String) async throws -> Data
+
+    @State private var image: ReadioPlatformImage?
+    @State private var phase = AppleReaderImagePhase.loading
+
+    var body: some View {
+        Group {
+            switch AppleReaderSurfacePolicy.imagePresentation(for: phase) {
+            case .content:
+                if let image {
+                    ReaderResolvedImage(
+                        image: platformImage(image),
+                        intrinsicSize: image.size,
+                        alt: alt
+                    )
+                } else {
+                    ReaderImageFallback(alt: alt)
+                }
+            case .placeholder:
+                ReaderImageLoadingPlaceholder(alt: alt)
+            case .fallback:
+                ReaderImageFallback(alt: alt)
+            }
+        }
+        .task(id: assetId) {
+            phase = .loading
+            image = nil
+            do {
+                let data = try await load(assetId)
+                guard let decoded = ReadioPlatformImage(data: data) else {
+                    phase = .failed
+                    return
+                }
+                guard !Task.isCancelled else { return }
+                image = decoded
+                phase = .loaded
+            } catch is CancellationError {
+                return
+            } catch {
+                phase = .failed
+            }
+        }
+    }
+
+    private func platformImage(_ image: ReadioPlatformImage) -> Image {
+        #if os(macOS)
+        return Image(nsImage: image)
+        #else
+        return Image(uiImage: image)
+        #endif
+    }
+}
+
+private extension String {
+    var nilIfBlank: String? {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }
 
@@ -312,7 +508,7 @@ struct ContentBlockView: View {
                     RichSentence(index: 0, text: "Chapter One", runs: [StyledRun(text: "Chapter One")])
                 ]),
                 currentSentenceIndex: -1,
-                currentWordProgress: 0,
+                currentWordRange: nil,
                 onSentenceClick: { _ in }
             )
 
@@ -322,21 +518,21 @@ struct ContentBlockView: View {
                     RichSentence(index: 2, text: "It was the worst of times.", runs: [StyledRun(text: "It was the worst of times.")]),
                 ]),
                 currentSentenceIndex: 1,
-                currentWordProgress: 0.5,
+                currentWordRange: ReadioScalarRange(start: 7, end: 10),
                 onSentenceClick: { _ in }
             )
 
             ContentBlockView(
                 block: .separator,
                 currentSentenceIndex: -1,
-                currentWordProgress: 0,
+                currentWordRange: nil,
                 onSentenceClick: { _ in }
             )
 
             ContentBlockView(
                 block: .code(text: "let x = 42\nprint(x)", language: "swift"),
                 currentSentenceIndex: -1,
-                currentWordProgress: 0,
+                currentWordRange: nil,
                 onSentenceClick: { _ in }
             )
         }

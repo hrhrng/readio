@@ -48,6 +48,12 @@ final class LibraryViewModel {
     /// Total number of items matching the current filters (across all pages).
     var totalItems = 0
 
+    /// Total count and most recent item from the same filtered in-progress query.
+    /// Keeping these separate from the paginated shelf prevents the header from
+    /// reporting only the progress found on the currently loaded page.
+    var inProgressTotal = 0
+    var continueReadingItem: LibraryItemSummary? = nil
+
     /// Current page number (1-based). Incremented by `loadNextPage()`.
     var currentPage = 1
 
@@ -105,19 +111,33 @@ final class LibraryViewModel {
         currentPage = 1
 
         do {
-            let response = try await libraryService.fetchItems(
+            async let pageRequest = libraryService.fetchItems(
+                category: selectedCategory,
+                search: searchQuery.isEmpty ? nil : searchQuery,
+                type: selectedType,
                 page: 1,
                 pageSize: pageSize,
-                category: selectedCategory,
-                type: selectedType,
-                search: searchQuery.isEmpty ? nil : searchQuery,
                 sortBy: sortBy,
                 sortOrder: sortOrder
             )
+            async let inProgressRequest = libraryService.fetchItems(
+                category: selectedCategory,
+                search: searchQuery.isEmpty ? nil : searchQuery,
+                type: selectedType,
+                page: 1,
+                pageSize: 1,
+                sortBy: "created_at",
+                sortOrder: "desc",
+                progressMin: 1,
+                progressMax: 99
+            )
+            let (response, inProgress) = try await (pageRequest, inProgressRequest)
 
             items = response.items
             totalItems = response.total
             totalPages = response.totalPages
+            inProgressTotal = inProgress.total
+            continueReadingItem = inProgress.items.first
         } catch {
             self.error = "Failed to load library: \(error.localizedDescription)"
         }
@@ -137,11 +157,11 @@ final class LibraryViewModel {
 
         do {
             let response = try await libraryService.fetchItems(
+                category: selectedCategory,
+                search: searchQuery.isEmpty ? nil : searchQuery,
+                type: selectedType,
                 page: nextPage,
                 pageSize: pageSize,
-                category: selectedCategory,
-                type: selectedType,
-                search: searchQuery.isEmpty ? nil : searchQuery,
                 sortBy: sortBy,
                 sortOrder: sortOrder
             )
@@ -185,6 +205,12 @@ final class LibraryViewModel {
         if let removedIndex {
             items.remove(at: removedIndex)
             totalItems = max(0, totalItems - 1)
+            if removedItem?.readingStatus == .reading {
+                inProgressTotal = max(0, inProgressTotal - 1)
+            }
+            if continueReadingItem?.id == id {
+                continueReadingItem = items.first(where: { $0.readingStatus == .reading })
+            }
         }
 
         do {
@@ -194,6 +220,12 @@ final class LibraryViewModel {
             if let removedItem, let removedIndex {
                 items.insert(removedItem, at: min(removedIndex, items.count))
                 totalItems += 1
+                if removedItem.readingStatus == .reading {
+                    inProgressTotal += 1
+                }
+                if continueReadingItem == nil {
+                    continueReadingItem = removedItem
+                }
             }
             throw error
         }

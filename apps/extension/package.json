@@ -2,6 +2,9 @@
   "name": "@readio/extension",
   "private": true,
   "version": "0.1.0",
+  "dependencies": {
+    "@readio/sdk": "workspace:*"
+  },
   "scripts": {
     "dev": "node scripts/build.mjs --watch",
     "build": "node scripts/build.mjs",

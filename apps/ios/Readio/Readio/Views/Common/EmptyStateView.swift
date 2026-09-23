@@ -47,6 +47,8 @@ import SwiftUI
 /// - The action button uses a bordered prominent style for high visibility.
 struct EmptyStateView: View {
 
+    @Environment(\.readioTheme) private var theme
+
     // MARK: - Properties
 
     /// SF Symbol name for the illustration icon (e.g., "book.closed.fill").
@@ -58,13 +60,14 @@ struct EmptyStateView: View {
     /// A descriptive message explaining the empty state and suggesting next steps.
     let message: String
 
-    /// Optional closure executed when the action button is tapped.
-    /// When nil, no action button is rendered.
-    var action: (() -> Void)? = nil
-
     /// Label text for the optional action button (e.g., "Import Now", "Try Again").
     /// Required if `action` is non-nil; ignored if `action` is nil.
     var actionLabel: String? = nil
+
+    /// Optional closure executed when the action button is tapped.
+    /// When nil, no action button is rendered. It is declared last so callers can
+    /// use Swift's trailing-closure syntax after `actionLabel`.
+    var action: (() -> Void)? = nil
 
     // MARK: - Body
 
@@ -74,25 +77,25 @@ struct EmptyStateView: View {
             // Large SF Symbol icon inside a circular background.
             // The circle provides visual weight and makes the icon a focal point.
             Image(systemName: icon)
-                .font(.system(size: 36))
-                .foregroundStyle(.secondary)
-                .frame(width: 72, height: 72)
+                .font(.system(size: 30, weight: .semibold))
+                .foregroundStyle(theme.accentStrong)
+                .frame(width: 76, height: 76)
                 .background(
                     Circle()
-                        .fill(Color(.secondarySystemGroupedBackground))
+                        .fill(theme.highlight)
                 )
 
             // MARK: Title
             Text(title)
                 .font(.title3)
                 .fontWeight(.semibold)
-                .foregroundStyle(.primary)
+                .foregroundStyle(theme.ink)
                 .multilineTextAlignment(.center)
 
             // MARK: Message
             Text(message)
                 .font(.subheadline)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(theme.secondaryInk)
                 .multilineTextAlignment(.center)
                 .lineLimit(3)
                 .frame(maxWidth: 280) // Constrain width for readable line lengths
@@ -106,6 +109,7 @@ struct EmptyStateView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.regular)
+                .tint(theme.accent)
                 .padding(.top, 4)
             }
         }

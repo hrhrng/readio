@@ -1,0 +1,842 @@
+{
+  "contract": "taste-saas/v1",
+  "version": 1,
+  "preset": "notion-like",
+  "presetAdjustments": {
+    "brandHue": "restrained-sage",
+    "readingSurface": "apple-books-warmth-and-cover-led-shelves",
+    "collectionDensity": "consumer-native-spacious",
+    "actionAcceleration": "raycast-like-with-visible-primary-paths"
+  },
+  "taskModel": {
+    "primaryTask": "import, find, read or listen, and resume mixed-format documents without losing exact context",
+    "entity": "library-item",
+    "contentPriority": [
+      "title",
+      "readingPosition",
+      "format",
+      "syncOfflineState",
+      "updatedAt",
+      "source"
+    ],
+    "operationFrequency": "high",
+    "operationRisk": "mixed-with-data-loss-and-position-conflict-risks",
+    "preserveContext": true
+  },
+  "shell": {
+    "slots": [
+      "brand",
+      "navigation",
+      "breadcrumb",
+      "route-outlet",
+      "sidebar-restore",
+      "global-surfaces"
+    ],
+    "states": [
+      "desktop-full",
+      "desktop-hidden",
+      "desktop-preview",
+      "mobile-hidden",
+      "mobile-drawer",
+      "reader-immersive"
+    ],
+    "viewport": "locked",
+    "scrollOwner": "route-layout",
+    "sidebarTransition": "desktop-full-to-hidden-by-resize-threshold-with-external-restore",
+    "globalLayerRoot": "global-surfaces"
+  },
+  "layouts": [
+    {
+      "id": "home-overview",
+      "route": "/",
+      "kind": "dashboard",
+      "slots": [
+        "home-header",
+        "continue-shelf",
+        "recent-shelf",
+        "sample-shelf",
+        "home-state"
+      ],
+      "states": [
+        "loading",
+        "ready",
+        "empty",
+        "error",
+        "stale",
+        "offline"
+      ],
+      "scrollOwner": "home-body"
+    },
+    {
+      "id": "library-collection",
+      "route": "/library/:filter?",
+      "kind": "gallery-with-list-alternate",
+      "slots": [
+        "library-header",
+        "library-view-controls",
+        "library-collection"
+      ],
+      "states": [
+        "loading",
+        "ready",
+        "empty",
+        "filtered-empty",
+        "error",
+        "stale",
+        "mutation-pending",
+        "offline"
+      ],
+      "scrollOwner": "library-page"
+    },
+    {
+      "id": "library-search-list",
+      "route": "/search",
+      "kind": "list",
+      "slots": [
+        "search-toolbar",
+        "search-data-grid"
+      ],
+      "states": [
+        "idle",
+        "searching",
+        "ready",
+        "filtered-empty",
+        "error",
+        "stale",
+        "offline"
+      ],
+      "scrollOwner": "search-data-grid"
+    },
+    {
+      "id": "library-item-detail",
+      "route": "/library/items/:itemId",
+      "kind": "detail-rail",
+      "slots": [
+        "item-detail-body",
+        "item-meta-rail"
+      ],
+      "states": [
+        "loading",
+        "ready",
+        "not-found",
+        "error",
+        "editing",
+        "mutation-pending",
+        "read-only",
+        "offline"
+      ],
+      "scrollOwner": "item-detail-body+item-meta-rail"
+    },
+    {
+      "id": "reader-document",
+      "route": "/player/:itemId",
+      "kind": "doc",
+      "slots": [
+        "reader-topbar",
+        "reader-inspector",
+        "reader-status",
+        "reader-document",
+        "reader-player"
+      ],
+      "states": [
+        "loading",
+        "ready-manual",
+        "ready-auto",
+        "ready-read-aloud",
+        "buffering",
+        "paused",
+        "seeking",
+        "completed",
+        "document-error",
+        "tts-error",
+        "offline-cached",
+        "offline-missing",
+        "position-conflict",
+        "search-idle",
+        "searching",
+        "search-ready",
+        "search-empty",
+        "search-error",
+        "bookmarks-loading",
+        "bookmarks-empty",
+        "bookmarks-ready",
+        "bookmark-mutation-pending",
+        "bookmark-conflict"
+      ],
+      "scrollOwner": "reader-document"
+    },
+    {
+      "id": "import-workspace",
+      "route": "/import",
+      "kind": "settings",
+      "slots": [
+        "import-source",
+        "import-body",
+        "import-actions"
+      ],
+      "states": [
+        "source-choice",
+        "validating",
+        "duplicate",
+        "transferring",
+        "parsing",
+        "completed",
+        "partial",
+        "failed",
+        "cancelled"
+      ],
+      "scrollOwner": "import-body"
+    },
+    {
+      "id": "settings-workspace",
+      "route": "/settings/:section?",
+      "kind": "settings",
+      "slots": [
+        "settings-nav",
+        "settings-section",
+        "settings-save-slot"
+      ],
+      "states": [
+        "loading",
+        "ready",
+        "dirty",
+        "saving",
+        "saved",
+        "validation-error",
+        "server-error",
+        "offline"
+      ],
+      "scrollOwner": "settings-section"
+    }
+  ],
+  "slotStates": [
+    {
+      "slot": "home-state",
+      "states": {
+        "loading": { "component": "HomeSkeleton", "geometry": "overview-frame" },
+        "ready": { "component": "HomeSections", "geometry": "overview-frame" },
+        "empty": { "component": "HomeZeroState", "geometry": "overview-frame" },
+        "error": { "component": "HomeLoadAlert", "geometry": "overview-frame" },
+        "stale": { "component": "HomeSections", "geometry": "overview-frame" },
+        "offline": { "component": "HomeSections", "geometry": "overview-frame" }
+      },
+      "stableAnchors": [
+        "left",
+        "right",
+        "top"
+      ]
+    },
+    {
+      "slot": "library-view-controls",
+      "states": {
+        "loading": { "component": "LibraryViewMenu", "geometry": "collection-header" },
+        "ready": { "component": "LibraryViewMenu", "geometry": "collection-header" },
+        "empty": { "component": "LibraryViewMenu", "geometry": "collection-header" },
+        "filtered-empty": { "component": "LibraryViewMenu", "geometry": "collection-header" },
+        "error": { "component": "LibraryViewMenu", "geometry": "collection-header" },
+        "stale": { "component": "LibraryViewMenu", "geometry": "collection-header" },
+        "mutation-pending": { "component": "LibraryViewMenu", "geometry": "collection-header" },
+        "offline": { "component": "LibraryViewMenu", "geometry": "collection-header" }
+      },
+      "stableAnchors": [
+        "left",
+        "right",
+        "top",
+        "bottom"
+      ]
+    },
+    {
+      "slot": "library-collection",
+      "states": {
+        "loading": { "component": "LibraryCollectionSkeleton", "geometry": "library-collection" },
+        "ready": { "component": "LibraryShelfOrRows", "geometry": "library-collection" },
+        "empty": { "component": "LibraryZeroState", "geometry": "library-collection" },
+        "filtered-empty": { "component": "LibraryNoResults", "geometry": "library-collection" },
+        "error": { "component": "LibraryLoadAlert", "geometry": "library-collection" },
+        "stale": { "component": "LibraryShelfOrRows", "geometry": "library-collection" },
+        "mutation-pending": { "component": "LibraryShelfOrRows", "geometry": "library-collection" },
+        "offline": { "component": "LibraryShelfOrRows", "geometry": "library-collection" }
+      },
+      "stableAnchors": [
+        "left",
+        "top"
+      ]
+    },
+    {
+      "slot": "search-data-grid",
+      "states": {
+        "idle": { "component": "SearchIdle", "geometry": "library-grid" },
+        "searching": { "component": "SearchResultsSkeleton", "geometry": "library-grid" },
+        "ready": { "component": "SearchResultsTable", "geometry": "library-grid" },
+        "filtered-empty": { "component": "SearchNoResults", "geometry": "library-grid" },
+        "error": { "component": "SearchLoadAlert", "geometry": "library-grid" },
+        "stale": { "component": "SearchResultsTable", "geometry": "library-grid" },
+        "offline": { "component": "SearchResultsTable", "geometry": "library-grid" }
+      },
+      "stableAnchors": [
+        "left",
+        "top"
+      ]
+    },
+    {
+      "slot": "item-detail-body",
+      "states": {
+        "loading": { "component": "ItemDetailSkeleton", "geometry": "item-detail-rail" },
+        "ready": { "component": "ItemDetailBody", "geometry": "item-detail-rail" },
+        "not-found": { "component": "ItemNotFound", "geometry": "item-detail-rail" },
+        "error": { "component": "ItemDetailAlert", "geometry": "item-detail-rail" },
+        "editing": { "component": "ItemDetailBody", "geometry": "item-detail-rail" },
+        "mutation-pending": { "component": "ItemDetailBody", "geometry": "item-detail-rail" },
+        "read-only": { "component": "ItemDetailBody", "geometry": "item-detail-rail" },
+        "offline": { "component": "ItemDetailBody", "geometry": "item-detail-rail" }
+      },
+      "stableAnchors": [
+        "left",
+        "top"
+      ]
+    },
+    {
+      "slot": "reader-document",
+      "states": {
+        "loading": { "component": "ReaderSkeleton", "geometry": "reader-frame" },
+        "ready-manual": { "component": "DocumentContent", "geometry": "reader-frame" },
+        "ready-auto": { "component": "DocumentContent", "geometry": "reader-frame" },
+        "ready-read-aloud": { "component": "DocumentContent", "geometry": "reader-frame" },
+        "buffering": { "component": "DocumentContent", "geometry": "reader-frame" },
+        "paused": { "component": "DocumentContent", "geometry": "reader-frame" },
+        "seeking": { "component": "DocumentContent", "geometry": "reader-frame" },
+        "completed": { "component": "DocumentContent", "geometry": "reader-frame" },
+        "document-error": { "component": "DocumentLoadError", "geometry": "reader-frame" },
+        "tts-error": { "component": "DocumentContent", "geometry": "reader-frame" },
+        "offline-cached": { "component": "DocumentContent", "geometry": "reader-frame" },
+        "offline-missing": { "component": "ReaderOfflineMissing", "geometry": "reader-frame" },
+        "position-conflict": { "component": "DocumentContent", "geometry": "reader-frame" }
+      },
+      "stableAnchors": [
+        "centerX",
+        "top"
+      ]
+    },
+    {
+      "slot": "reader-inspector",
+      "states": {
+        "search-idle": { "component": "ReaderSearchPrompt", "geometry": "reader-inspector-sheet" },
+        "searching": { "component": "ReaderSearchProgress", "geometry": "reader-inspector-sheet" },
+        "search-ready": { "component": "ReaderSearchResults", "geometry": "reader-inspector-sheet" },
+        "search-empty": { "component": "ReaderSearchNoResults", "geometry": "reader-inspector-sheet" },
+        "search-error": { "component": "ReaderSearchError", "geometry": "reader-inspector-sheet" },
+        "bookmarks-loading": { "component": "ReaderBookmarkProgress", "geometry": "reader-inspector-sheet" },
+        "bookmarks-empty": { "component": "ReaderBookmarkZeroState", "geometry": "reader-inspector-sheet" },
+        "bookmarks-ready": { "component": "ReaderBookmarkList", "geometry": "reader-inspector-sheet" },
+        "bookmark-mutation-pending": { "component": "ReaderBookmarkList", "geometry": "reader-inspector-sheet" },
+        "bookmark-conflict": { "component": "ReaderBookmarkConflict", "geometry": "reader-inspector-sheet" }
+      },
+      "stableAnchors": [
+        "right",
+        "top",
+        "bottom",
+        "firstTextX"
+      ]
+    },
+    {
+      "slot": "import-body",
+      "states": {
+        "source-choice": { "component": "ImportSourceChoice", "geometry": "task-workspace" },
+        "validating": { "component": "ImportValidation", "geometry": "task-workspace" },
+        "duplicate": { "component": "ImportDuplicate", "geometry": "task-workspace" },
+        "transferring": { "component": "ImportProgress", "geometry": "task-workspace" },
+        "parsing": { "component": "ImportProgress", "geometry": "task-workspace" },
+        "completed": { "component": "ImportCompleted", "geometry": "task-workspace" },
+        "partial": { "component": "ImportWarning", "geometry": "task-workspace" },
+        "failed": { "component": "ImportFailure", "geometry": "task-workspace" },
+        "cancelled": { "component": "ImportCancelled", "geometry": "task-workspace" }
+      },
+      "stableAnchors": [
+        "left",
+        "top"
+      ]
+    },
+    {
+      "slot": "settings-section",
+      "states": {
+        "loading": { "component": "SettingsSkeleton", "geometry": "settings-workspace" },
+        "ready": { "component": "SettingsSection", "geometry": "settings-workspace" },
+        "dirty": { "component": "SettingsSection", "geometry": "settings-workspace" },
+        "saving": { "component": "SettingsSection", "geometry": "settings-workspace" },
+        "saved": { "component": "SettingsSection", "geometry": "settings-workspace" },
+        "validation-error": { "component": "SettingsSection", "geometry": "settings-workspace" },
+        "server-error": { "component": "SettingsSection", "geometry": "settings-workspace" },
+        "offline": { "component": "SettingsSection", "geometry": "settings-workspace" }
+      },
+      "stableAnchors": [
+        "left",
+        "top"
+      ]
+    }
+  ],
+  "globalSurfaces": [
+    {
+      "intent": "mutation.reversible",
+      "surface": "toast",
+      "semantic": "success",
+      "action": "undo"
+    },
+    {
+      "intent": "decision.destructive",
+      "surface": "alert-dialog",
+      "semantic": "danger",
+      "action": "confirm"
+    },
+    {
+      "intent": "context.collection-controls",
+      "surface": "dropdown-menu",
+      "semantic": "neutral",
+      "action": "change-view-or-sort"
+    },
+    {
+      "intent": "context.preview",
+      "surface": "sheet",
+      "semantic": "neutral",
+      "action": "return-focus"
+    },
+    {
+      "intent": "task.commit",
+      "surface": "modal",
+      "semantic": "neutral",
+      "action": "submit"
+    },
+    {
+      "intent": "field.validation",
+      "surface": "inline",
+      "semantic": "danger",
+      "action": "focus-field"
+    },
+    {
+      "intent": "system.outage",
+      "surface": "system-alert",
+      "semantic": "danger",
+      "action": "retry-or-sign-in"
+    },
+    {
+      "intent": "job.background",
+      "surface": "progress-toast",
+      "semantic": "info-to-success-or-error",
+      "action": "update-one-toast-id"
+    },
+    {
+      "intent": "reader.degraded",
+      "surface": "inline-status-banner",
+      "semantic": "warning-or-danger",
+      "action": "recover-in-reader"
+    },
+    {
+      "intent": "reader.tools.preview",
+      "surface": "sheet",
+      "semantic": "neutral",
+      "action": "return-focus"
+    },
+    {
+      "intent": "bookmark.delete",
+      "surface": "alert-dialog",
+      "semantic": "danger",
+      "action": "confirm"
+    },
+    {
+      "intent": "bookmark.completed",
+      "surface": "toast",
+      "semantic": "success-or-neutral",
+      "action": "dismiss"
+    },
+    {
+      "intent": "bookmark.conflict",
+      "surface": "inline",
+      "semantic": "danger",
+      "action": "refresh-and-retry"
+    }
+  ],
+  "tokens": {
+    "--density-unit": {
+      "kind": "basis",
+      "value": "1px",
+      "rationale": "Linear compact-with-breathing measurement unit for non-reading chrome",
+      "consumers": [
+        "--type-line",
+        "--data-row-h",
+        "--shell-top-h",
+        "--list-toolbar-h",
+        "--reader-chrome-h"
+      ]
+    },
+    "--type-line": {
+      "kind": "derived",
+      "value": "calc(var(--density-unit) * 18)",
+      "consumers": [
+        "body.console-density",
+        ".sidebar-row",
+        ".library-data-row"
+      ]
+    },
+    "--size-control-compact": {
+      "kind": "basis",
+      "value": "32px",
+      "rationale": "closed compact layer for dense secondary controls",
+      "consumers": [
+        ".segmented-control button",
+        ".feedback-action",
+        ".book-menu-trigger"
+      ]
+    },
+    "--size-control-standard": {
+      "kind": "basis",
+      "value": "40px",
+      "rationale": "shared desktop product rhythm taken from the approved Readio palette POC sidebar highlight",
+      "consumers": [
+        "--nav-item-height",
+        "--button-height",
+        "--input-height",
+        "--menu-trigger-height",
+        "--icon-slot"
+      ]
+    },
+    "--size-control-prominent": {
+      "kind": "basis",
+      "value": "44px",
+      "rationale": "prominent control and mobile touch-target layer",
+      "consumers": [
+        ".settings-compact-button@mobile",
+        ".import-tab@mobile",
+        ".segmented-control button@mobile"
+      ]
+    },
+    "--nav-item-height": {
+      "kind": "derived",
+      "value": "var(--size-control-standard)",
+      "consumers": [
+        ".nav-item",
+        ".sidebar-row-skeleton"
+      ]
+    },
+    "--button-height": {
+      "kind": "derived",
+      "value": "var(--size-control-standard)",
+      "consumers": [
+        ".ui-button"
+      ]
+    },
+    "--input-height": {
+      "kind": "derived",
+      "value": "var(--size-control-standard)",
+      "consumers": [
+        ".ui-input"
+      ]
+    },
+    "--menu-trigger-height": {
+      "kind": "derived",
+      "value": "var(--size-control-standard)",
+      "consumers": [
+        ".ui-select-trigger",
+        ".library-view-trigger"
+      ]
+    },
+    "--icon-slot": {
+      "kind": "derived",
+      "value": "var(--size-control-standard)",
+      "consumers": [
+        ".ui-icon-button"
+      ]
+    },
+    "--data-row-h": {
+      "kind": "derived",
+      "value": "calc(var(--type-line) + var(--density-unit) * 14)",
+      "consumers": [
+        ".library-data-row",
+        ".library-skeleton-row",
+        ".search-data-row"
+      ]
+    },
+    "--table-head-h": {
+      "kind": "derived",
+      "value": "calc(var(--type-line) + var(--density-unit) * 10)",
+      "consumers": [
+        ".library-table-head",
+        ".search-table-head"
+      ]
+    },
+    "--shell-top-h": {
+      "kind": "derived",
+      "value": "calc(var(--density-unit) * 39)",
+      "consumers": [
+        ".sidebar-brand-row",
+        ".shell-topbar"
+      ]
+    },
+    "--list-toolbar-h": {
+      "kind": "derived",
+      "value": "calc(var(--density-unit) * 42)",
+      "consumers": [
+        ".library-toolbar",
+        ".library-bulk-action-bar",
+        ".search-toolbar"
+      ]
+    },
+    "--reader-chrome-h": {
+      "kind": "derived",
+      "value": "calc(var(--type-line) + var(--density-unit) * 38)",
+      "consumers": [
+        ".reader-topbar",
+        ".reader-player",
+        ".reader-skeleton-chrome"
+      ]
+    },
+    "--shell-slot-size": {
+      "kind": "basis",
+      "value": "20px",
+      "rationale": "shared brand, navigation, search, and footer mark slot",
+      "consumers": [
+        ".sidebar-brand-row [data-sidebar-slot]",
+        ".sidebar-navigation [data-sidebar-slot]",
+        ".sidebar-footer [data-sidebar-slot]"
+      ]
+    },
+    "--shell-stage-gap": {
+      "kind": "basis",
+      "value": "8px",
+      "rationale": "single Linear stage gap for route surface, hidden restore, and preview shoulders",
+      "consumers": [
+        ".app-shell-route-surface",
+        ".sidebar-preview",
+        ".toast-stack"
+      ]
+    },
+    "--page-gutter-inline": {
+      "kind": "basis",
+      "value": "2rem",
+      "rationale": "comfortable collection edge shared by heading, shelf, rows, skeleton, empty, and error states",
+      "consumers": [
+        ".page-header",
+        ".library-shelf-grid",
+        ".library-rows-list",
+        ".library-zero-state",
+        ".search-results"
+      ]
+    },
+    "--detail-frame-inset": {
+      "kind": "basis",
+      "value": "24px",
+      "rationale": "comfortable detail/settings reading edge distinct from dense lists",
+      "consumers": [
+        ".item-detail-body",
+        ".settings-section",
+        ".item-detail-skeleton"
+      ]
+    },
+    "--reader-measure": {
+      "kind": "basis",
+      "value": "44rem",
+      "rationale": "long-form line measure shared by document content and every reader state skeleton/error",
+      "consumers": [
+        ".reader-document-content",
+        ".reader-document-skeleton",
+        ".reader-document-error"
+      ]
+    },
+    "--reader-inspector-w": {
+      "kind": "basis",
+      "value": "20rem",
+      "rationale": "contents, search, and bookmarks share one stable inspector track",
+      "consumers": [
+        ".reader-inspector",
+        ".reader-inspector-skeleton"
+      ]
+    },
+    "--detail-rail-w": {
+      "kind": "basis",
+      "value": "20rem",
+      "rationale": "metadata rail shared by loaded and skeleton detail layouts",
+      "consumers": [
+        ".item-detail-layout",
+        ".item-detail-skeleton"
+      ]
+    },
+    "--surface-overlay": {
+      "kind": "semantic",
+      "value": "var(--surface-raised)",
+      "rationale": "single opaque surface shared by all global overlays",
+      "consumers": [
+        ".command-palette",
+        ".sheet",
+        ".modal",
+        ".toast"
+      ]
+    },
+    "--semantic-danger": {
+      "kind": "semantic",
+      "value": "#b42318",
+      "rationale": "destructive and blocking failure meaning with non-color reinforcement",
+      "consumers": [
+        ".alert-dialog-danger",
+        ".inline-alert-danger",
+        ".field-error"
+      ]
+    },
+    "--semantic-brand": {
+      "kind": "semantic",
+      "value": "#397548",
+      "rationale": "restrained clover-green brand/accent selected for Quiet Precision",
+      "consumers": [
+        ".primary-action",
+        ".focus-ring",
+        ".active-reader-highlight"
+      ]
+    }
+  },
+  "alignmentGroups": [
+    {
+      "id": "standard-control-height",
+      "mode": "height",
+      "token": "--size-control-standard",
+      "members": [
+        "shell.navigation.active",
+        "controls.button.standard",
+        "controls.input.standard",
+        "controls.menu-trigger.standard",
+        "controls.icon-button.standard"
+      ]
+    },
+    {
+      "id": "sidebar-slot-axis",
+      "mode": "centerX",
+      "token": "--shell-slot-size",
+      "members": [
+        "shell.brand.slot",
+        "shell.navigation.slot",
+        "shell.search.slot",
+        "shell.footer.slot"
+      ]
+    },
+    {
+      "id": "shell-top-band-top",
+      "mode": "top",
+      "token": "--shell-top-h",
+      "members": [
+        "shell.brand",
+        "shell.breadcrumb"
+      ]
+    },
+    {
+      "id": "shell-top-band-controls",
+      "mode": "centerY",
+      "token": "--shell-top-h",
+      "members": [
+        "shell.brand.controls",
+        "shell.breadcrumb.controls"
+      ]
+    },
+    {
+      "id": "collection-frame-start",
+      "mode": "left",
+      "token": "--page-gutter-inline",
+      "members": [
+        "library.header",
+        "library.shelf",
+        "library.rows",
+        "library.empty",
+        "library.error",
+        "search.toolbar",
+        "search.data-grid"
+      ]
+    },
+    {
+      "id": "collection-readable-start",
+      "mode": "firstTextX",
+      "token": "--page-gutter-inline",
+      "members": [
+        "library.header.firstText",
+        "library.row.title.firstText",
+        "library.empty.firstText",
+        "search.toolbar.firstText"
+      ]
+    },
+    {
+      "id": "top-control-baseline",
+      "mode": "baseline",
+      "token": "--type-line",
+      "members": [
+        "shell.breadcrumb.label",
+        "library.header.label",
+        "library.view-menu.label"
+      ]
+    },
+    {
+      "id": "reader-document-center",
+      "mode": "centerX",
+      "token": "--reader-measure",
+      "members": [
+        "reader.document.loaded",
+        "reader.document.loading",
+        "reader.document.error"
+      ]
+    },
+    {
+      "id": "reader-chrome-controls",
+      "mode": "centerY",
+      "token": "--reader-chrome-h",
+      "members": [
+        "reader.topbar.controls",
+        "reader.player.controls"
+      ]
+    },
+    {
+      "id": "reader-inspector-boundary",
+      "mode": "right",
+      "token": "--reader-inspector-w",
+      "members": [
+        "reader.inspector.search",
+        "reader.inspector.bookmarks",
+        "reader.inspector.loading",
+        "reader.inspector.empty",
+        "reader.inspector.error"
+      ]
+    },
+    {
+      "id": "reader-inspector-readable-start",
+      "mode": "firstTextX",
+      "token": "--page-gutter-inline",
+      "members": [
+        "reader.inspector.tabs.firstText",
+        "reader.inspector.summary.firstText",
+        "reader.inspector.result.firstText",
+        "reader.inspector.bookmark.firstText"
+      ]
+    },
+    {
+      "id": "detail-rail-end",
+      "mode": "right",
+      "token": "--detail-rail-w",
+      "members": [
+        "item-detail.meta-rail",
+        "item-detail.meta-rail-skeleton"
+      ]
+    },
+    {
+      "id": "overlay-fixed-top",
+      "mode": "top",
+      "token": "--shell-top-h",
+      "members": [
+        "global.modal.closed",
+        "global.modal.growing",
+        "global.modal.validation-error",
+        "global.command-palette.results"
+      ]
+    },
+    {
+      "id": "toast-corner",
+      "mode": "bottom",
+      "token": "--shell-stage-gap",
+      "members": [
+        "global.toast.first",
+        "global.toast.stack"
+      ]
+    }
+  ]
+}

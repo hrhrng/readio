@@ -1,6 +1,5 @@
 interface CacheEntry {
   url: string; // Object URL — created by caller via URL.createObjectURL()
-  duration: number;
 }
 
 export class AudioCache {

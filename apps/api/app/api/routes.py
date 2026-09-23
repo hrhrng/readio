@@ -16,14 +16,23 @@ from starlette.responses import StreamingResponse
 from app.core.auth import get_current_user_id, get_optional_user_id
 from app.core.settings import settings
 from app.library.files import delete_file, save_file, get_file_path
-from app.library.importers import extract_uploaded_document, fetch_url_document
+from app.library.importers import extract_uploaded_document
 from app.library.models import (
+    BookmarkMutationRequest,
+    BookmarkMutationResponse,
+    BookmarkRecord,
     CreateLibraryItemRequest,
-    ImportUrlRequest,
     LibraryItem,
     LibraryItemsResponse,
+    PositionMutationResponse,
+    ReadingPositionMutation,
+    ReadingPositionRecord,
 )
-from app.library.store import LibraryStore
+from app.library.store import (
+    BookmarkIdCollisionError,
+    LibraryStore,
+    MutationIdReuseError,
+)
 from app.tts.jobs import TTSJobManager
 from app.tts.models import (
     SynthesizeResponse,
@@ -52,7 +61,10 @@ library_store = LibraryStore(settings.library_db_path)
 
 def _build_user_tts_router(user_id: str | None) -> 'TTSRouter':
     """Build a TTSRouter with per-user API keys if available."""
-    if not user_id:
+    # Direct unit callers do not pass FastAPI's resolved dependency value and
+    # may therefore leave the `Depends(...)` marker in this parameter. It is
+    # not a user identity and must never reach SQLite as a bind parameter.
+    if not isinstance(user_id, str) or not user_id:
         return tts_router
     user_keys = library_store.get_user_api_keys(user_id)
     if not user_keys:
@@ -304,6 +316,109 @@ async def update_library_item_chapter(item_id: str, payload: ChapterUpdateReques
     return {'status': 'ok'}
 
 
+@router.get(
+    '/api/library/items/{item_id}/position',
+    response_model=ReadingPositionRecord,
+)
+async def get_library_item_position(item_id: str) -> ReadingPositionRecord:
+    item = await asyncio.to_thread(library_store.get_item, item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail='item not found')
+    position = await asyncio.to_thread(library_store.get_reading_position, item_id)
+    if position is None:
+        raise HTTPException(status_code=404, detail='reading position not found')
+    return position
+
+
+@router.post(
+    '/api/library/items/{item_id}/position',
+    response_model=PositionMutationResponse,
+)
+async def update_library_item_position(
+    item_id: str,
+    payload: ReadingPositionMutation,
+    response: Response,
+) -> PositionMutationResponse:
+    try:
+        result = await asyncio.to_thread(
+            library_store.apply_reading_position,
+            item_id,
+            payload,
+        )
+    except MutationIdReuseError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    if result is None:
+        raise HTTPException(status_code=404, detail='item not found')
+    if result.status == 'conflict':
+        response.status_code = 409
+    return result
+
+
+@router.get(
+    '/api/library/items/{item_id}/bookmarks',
+    response_model=list[BookmarkRecord],
+)
+async def list_library_item_bookmarks(item_id: str) -> list[BookmarkRecord]:
+    item = await asyncio.to_thread(library_store.get_item, item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail='item not found')
+    return await asyncio.to_thread(library_store.list_bookmarks, item_id)
+
+
+@router.post(
+    '/api/library/items/{item_id}/bookmarks',
+    response_model=BookmarkMutationResponse,
+)
+async def update_library_item_bookmark(
+    item_id: str,
+    payload: BookmarkMutationRequest,
+    response: Response,
+) -> BookmarkMutationResponse:
+    try:
+        result = await asyncio.to_thread(
+            library_store.apply_bookmark,
+            item_id,
+            payload,
+        )
+    except (MutationIdReuseError, BookmarkIdCollisionError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    if result is None:
+        raise HTTPException(status_code=404, detail='item not found')
+    if result.status == 'conflict':
+        response.status_code = 409
+    return result
+
+
+@router.delete(
+    '/api/library/items/{item_id}/bookmarks/{bookmark_id}',
+    status_code=204,
+)
+async def delete_library_item_bookmark(
+    item_id: str,
+    bookmark_id: str,
+    base_version: int = Query(ge=0, le=2**64 - 1),
+    mutation_id: str = Query(min_length=1, max_length=200),
+) -> Response:
+    item = await asyncio.to_thread(library_store.get_item, item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail='item not found')
+    try:
+        result = await asyncio.to_thread(
+            library_store.delete_bookmark,
+            item_id,
+            bookmark_id,
+            base_version,
+            mutation_id,
+        )
+    except MutationIdReuseError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    if result == 'not_found':
+        raise HTTPException(status_code=404, detail='bookmark not found')
+    if result == 'conflict':
+        raise HTTPException(status_code=409, detail='bookmark version conflict')
+    return Response(status_code=204)
+
+
 # ---------------------------------------------------------------------------
 # TTS voice catalogue — dynamically fetched from MiniMax API
 # ---------------------------------------------------------------------------
@@ -517,39 +632,6 @@ async def get_api_keys(user_id: str = Depends(get_current_user_id)) -> dict[str,
             'has_global_fallback': bool(global_fallback),
         }
     return result
-
-
-@router.post('/api/library/import/url', response_model=LibraryItem, status_code=201)
-async def import_library_url(payload: ImportUrlRequest) -> LibraryItem:
-    logger.info('importing url=%s', payload.url)
-    try:
-        document = await fetch_url_document(str(payload.url))
-    except ValueError as exc:
-        logger.warning('url import validation error: url=%s — %s', payload.url, exc)
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:  # noqa: BLE001
-        logger.exception('url import failed: url=%s', payload.url)
-        exc_type = type(exc).__name__
-        raise HTTPException(status_code=502, detail=f'failed to fetch url ({exc_type}): {exc}') from exc
-
-    title = (payload.title or document.get('title') or str(payload.url)).strip()
-    content = document.get('content', '').strip()
-    if not content:
-        raise HTTPException(status_code=400, detail='no readable content extracted')
-
-    content_format = document.get('content_format')
-    created = library_store.create_item(
-        CreateLibraryItemRequest(
-            title=title,
-            content=content,
-            type='web',
-            category=payload.category,
-            folder_id=payload.folder_id,
-            source=str(payload.url),
-            content_format=content_format,
-        )
-    )
-    return created
 
 
 @router.post('/api/library/import/file', response_model=LibraryItem, status_code=201)

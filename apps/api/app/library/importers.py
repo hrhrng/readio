@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import base64
 import json
 import logging
@@ -12,8 +11,6 @@ from html import unescape
 from pathlib import Path
 from zipfile import ZipFile
 from xml.etree import ElementTree as ET
-
-import httpx
 
 from app.core.settings import settings
 
@@ -372,7 +369,7 @@ def _extract_epub_text(data: bytes) -> str:
         'author': (manifest['author'] or '').strip() or None,
         # Prefer the first chapter image (the actual book cover from the cover XHTML page)
         # over the OPF-declared cover, which is often a publisher logo.
-        'cover_image': first_cover or manifest['cover_image'],
+        'cover_image': first_cover or manifest['cover_image'] or None,
         'chapters': chapter_entries,
     }
     return json.dumps(payload, ensure_ascii=False)
@@ -428,87 +425,3 @@ def extract_uploaded_document(filename: str, data: bytes) -> dict[str, str]:
     if cover:
         result['cover_image'] = cover
     return result
-
-
-def _fetch_via_trafilatura(url: str) -> dict[str, str] | None:
-    """Use trafilatura to fetch URL and extract clean HTML content.
-
-    Returns a dict with title/content/content_format on success, or None if
-    trafilatura fails to extract meaningful content (triggers fallback).
-    trafilatura's HTML output is clean semantic HTML (<h1>, <p>, <a>, <ul>,
-    <blockquote>, etc.) with navigation/ads/footer already stripped.
-    """
-    try:
-        import trafilatura
-    except ImportError:
-        logger.warning('trafilatura not installed, falling back to regex extraction')
-        return None
-
-    try:
-        downloaded = trafilatura.fetch_url(url)
-    except Exception:  # noqa: BLE001
-        logger.warning('trafilatura fetch failed for %s', url, exc_info=True)
-        return None
-
-    if not downloaded:
-        return None
-
-    # Extract article content as HTML with links and images preserved
-    content = trafilatura.extract(
-        downloaded,
-        output_format='html',
-        include_links=True,
-        include_images=True,
-    )
-    if not content or not content.strip():
-        return None
-
-    # Extract metadata for the title
-    title = ''
-    try:
-        metadata = trafilatura.extract_metadata(downloaded)
-        if metadata and metadata.title:
-            title = metadata.title.strip()
-    except Exception:  # noqa: BLE001
-        pass
-
-    return {
-        'title': title,
-        'content': content.strip(),
-        'content_format': 'html',
-    }
-
-
-async def fetch_url_document(url: str) -> dict[str, str]:
-    # Primary: use trafilatura for rich Markdown extraction (runs in thread
-    # pool since trafilatura's network + parsing is synchronous)
-    result = await asyncio.to_thread(_fetch_via_trafilatura, url)
-    if result:
-        logger.info('fetch_url_document: trafilatura success — url=%s format=html len=%d', url, len(result['content']))
-        return result
-
-    # Fallback: manual HTTP fetch + regex-based plain-text extraction
-    logger.info('fetch_url_document: trafilatura failed, falling back to regex extraction — url=%s', url)
-    headers = {
-        'User-Agent': 'ReadioBot/0.1 (+https://github.com/readio/readio)',
-        'Accept': 'text/html,application/xhtml+xml',
-    }
-    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-        response = await client.get(url, headers=headers)
-        response.raise_for_status()
-        content_type = response.headers.get('content-type', '')
-        if 'text/html' not in content_type and 'application/xhtml+xml' not in content_type:
-            raise ValueError('url is not an HTML page')
-
-        html = response.text
-
-    text = _extract_text(html)
-    if not text:
-        raise ValueError('no readable content extracted')
-
-    title = _extract_title(html)
-    return {
-        'title': title,
-        'content': text,
-        'content_format': 'plaintext',
-    }

@@ -104,25 +104,31 @@ struct ListItem: Codable, Sendable {
 enum ContentBlock: Sendable {
     /// A heading element (h1–h6). `level` 1 is the largest.
     /// `anchorId` is used for TOC navigation (scroll-to-heading).
-    case heading(level: Int, sentences: [RichSentence], anchorId: String?)
+    case heading(level: Int, sentences: [RichSentence], anchorId: String? = nil)
 
     /// A paragraph of text with rich sentence-level formatting.
-    case paragraph(sentences: [RichSentence], anchorId: String?)
+    case paragraph(sentences: [RichSentence], anchorId: String? = nil)
 
-    /// An inline image. `src` may be a relative path (within the EPUB) or a data URL.
-    case image(src: String, alt: String?)
+    /// An inline image. Network documents may retain `src`; EPUB imports use
+    /// `assetId` so the original archive bytes can be decoded natively on demand.
+    case image(
+        src: String? = nil,
+        assetId: String? = nil,
+        mediaType: String? = nil,
+        alt: String? = nil
+    )
 
     /// An ordered or unordered list. Each item has its own sentence array
     /// so TTS can highlight individual list items during playback.
-    case list(ordered: Bool, items: [ListItem], anchorId: String?)
+    case list(ordered: Bool, items: [ListItem], anchorId: String? = nil)
 
     /// A blockquote with rich sentence content, typically rendered with a
     /// left border and italic styling.
-    case blockquote(sentences: [RichSentence], anchorId: String?)
+    case blockquote(sentences: [RichSentence], anchorId: String? = nil)
 
     /// A code block (preformatted text). Not included in TTS playback.
     /// `language` is an optional syntax highlighting hint (e.g., "swift", "python").
-    case code(text: String, language: String?)
+    case code(text: String, language: String? = nil)
 
     /// A horizontal rule / thematic break. Rendered as a divider line.
     case separator
@@ -142,6 +148,8 @@ extension ContentBlock: Codable {
         case sentences
         case anchorId
         case src
+        case assetId
+        case mediaType
         case alt
         case ordered
         case items
@@ -169,9 +177,11 @@ extension ContentBlock: Codable {
             self = .paragraph(sentences: sentences, anchorId: anchorId)
 
         case .image:
-            let src = try container.decode(String.self, forKey: .src)
+            let src = try container.decodeIfPresent(String.self, forKey: .src)
+            let assetId = try container.decodeIfPresent(String.self, forKey: .assetId)
+            let mediaType = try container.decodeIfPresent(String.self, forKey: .mediaType)
             let alt = try container.decodeIfPresent(String.self, forKey: .alt)
-            self = .image(src: src, alt: alt)
+            self = .image(src: src, assetId: assetId, mediaType: mediaType, alt: alt)
 
         case .list:
             let ordered = try container.decode(Bool.self, forKey: .ordered)
@@ -211,9 +221,11 @@ extension ContentBlock: Codable {
             try container.encode(sentences, forKey: .sentences)
             try container.encodeIfPresent(anchorId, forKey: .anchorId)
 
-        case .image(let src, let alt):
+        case .image(let src, let assetId, let mediaType, let alt):
             try container.encode(BlockType.image, forKey: .type)
-            try container.encode(src, forKey: .src)
+            try container.encodeIfPresent(src, forKey: .src)
+            try container.encodeIfPresent(assetId, forKey: .assetId)
+            try container.encodeIfPresent(mediaType, forKey: .mediaType)
             try container.encodeIfPresent(alt, forKey: .alt)
 
         case .list(let ordered, let items, let anchorId):

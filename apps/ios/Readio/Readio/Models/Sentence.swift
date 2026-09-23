@@ -22,6 +22,25 @@ struct Sentence: Identifiable, Sendable {
     /// This is the string sent to the TTS provider for synthesis.
     let text: String
 
+    /// Unicode-scalar position in the canonical text used by the Rust cursor.
+    let charOffset: Int
+
+    /// Stable sentence row in the Reader IR text index. Playback arrays may be
+    /// chapter-local, so this is intentionally separate from the local `index`.
+    let readerIndex: Int
+
+    init(
+        index: Int,
+        text: String,
+        charOffset: Int? = nil,
+        readerIndex: Int? = nil
+    ) {
+        self.index = index
+        self.text = text
+        self.charOffset = charOffset ?? index
+        self.readerIndex = readerIndex ?? index
+    }
+
     /// Conformance to `Identifiable` — the index is unique within a chapter.
     var id: Int { index }
 }

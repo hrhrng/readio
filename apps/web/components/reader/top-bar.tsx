@@ -1,59 +1,110 @@
-"use client";
+"use client"
 
-import { useRouter } from "next/navigation";
-import { ArrowLeft, List, Settings } from "lucide-react";
+import { useRouter } from "next/navigation"
+import { ArrowLeft, Bookmark, List, Search, Settings } from "lucide-react"
+import type { ReaderTool } from "@/lib/reader-tools-navigation"
+import { useLocale } from "../locale-provider"
 
 interface TopBarProps {
-  title: string;
-  onToggleToc: () => void;
-  onToggleSettings: () => void;
-  tocOpen: boolean;
+  title: string
+  onToggleToc: () => void
+  onToggleSettings: () => void
+  onOpenTool: (tool: ReaderTool) => void
+  activeTool: ReaderTool | null
+  tocOpen: boolean
+}
+
+interface ReaderToolActionsProps {
+  activeTool: ReaderTool | null
+  tocOpen: boolean
+  onOpenTool: (tool: ReaderTool) => void
+  onToggleToc: () => void
+  onToggleSettings: () => void
+}
+
+export function ReaderToolActions({
+  activeTool,
+  tocOpen,
+  onOpenTool,
+  onToggleToc,
+  onToggleSettings,
+}: ReaderToolActionsProps) {
+  const { t } = useLocale()
+  return (
+    <div className="reader-topbar-end">
+      <button
+        type="button"
+        onClick={() => onOpenTool("search")}
+        className="ui-icon-button"
+        aria-pressed={activeTool === "search"}
+        aria-label={t("reader.find")}
+      >
+        <Search className="ui-icon" aria-hidden="true" />
+      </button>
+      <button
+        type="button"
+        onClick={() => onOpenTool("bookmarks")}
+        className="ui-icon-button"
+        aria-pressed={activeTool === "bookmarks"}
+        aria-label={t("reader.openBookmarks")}
+      >
+        <Bookmark className="ui-icon" aria-hidden="true" />
+      </button>
+      <button
+        type="button"
+        onClick={onToggleToc}
+        className="ui-icon-button"
+        aria-pressed={tocOpen}
+        aria-label={t("reader.openToc")}
+      >
+        <List className="ui-icon" aria-hidden="true" />
+      </button>
+      <button
+        type="button"
+        onClick={onToggleSettings}
+        className="ui-icon-button"
+        aria-label={t("reader.openSettings")}
+      >
+        <Settings className="ui-icon" aria-hidden="true" />
+      </button>
+    </div>
+  )
 }
 
 export function TopBar({
   title,
   onToggleToc,
   onToggleSettings,
+  onOpenTool,
+  activeTool,
   tocOpen,
 }: TopBarProps) {
-  const router = useRouter();
+  const router = useRouter()
+  const { t } = useLocale()
 
   return (
-    <div className="fixed top-0 left-0 right-0 h-12 bg-surface border-b border-border z-40 flex items-center px-4">
-      <button
-        onClick={() => router.back()}
-        className="flex items-center gap-1.5 text-text-secondary hover:text-text-primary transition-colors duration-200 min-w-[44px] min-h-[44px] justify-center cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent rounded-lg"
-        aria-label="Go back"
-      >
-        <ArrowLeft size={18} />
-        <span className="text-sm hidden sm:inline">Back</span>
-      </button>
-
-      <h1 className="flex-1 text-sm font-medium text-text-primary text-center truncate mx-4">
-        {title}
-      </h1>
-
-      <div className="flex items-center gap-1">
+    <header className="reader-topbar">
+      <div className="reader-topbar-start">
         <button
-          onClick={onToggleToc}
-          className={`min-w-[44px] min-h-[44px] flex items-center justify-center rounded-lg transition-colors duration-200 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ${
-            tocOpen
-              ? "text-accent bg-surface-active"
-              : "text-text-secondary hover:text-text-primary"
-          }`}
-          data-toc-toggle
-          aria-label="Toggle table of contents"
+          type="button"
+          onClick={() => router.back()}
+          className="ui-button ui-button--quiet px-2"
+          aria-label={t("reader.back")}
         >
-          <List size={18} />
-        </button>
-        <button
-          onClick={onToggleSettings}
-          className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-lg text-text-secondary hover:text-text-primary transition-colors duration-200 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-          aria-label="Settings"
-        >
-          <Settings size={18} />
+          <ArrowLeft className="ui-icon" aria-hidden="true" />
+          <span className="hidden sm:inline">{t("reader.back")}</span>
         </button>
       </div>
-    </div>
-  );
+
+      <h1 className="reader-topbar-title">{title}</h1>
+
+      <ReaderToolActions
+        activeTool={activeTool}
+        tocOpen={tocOpen}
+        onOpenTool={onOpenTool}
+        onToggleToc={onToggleToc}
+        onToggleSettings={onToggleSettings}
+      />
+    </header>
+  )
 }

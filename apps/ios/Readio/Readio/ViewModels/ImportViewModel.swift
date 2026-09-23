@@ -7,12 +7,12 @@ import SwiftUI
 /// The import screen provides two ways to add content to the library:
 ///
 /// 1. **File import:** The user picks a file (EPUB, PDF, TXT) via the system file
-///    picker. The file data is uploaded to `POST /api/library/import/file` as a
-///    multipart form. Supported formats are determined by the backend.
+///    picker. Rust computes identity and parses supported formats; Apple persists
+///    the bytes and metadata in the local replica.
 ///
-/// 2. **URL import:** The user pastes a URL (article, web page). The backend
-///    scrapes the content via `POST /api/library/import/url`, extracts text,
-///    and creates a new library item of type `.web`.
+/// 2. **URL import:** The user pastes a URL (article, web page). URLSession only
+///    acquires source HTML; Rust filters and projects canonical text before the
+///    local replica creates or reuses a `.web` item.
 ///
 /// Both flows are mutually exclusive — only one import can run at a time.
 ///

@@ -15,6 +15,10 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
+use readio_sdk::{
+    ReadioSdk,
+    imports::{ImportEffect, ImportOutcome, ImportOwnership, ImportRecord, ImportRequest},
+};
 use serde::{Deserialize, Serialize};
 
 use crate::book::{Book, content_id, slug};
@@ -60,6 +64,14 @@ impl Mode {
             Mode::Move => crate::i18n::t("lib.mode_move"),
         }
     }
+
+    fn ownership(self) -> ImportOwnership {
+        match self {
+            Mode::Copy => ImportOwnership::Copy,
+            Mode::Link => ImportOwnership::Link,
+            Mode::Move => ImportOwnership::Move,
+        }
+    }
 }
 
 /// One imported book.
@@ -77,6 +89,8 @@ pub struct Entry {
     pub origin: Option<PathBuf>,
     #[serde(default)]
     pub mode: Mode,
+    #[serde(default)]
+    pub import_record: Option<ImportRecord>,
     #[serde(default)]
     pub bytes: u64,
     #[serde(default)]
@@ -206,37 +220,69 @@ impl Library {
             ));
         }
 
-        let id = content_id(&source)?;
-        let book = Book::load(Some(&source))?;
+        let source_bytes =
+            std::fs::read(&source).with_context(|| tf("lib.not_found", &[&source.display()]))?;
+        let sdk = ReadioSdk::new();
+        let identity = sdk.imports.content_identity(&source_bytes);
+        let shared_id = identity.digest.clone();
+        let existing = self
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.id == shared_id
+                    || entry
+                        .import_record
+                        .as_ref()
+                        .is_some_and(|record| record.content_identity == identity)
+                    || (entry.available()
+                        && content_id(&entry.path).is_ok_and(|identity| identity == shared_id))
+            })
+            .cloned();
+        // Old releases keyed progress by a 16-character FNV prefix. Once an
+        // existing file proves it has the same shared identity, retain that
+        // primary key so state.json and bookmarks remain reachable.
+        let id = existing
+            .as_ref()
+            .map_or_else(|| shared_id.clone(), |entry| entry.id.clone());
+        let mut book = Book::load(Some(&source))?;
+        book.id = id.clone();
         let bytes = std::fs::metadata(&source).map(|m| m.len()).unwrap_or(0);
 
-        // Re-importing something already held: keep the existing file unless the
-        // mode asks for a different arrangement.
-        if let Some(existing) = self.find(&id).cloned()
+        let owned_storage = self.destination(&id, &book, &source);
+        let source_key = source.to_string_lossy().into_owned();
+        let existing_record = existing.as_ref().map(|entry| {
+            entry.import_record.clone().unwrap_or_else(|| ImportRecord {
+                item_id: entry.id.clone(),
+                content_identity: identity.clone(),
+                ownership: entry.mode.ownership(),
+                source_key: entry
+                    .origin
+                    .as_ref()
+                    .unwrap_or(&entry.path)
+                    .to_string_lossy()
+                    .into_owned(),
+                storage_key: entry.path.to_string_lossy().into_owned(),
+            })
+        });
+        let plan = sdk.imports.plan(ImportRequest {
+            content_identity: identity,
+            ownership: mode.ownership(),
+            source_key,
+            owned_storage_key: owned_storage.to_string_lossy().into_owned(),
+            replace_ownership: existing.as_ref().is_some_and(|entry| entry.mode != mode),
+            existing: existing_record,
+        });
+        if plan.outcome == ImportOutcome::Reused
+            && let Some(existing) = existing.as_ref()
             && existing.available()
-            && existing.mode == mode
         {
-            return Ok((existing, book));
+            book.path = Some(existing.path.clone());
+            return Ok((existing.clone(), book));
         }
 
-        let stored = match mode {
-            Mode::Link => source.clone(),
-            Mode::Copy | Mode::Move => {
-                paths::ensure_dirs()?;
-                let dest = self.destination(&id, &book, &source);
-                if dest != source {
-                    if mode == Mode::Move {
-                        move_file(&source, &dest)?;
-                    } else {
-                        std::fs::copy(&source, &dest)
-                            .with_context(|| tf("lib.copy_failed", &[&paths::display(&dest)]))?;
-                    }
-                }
-                dest
-            }
-        };
+        execute_import_effects(&plan.effects, &plan.record)?;
+        let stored = PathBuf::from(&plan.record.storage_key);
 
-        let mut book = book;
         book.path = Some(stored.clone());
 
         let entry = Entry {
@@ -246,12 +292,13 @@ impl Library {
             path: stored,
             origin: (mode != Mode::Link).then(|| source.clone()),
             mode,
+            import_record: Some(plan.record),
             bytes,
             chars: book.char_count(),
             words: book.word_count(),
             chapters: book.chapters.len(),
             imported: now_secs(),
-            last_opened: 0,
+            last_opened: existing.as_ref().map_or(0, |entry| entry.last_opened),
         };
 
         match self.entries.iter_mut().find(|e| e.id == id) {
@@ -288,22 +335,56 @@ impl Library {
             .filter(|i| *i < self.entries.len())
             .ok_or_else(|| anyhow!("{}", tf("lib.no_entry", &[&index])))?;
         let entry = self.entries.remove(zero);
-        if entry.mode != Mode::Link && entry.path.starts_with(paths::books_dir()) {
-            let _ = std::fs::remove_file(&entry.path);
+        if let Some(record) = &entry.import_record {
+            for effect in ReadioSdk::new().imports.forget(record) {
+                if let ImportEffect::DeleteOwnedContent { storage_key } = effect {
+                    delete_owned_content(Path::new(&storage_key));
+                }
+            }
+        } else if entry.mode != Mode::Link {
+            delete_owned_content(&entry.path);
         }
         self.save()?;
         Ok(entry)
     }
 }
 
-/// `rename` fails across filesystems; fall back to copy + delete.
-fn move_file(source: &Path, dest: &Path) -> Result<()> {
-    if std::fs::rename(source, dest).is_ok() {
-        return Ok(());
+fn execute_import_effects(effects: &[ImportEffect], record: &ImportRecord) -> Result<()> {
+    for effect in effects {
+        match effect {
+            ImportEffect::WriteOwnedContent {
+                source_key,
+                storage_key,
+            } => {
+                let source = Path::new(source_key);
+                let storage = Path::new(storage_key);
+                if source == storage {
+                    continue;
+                }
+                if let Some(parent) = storage.parent() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| tf("lib.write_failed", &[&paths::display(storage)]))?;
+                }
+                std::fs::copy(source, storage)
+                    .with_context(|| tf("lib.copy_failed", &[&paths::display(storage)]))?;
+            }
+            ImportEffect::DeleteSourceAfterCommit { source_key } => {
+                let source = Path::new(source_key);
+                if source != Path::new(&record.storage_key) {
+                    std::fs::remove_file(source)
+                        .with_context(|| tf("lib.moved_but_kept", &[&paths::display(source)]))?;
+                }
+            }
+            ImportEffect::DeleteOwnedContent { storage_key } => {
+                delete_owned_content(Path::new(storage_key));
+            }
+        }
     }
-    std::fs::copy(source, dest)
-        .with_context(|| tf("lib.write_failed", &[&paths::display(dest)]))?;
-    std::fs::remove_file(source)
-        .with_context(|| tf("lib.moved_but_kept", &[&paths::display(source)]))?;
     Ok(())
+}
+
+fn delete_owned_content(path: &Path) {
+    if path.starts_with(paths::books_dir()) {
+        let _ = std::fs::remove_file(path);
+    }
 }

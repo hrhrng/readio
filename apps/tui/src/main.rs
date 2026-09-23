@@ -22,6 +22,7 @@ use ratatui::backend::CrosstermBackend;
 
 use readio::app::{self, App};
 use readio::cli::{self, Parsed};
+use readio::cloud;
 use readio::config::Config;
 use readio::i18n;
 use readio::library::Library;
@@ -35,6 +36,14 @@ fn main() -> Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let args = match cli::parse(&argv) {
         Ok(Parsed::Run(args)) => args,
+        Ok(Parsed::Cloud(command)) => {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()?;
+            runtime.block_on(cloud::run(command))?;
+            return Ok(());
+        }
         Ok(Parsed::Help) => {
             println!("{}", cli::usage());
             return Ok(());

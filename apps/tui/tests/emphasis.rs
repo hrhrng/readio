@@ -122,47 +122,33 @@ fn code_and_headings_carry_no_emphasis() {
     }
 }
 
-/// How a converted EPUB actually spells italics. The book this was written
-/// against — a Calibre-produced Calvino — contains no `<em>` at all: 488
-/// `<span class="…">` and a stylesheet.
 #[test]
-fn italics_written_as_a_css_class_are_still_italics() {
-    let classes = readio::book::css::scan(
-        ".calibre14 { font-style: italic }\n.calibre9 { font-weight: bold }",
-    );
-    let paras = html::to_document_styled(
+fn css_classes_do_not_invent_portable_document_semantics() {
+    let paras = html::to_paras(
         "<html><body><p>他读的是 <span class=\"calibre14\">看不见的城市</span>，\
          而不是 <span class=\"calibre9\">别的书</span>。</p></body></html>",
-        &classes,
-    )
-    .paras;
-    assert_eq!(
-        leaning(first_text(&paras)),
-        vec![
-            ("看不见的城市".to_string(), false),
-            ("别的书".to_string(), true)
-        ]
+    );
+    assert!(
+        first_text(&paras).emphasis().is_empty(),
+        "a renderer-specific class cannot become cross-platform emphasis"
     );
 }
 
 #[test]
-fn an_inline_style_needs_no_stylesheet() {
+fn inline_css_does_not_invent_portable_document_semantics() {
     let paras = html::to_paras(
         "<html><body><p>a <span style=\"font-style: italic\">b</span> c</p></body></html>",
     );
-    assert_eq!(leaning(first_text(&paras)), vec![("b".to_string(), false)]);
+    assert!(first_text(&paras).emphasis().is_empty());
 }
 
 /// A span that only changes colour is not emphasis, and a class that cancels an
 /// inherited style is the opposite of it.
 #[test]
 fn ordinary_spans_stay_ordinary() {
-    let classes = readio::book::css::scan(".c { color: #333 } .plain { font-style: normal }");
-    let paras = html::to_document_styled(
+    let paras = html::to_paras(
         "<html><body><p>a <span class=\"c\">b</span> <span class=\"plain\">c</span></p></body></html>",
-        &classes,
-    )
-    .paras;
+    );
     assert!(
         first_text(&paras).emphasis().is_empty(),
         "nothing here is emphasised: {:?}",
@@ -196,14 +182,18 @@ fn epub_with_emphasis(name: &str) -> PathBuf {
         "c.opf",
         r#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
              <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>斜体的书</dc:title></metadata>
-             <manifest><item id="a" href="a.xhtml" media-type="application/xhtml+xml"/></manifest>
+             <manifest>
+               <item id="a" href="a.xhtml" media-type="application/xhtml+xml"/>
+             </manifest>
              <spine><itemref idref="a"/></spine>
            </package>"#
             .as_bytes(),
     );
     put(
         "a.xhtml",
-        r#"<html><body><p>这一段里只有 <em>斜体的这四个字</em> 需要倾斜，其余都是正文，长度足够撑开一整段。</p></body></html>"#
+        r#"<html><body>
+             <p>这一段里只有 <em>斜体的这四个字</em> 需要倾斜，其余都是正文，长度足够撑开一整段。</p>
+           </body></html>"#
             .as_bytes(),
     );
     zip.finish().expect("finish epub");

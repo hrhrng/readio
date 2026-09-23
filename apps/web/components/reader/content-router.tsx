@@ -1,27 +1,40 @@
 "use client";
 
 import { LibraryItem, Sentence } from "@/lib/types";
-import { PlainTextReader } from "./plain-text-reader";
 import { EpubReader } from "./epub-reader";
 import { PdfReader } from "./pdf-reader";
-import { HtmlReader } from "./html-reader";
+import { SharedEpubReader } from "./shared-epub-reader";
+import { SharedPdfReader } from "./shared-pdf-reader";
+import {
+  SharedDocumentReader,
+  type DocumentReaderIO,
+} from "./shared-document-reader";
+import type { TOCItem } from "./toc-panel";
+import type { ReaderIR } from "@/lib/rust-core";
+import type { WebDiagnosticLog } from "@/lib/diagnostics";
 
 interface ContentRouterProps {
   item: LibraryItem;
   onSentencesExtracted: (sentences: Sentence[]) => void;
+  onReaderIRExtracted?: (reader: ReaderIR) => void;
   currentSentenceIndex: number;
   currentWordProgress: number;
   onSentenceClick: (index: number) => void;
-  onChaptersExtracted?: (chapters: { id: string; title: string; depth?: number }[]) => void;
+  onChaptersExtracted?: (chapters: TOCItem[]) => void;
+  documentReaderIO?: DocumentReaderIO;
+  diagnostics?: Pick<WebDiagnosticLog, "beginOperation" | "record">;
 }
 
 export function ContentRouter({
   item,
   onSentencesExtracted,
+  onReaderIRExtracted,
   currentSentenceIndex,
   currentWordProgress,
   onSentenceClick,
   onChaptersExtracted,
+  documentReaderIO,
+  diagnostics,
 }: ContentRouterProps) {
   if (!item.content && !item.file_path) {
     return (
@@ -31,30 +44,83 @@ export function ContentRouter({
     );
   }
 
-  if (item.type === "epub" && item.file_path) {
-    return (
-      <EpubReader
-        itemId={item.id}
-        fallbackContent={item.content}
-        onSentencesExtracted={onSentencesExtracted}
-        currentSentenceIndex={currentSentenceIndex}
-        currentWordProgress={currentWordProgress}
-        onSentenceClick={onSentenceClick}
-        onChaptersExtracted={onChaptersExtracted}
-      />
-    );
+  if (item.type === "epub") {
+    if (item.content_format === "readio-epub-v1" && item.content) {
+      return (
+        <SharedEpubReader
+          itemId={item.id}
+          content={item.content}
+          onSentencesExtracted={onSentencesExtracted}
+          onReaderIRExtracted={onReaderIRExtracted}
+          currentSentenceIndex={currentSentenceIndex}
+          currentWordProgress={currentWordProgress}
+          onSentenceClick={onSentenceClick}
+          onChaptersExtracted={onChaptersExtracted}
+        />
+      );
+    }
+    if (item.file_path) {
+      return (
+        <EpubReader
+          itemId={item.id}
+          fallbackContent={item.content}
+          onSentencesExtracted={onSentencesExtracted}
+          onReaderIRExtracted={onReaderIRExtracted}
+          currentSentenceIndex={currentSentenceIndex}
+          currentWordProgress={currentWordProgress}
+          onSentenceClick={onSentenceClick}
+          onChaptersExtracted={onChaptersExtracted}
+        />
+      );
+    }
   }
 
-  if (item.type === "pdf" && item.file_path) {
+  if (item.type === "pdf") {
+    if (item.content_format === "readio-pdf-v1" && item.content) {
+      return (
+        <SharedPdfReader
+          content={item.content}
+          onSentencesExtracted={onSentencesExtracted}
+          onReaderIRExtracted={onReaderIRExtracted}
+          currentSentenceIndex={currentSentenceIndex}
+          currentWordProgress={currentWordProgress}
+          onSentenceClick={onSentenceClick}
+          onChaptersExtracted={onChaptersExtracted}
+        />
+      );
+    }
+    if (item.file_path) {
+      return (
+        <PdfReader
+          itemId={item.id}
+          fallbackContent={item.content}
+          onSentencesExtracted={onSentencesExtracted}
+          onReaderIRExtracted={onReaderIRExtracted}
+          currentSentenceIndex={currentSentenceIndex}
+          currentWordProgress={currentWordProgress}
+          onSentenceClick={onSentenceClick}
+          onChaptersExtracted={onChaptersExtracted}
+        />
+      );
+    }
+  }
+
+  const markdownSource =
+    item.markdown_source ??
+    (item.content_format === "markdown" ? item.content : null);
+  if (markdownSource !== null) {
     return (
-      <PdfReader
-        itemId={item.id}
-        fallbackContent={item.content}
+      <SharedDocumentReader
+        content={markdownSource}
+        format="markdown"
         onSentencesExtracted={onSentencesExtracted}
+        onReaderIRExtracted={onReaderIRExtracted}
         currentSentenceIndex={currentSentenceIndex}
         currentWordProgress={currentWordProgress}
         onSentenceClick={onSentenceClick}
         onChaptersExtracted={onChaptersExtracted}
+        readerIO={documentReaderIO}
+        diagnostics={diagnostics}
       />
     );
   }
@@ -62,24 +128,34 @@ export function ContentRouter({
   // HTML-formatted web imports get rich rendering with TTS integration
   if (item.type === "web" && item.content_format === "html") {
     return (
-      <HtmlReader
+      <SharedDocumentReader
         content={item.content}
+        format="html"
         onSentencesExtracted={onSentencesExtracted}
+        onReaderIRExtracted={onReaderIRExtracted}
         currentSentenceIndex={currentSentenceIndex}
         currentWordProgress={currentWordProgress}
         onSentenceClick={onSentenceClick}
+        onChaptersExtracted={onChaptersExtracted}
+        readerIO={documentReaderIO}
+        diagnostics={diagnostics}
       />
     );
   }
 
   // web / txt / fallback for epub/pdf without file_path
   return (
-    <PlainTextReader
+    <SharedDocumentReader
       content={item.content}
+      format="text"
       onSentencesExtracted={onSentencesExtracted}
+      onReaderIRExtracted={onReaderIRExtracted}
       currentSentenceIndex={currentSentenceIndex}
       currentWordProgress={currentWordProgress}
       onSentenceClick={onSentenceClick}
+      onChaptersExtracted={onChaptersExtracted}
+      readerIO={documentReaderIO}
+      diagnostics={diagnostics}
     />
   );
 }

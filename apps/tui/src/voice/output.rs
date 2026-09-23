@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow};
 use maudio::{
@@ -20,6 +20,7 @@ use maudio::{
 use super::PlaybackControl;
 
 pub(super) const INTERNAL_PLAYER: &str = "@readio";
+const AUDIO_CALLBACK_START_TIMEOUT: Duration = Duration::from_millis(1_500);
 
 struct PcmCursor {
     samples: Vec<f32>,
@@ -383,7 +384,17 @@ fn play_with_backends(
 
     let mut started = false;
     let mut acknowledged_pause = control.paused();
+    let callback_deadline = Instant::now() + AUDIO_CALLBACK_START_TIMEOUT;
     loop {
+        if !state.seen.load(Ordering::Acquire) && Instant::now() >= callback_deadline {
+            device
+                .device_stop()
+                .map_err(|err| anyhow!("stop stalled audio output: {err:?}"))?;
+            return Err(anyhow!(
+                "audio output callback did not start within {} ms",
+                AUDIO_CALLBACK_START_TIMEOUT.as_millis()
+            ));
+        }
         if control.cancelled() {
             state.cancelled.store(true, Ordering::SeqCst);
         }
@@ -453,14 +464,13 @@ mod tests {
 
     use crate::voice::{Pipeline, PlaybackClock};
 
-    /// A started device is not enough: the callback must consume the clip and
-    /// let the blocking playback call return. This exercises the same default
-    /// backend as a real read-aloud session, because a device that reports a
-    /// successful start without invoking its callback otherwise leaves the
-    /// player thread asleep forever.
+    /// A started device is not enough: the callback must consume the clip or
+    /// the transport must return one explicit startup failure. This exercises
+    /// the same default backend as a real read-aloud session without letting a
+    /// driver that never invokes its callback strand the player thread.
     #[cfg(target_os = "macos")]
     #[test]
-    fn default_output_consumes_a_short_pcm_clip() {
+    fn default_output_finishes_or_reports_a_callback_start_failure() {
         let path =
             std::env::temp_dir().join(format!("readio-output-{}-short.wav", std::process::id()));
         std::fs::write(&path, crate::voice::wav::silence(80, 48_000)).expect("write test wav");
@@ -487,9 +497,16 @@ mod tests {
         });
 
         let outcome = result
-            .recv_timeout(Duration::from_secs(2))
-            .expect("the audio device started but its callback never consumed the clip");
-        outcome.expect("play short PCM clip");
+            .recv_timeout(Duration::from_secs(3))
+            .expect("default audio playback did not finish or report its startup failure");
+        if let Err(error) = outcome {
+            assert!(
+                error
+                    .to_string()
+                    .contains("audio output callback did not start"),
+                "unexpected default output failure: {error:#}"
+            );
+        }
         let _ = std::fs::remove_file(path);
     }
 

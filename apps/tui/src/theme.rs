@@ -20,6 +20,8 @@ pub struct Theme {
     pub text_muted: Color,
     pub text_faint: Color,
 
+    /// Product identity shared with the Web dark theme.
+    pub accent_brand: Color,
     pub accent_user: Color,
     pub accent_agent: Color,
     pub accent_thinking: Color,
@@ -51,36 +53,39 @@ pub struct Theme {
 }
 
 pub const THEME: Theme = Theme {
-    bg_base: rgb(22, 22, 24),
-    bg_soft: rgb(30, 30, 34),
-    bg_code: rgb(28, 28, 32),
+    bg_base: rgb(28, 31, 29),
+    bg_soft: rgb(37, 41, 37),
+    bg_code: rgb(32, 36, 33),
 
-    text_primary: rgb(214, 216, 224),
-    text_secondary: rgb(158, 162, 176),
-    text_muted: rgb(118, 122, 136),
-    text_faint: rgb(84, 88, 100),
+    text_primary: rgb(244, 247, 244),
+    text_secondary: rgb(192, 200, 193),
+    text_muted: rgb(156, 166, 158),
+    // Faint still has to be readable: this is the status-line hint colour, not
+    // a decorative border. It clears 4.5:1 against `bg_base`.
+    text_faint: rgb(127, 137, 129),
 
-    accent_user: rgb(176, 180, 194),
-    accent_agent: rgb(196, 152, 245),
-    accent_thinking: rgb(148, 128, 190),
-    accent_tool: rgb(104, 110, 128),
+    accent_brand: rgb(138, 214, 169),
+    accent_user: rgb(192, 200, 193),
+    accent_agent: rgb(138, 214, 169),
+    accent_thinking: rgb(122, 166, 139),
+    accent_tool: rgb(156, 166, 158),
     accent_system: rgb(122, 162, 247),
-    accent_running: rgb(196, 152, 245),
-    accent_success: rgb(126, 208, 158),
-    accent_error: rgb(232, 118, 118),
-    accent_warning: rgb(226, 186, 120),
-    accent_plan: rgb(255, 219, 141),
-    accent_model: rgb(116, 199, 196),
+    accent_running: rgb(138, 214, 169),
+    accent_success: rgb(145, 215, 163),
+    accent_error: rgb(255, 180, 171),
+    accent_warning: rgb(239, 196, 119),
+    accent_plan: rgb(239, 196, 119),
+    accent_model: rgb(155, 205, 228),
 
-    border: rgb(52, 54, 62),
-    border_focus: rgb(88, 92, 104),
+    border: rgb(58, 64, 59),
+    border_focus: rgb(91, 101, 93),
 
-    bg_speaking: rgb(44, 40, 62),
-    bg_speaking_word: rgb(92, 74, 148),
-    fg_speaking: rgb(242, 240, 248),
+    bg_speaking: rgb(45, 67, 53),
+    bg_speaking_word: rgb(73, 111, 87),
+    fg_speaking: rgb(244, 247, 244),
 
-    bg_selected: rgb(40, 40, 48),
-    fg_latin: rgb(122, 194, 214),
+    bg_selected: rgb(48, 54, 48),
+    fg_latin: rgb(155, 205, 228),
 };
 
 pub fn theme() -> &'static Theme {
@@ -100,6 +105,8 @@ pub const BULLET_OPEN: &str = "○";
 pub const CHECK: &str = "✓";
 pub const CROSS: &str = "✗";
 pub const ARROW: &str = "❯";
+/// The cross-platform lockup: the command prompt plus a stable cursor.
+pub const BRAND_MARK: &str = "❯_";
 /// One arrow: something is running, or a mode that runs on its own. Two of them
 /// mean "and it keeps going", the way a coding agent marks its unattended mode.
 pub const PLAY: &str = "⏵";

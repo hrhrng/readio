@@ -3,5 +3,5 @@ export default function PlayerLayout({
 }: {
   children: React.ReactNode;
 }) {
-  return <div className="min-h-screen bg-surface">{children}</div>;
+  return children;
 }

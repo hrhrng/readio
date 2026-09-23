@@ -4,6 +4,10 @@
 mod common;
 
 use std::time::Duration;
+use std::{
+    ops::{Deref, DerefMut},
+    sync::{Mutex, MutexGuard},
+};
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -11,6 +15,34 @@ use readio::app::App;
 use readio::book::Book;
 use readio::library::Library;
 use readio::store::Store;
+
+/// Every frame fixture reads and may persist the same process-scoped config.
+/// Keep that real persistence behavior while preventing one parallel test's
+/// `/auto` command from changing the mode between another fixture's pin and
+/// `App::new` load.
+struct SerialApp {
+    app: App,
+    _guard: MutexGuard<'static, ()>,
+}
+
+impl Deref for SerialApp {
+    type Target = App;
+
+    fn deref(&self) -> &Self::Target {
+        &self.app
+    }
+}
+
+impl DerefMut for SerialApp {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.app
+    }
+}
+
+fn exclusive_fixture() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Render the app after `frames` ticks, returning the screen as plain text.
 ///
@@ -57,11 +89,12 @@ fn run_until_idle(app: &mut App, terminal: &mut Terminal<TestBackend>) -> String
     screen(app, terminal, 1)
 }
 
-fn fixture() -> (App, Terminal<TestBackend>) {
+fn fixture() -> (SerialApp, Terminal<TestBackend>) {
     fixture_sized(90, 30)
 }
 
-fn fixture_sized(width: u16, height: u16) -> (App, Terminal<TestBackend>) {
+fn fixture_sized(width: u16, height: u16) -> (SerialApp, Terminal<TestBackend>) {
+    let guard = exclusive_fixture();
     common::isolated_home();
     pin_manual();
     let book = Book::load(None).expect("sample book");
@@ -72,7 +105,7 @@ fn fixture_sized(width: u16, height: u16) -> (App, Terminal<TestBackend>) {
         Some("已复制进书库：《注意力的形状》".to_string()),
     );
     let terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
-    (app, terminal)
+    (SerialApp { app, _guard: guard }, terminal)
 }
 
 /// Start every test in manual mode.
@@ -87,7 +120,8 @@ fn pin_manual() {
 }
 
 /// An app that starts with no book open, the way a bare `readio` launch does.
-fn library_fixture(entries: usize) -> (App, Terminal<TestBackend>) {
+fn library_fixture(entries: usize) -> (SerialApp, Terminal<TestBackend>) {
+    let guard = exclusive_fixture();
     common::isolated_home();
     pin_manual();
     let mut library = Library::ephemeral();
@@ -99,6 +133,7 @@ fn library_fixture(entries: usize) -> (App, Terminal<TestBackend>) {
             path: std::path::PathBuf::from(format!("/tmp/readio-missing-{i}.md")),
             origin: None,
             mode: readio::library::Mode::Copy,
+            import_record: None,
             bytes: 1234,
             chars: 5000 * (i + 1),
             words: 1000 * (i + 1),
@@ -109,7 +144,7 @@ fn library_fixture(entries: usize) -> (App, Terminal<TestBackend>) {
     }
     let app = App::new(library, Store::ephemeral(), None, None);
     let terminal = Terminal::new(TestBackend::new(96, 24)).expect("terminal");
-    (app, terminal)
+    (SerialApp { app, _guard: guard }, terminal)
 }
 
 #[test]
@@ -117,7 +152,10 @@ fn opening_frame_shows_chrome_and_welcome() {
     let (mut app, mut terminal) = fixture();
     let view = screen(&mut app, &mut terminal, 12);
 
-    assert!(view.contains("readio"), "header brand missing:\n{view}");
+    assert!(
+        view.contains("❯_ readio"),
+        "header should carry the prompt-and-cursor brand mark:\n{view}"
+    );
     assert!(view.contains("注意力的形状"), "book title missing:\n{view}");
     assert!(
         view.contains("第 1/4 章"),
@@ -793,20 +831,24 @@ fn the_word_highlight_survives_a_line_wrap() {
     let area = Rect::new(0, 0, 34, 16);
     let th = theme();
 
-    // Walk a word cursor across the whole passage; at every step exactly one
-    // unit is deeply washed, no matter where the wrap falls.
-    let units = readio::voice::sentence::units(passage);
+    // The renderer receives byte ranges from the adapter. Walk literal source
+    // characters here: tokenization belongs to Rust Core and is tested there.
+    let units = passage
+        .char_indices()
+        .filter(|(_, character)| character.is_alphanumeric())
+        .map(|(start, character)| (start, start + character.len_utf8()))
+        .collect::<Vec<_>>();
     assert!(
         units.len() > 20,
         "the fixture should be long: {}",
         units.len()
     );
-    for unit in units {
+    for range in units {
         sb.set_highlight(
             id,
             Some(Highlight {
                 sentence: (0, passage.len()),
-                word: Some(unit.range),
+                word: Some(range),
             }),
         );
         let mut buf = Buffer::empty(area);
@@ -816,7 +858,7 @@ fn the_word_highlight_survives_a_line_wrap() {
             .iter()
             .filter(|cell| cell.bg == th.bg_speaking_word)
             .count();
-        let text = &passage[unit.range.0..unit.range.1];
+        let text = &passage[range.0..range.1];
         assert_eq!(
             deep,
             text.chars().count(),

@@ -30,6 +30,9 @@ import SwiftUI
 /// - Respects safe area insets for devices with home indicators (iPhone X and later).
 /// - The entire bar is 60pt tall (plus safe area) for comfortable touch targets.
 struct PlayerBarView: View {
+    @Environment(\.locale) private var locale
+
+    @Environment(\.readioTheme) private var theme
 
     // MARK: - Properties
 
@@ -41,9 +44,10 @@ struct PlayerBarView: View {
     /// speed property is private. Used by the SpeedControlView.
     var currentSpeed: Double = 1.0
 
-    /// Callback when the user changes the playback speed via the speed control.
-    /// The parent view should update both the engine and the ViewModel.
-    var onSpeedChange: ((Double) -> Void)? = nil
+    var readingMode: ReadioReadingMode = .readAloud
+    var readingEffort: ReadioEffortLevel = .high
+    var onReadingModeChange: ((ReadioReadingMode) -> Void)? = nil
+    var onReadingEffortChange: ((ReadioEffortLevel) -> Void)? = nil
 
     /// Callback to open the voice picker sheet. Handled by the parent `ReaderView`.
     let onVoiceTap: () -> Void
@@ -51,34 +55,45 @@ struct PlayerBarView: View {
     // MARK: - Body
 
     var body: some View {
+        #if os(macOS)
+        playerContent
+            .padding(.horizontal, 18)
+            .padding(.vertical, 10)
+            .frame(maxWidth: 760)
+            .background {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(theme.raised)
+            }
+            .shadow(color: .black.opacity(0.14), radius: 8, x: 0, y: 4)
+        #else
         VStack(spacing: 0) {
             // Top divider separating the player bar from the content area
-            Divider()
+            Rectangle()
+                .fill(theme.border)
+                .frame(height: 1)
 
-            VStack(spacing: 8) {
-                // MARK: Progress Bar + Time Remaining
-                progressSection
-
-                // MARK: Transport Controls
-                transportControls
-
-                // MARK: Error Banner (Conditional)
-                if let ttsError = engine.ttsError {
-                    errorBanner(ttsError)
-                }
-            }
+            playerContent
             .padding(.horizontal, 16)
             .padding(.top, 10)
             .padding(.bottom, 6)
         }
         .background(
-            // Glass-morphism background for a modern, layered look.
-            // `.ultraThinMaterial` provides a frosted-glass effect that lets
-            // the content beneath show through subtly.
             Rectangle()
-                .fill(.ultraThinMaterial)
+                .fill(theme.raised)
                 .ignoresSafeArea(.container, edges: .bottom)
         )
+        #endif
+    }
+
+    private var playerContent: some View {
+        VStack(spacing: 8) {
+            progressSection
+            transportControls
+
+            if let ttsError = engine.ttsError {
+                errorBanner(ttsError)
+            }
+        }
     }
 
     // MARK: - Progress Section
@@ -94,12 +109,12 @@ struct PlayerBarView: View {
                 ZStack(alignment: .leading) {
                     // Background track
                     RoundedRectangle(cornerRadius: 2)
-                        .fill(Color(.systemGray4))
+                        .fill(theme.selected)
                         .frame(height: 4)
 
                     // Filled progress indicator
                     RoundedRectangle(cornerRadius: 2)
-                        .fill(Color.accentColor)
+                        .fill(theme.accent)
                         .frame(
                             width: geometry.size.width * progressFraction,
                             height: 4
@@ -107,7 +122,7 @@ struct PlayerBarView: View {
 
                     // Seek thumb — small circle at the current position
                     Circle()
-                        .fill(Color.accentColor)
+                        .fill(theme.accent)
                         .frame(width: 10, height: 10)
                         .offset(x: geometry.size.width * progressFraction - 5)
                 }
@@ -125,7 +140,7 @@ struct PlayerBarView: View {
             // Remaining time estimate
             Text(remainingTimeText)
                 .font(.system(size: 11, design: .monospaced))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(theme.secondaryInk)
                 .frame(width: 70, alignment: .trailing)
         }
     }
@@ -139,9 +154,10 @@ struct PlayerBarView: View {
             Button { engine.prevSentence() } label: {
                 Image(systemName: "backward.fill")
                     .font(.title3)
-                    .foregroundStyle(.primary)
+                    .foregroundStyle(theme.ink)
             }
             .frame(width: 44, height: 44)
+            .buttonStyle(.plain)
 
             Spacer()
 
@@ -153,7 +169,7 @@ struct PlayerBarView: View {
                     // Loading state — spinner replaces the play/pause icon
                     ProgressView()
                         .controlSize(.regular)
-                        .tint(.accentColor)
+                        .tint(theme.accent)
                 } else {
                     Button {
                         if engine.isPlaying {
@@ -164,8 +180,10 @@ struct PlayerBarView: View {
                     } label: {
                         Image(systemName: engine.isPlaying ? "pause.circle.fill" : "play.circle.fill")
                             .font(.system(size: 44))
-                            .foregroundStyle(.accentColor)
+                            .foregroundStyle(theme.accent)
                     }
+                    .disabled(readingMode == .manual)
+                    .buttonStyle(.plain)
                 }
             }
             .frame(width: 50, height: 50)
@@ -176,23 +194,46 @@ struct PlayerBarView: View {
             Button { engine.nextSentence() } label: {
                 Image(systemName: "forward.fill")
                     .font(.title3)
-                    .foregroundStyle(.primary)
+                    .foregroundStyle(theme.ink)
             }
             .frame(width: 44, height: 44)
+            .buttonStyle(.plain)
 
             Spacer()
 
-            // MARK: Speed Control
-            // Speed is managed by PlayerViewModel (not directly on the engine),
-            // so we pass the externally-provided currentSpeed and callback.
-            SpeedControlView(
-                currentSpeed: currentSpeed,
-                onSpeedChange: { newSpeed in
-                    onSpeedChange?(newSpeed)
+            // One compact control selects the peer reading mode and the shared
+            // six-level effort without adding another transport row on iPhone.
+            readingPreferencesMenu
+
+            Spacer()
+
+            if readingMode == .readAloud {
+                Menu {
+                    Button("Off") { engine.clearSleepDeadline() }
+                    Divider()
+                    ForEach([15, 30, 60], id: \.self) { minutes in
+                        Button("\(minutes) minutes") {
+                            let deadline = Int64(
+                                Date().timeIntervalSince1970 * 1_000
+                            ) + Int64(minutes * 60_000)
+                            engine.setSleepDeadline(unixMilliseconds: deadline)
+                        }
+                    }
+                } label: {
+                    TimelineView(.periodic(from: .now, by: 30)) { context in
+                        Label(
+                            sleepTimerLabel(at: context.date),
+                            systemImage: "moon.zzz"
+                        )
+                        .font(.caption)
+                    }
                 }
-            )
+                .frame(minWidth: 44, minHeight: 44)
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
 
-            Spacer()
+                Spacer()
+            }
 
             // MARK: Voice Picker Button
             Button(action: onVoiceTap) {
@@ -201,6 +242,91 @@ struct PlayerBarView: View {
                     .foregroundStyle(.primary)
             }
             .frame(width: 44, height: 44)
+            .buttonStyle(.plain)
+            .disabled(readingMode != .readAloud)
+            .opacity(readingMode == .readAloud ? 1 : 0)
+        }
+    }
+
+    private var readingPreferencesMenu: some View {
+        Menu {
+            Section("Reading Mode") {
+                ForEach(ReadioReadingMode.allCases, id: \.self) { mode in
+                    Button {
+                        onReadingModeChange?(mode)
+                    } label: {
+                        if mode == readingMode {
+                            Label(readingModeLabel(mode), systemImage: "checkmark")
+                        } else {
+                            Text(readingModeLabel(mode))
+                        }
+                    }
+                }
+            }
+            Section("Effort") {
+                ForEach(ReadioEffortLevel.allCases, id: \.self) { effort in
+                    Button {
+                        onReadingEffortChange?(effort)
+                    } label: {
+                        if effort == readingEffort {
+                            Label(readingEffortLabel(effort), systemImage: "checkmark")
+                        } else {
+                            Text(readingEffortLabel(effort))
+                        }
+                    }
+                }
+            }
+        } label: {
+            VStack(spacing: 1) {
+                Image(systemName: readingModeSymbol)
+                    .font(.body)
+                Text("\(readingModeLabel(readingMode)) · \(currentSpeed.formatted(.number.precision(.fractionLength(1))))×")
+                    .font(.system(size: 9, design: .rounded))
+                    .lineLimit(1)
+            }
+            .frame(minWidth: 56, minHeight: 44)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .accessibilityLabel("Reading mode and effort")
+        .accessibilityValue(
+            "\(readingModeLabel(readingMode)), \(readingEffortLabel(readingEffort)) effort"
+        )
+    }
+
+    private var readingModeSymbol: String {
+        switch readingMode {
+        case .manual: "hand.tap"
+        case .auto: "text.line.first.and.arrowtriangle.forward"
+        case .readAloud: "waveform"
+        }
+    }
+
+    private func readingModeLabel(_ mode: ReadioReadingMode) -> String {
+        switch mode {
+        case .manual:
+            AppleLocalization.string("Manual", defaultValue: "Manual", locale: locale)
+        case .auto:
+            AppleLocalization.string("Auto", defaultValue: "Auto", locale: locale)
+        case .readAloud:
+            AppleLocalization.string("Read Aloud", defaultValue: "Read Aloud", locale: locale)
+        }
+    }
+
+    private func readingEffortLabel(_ effort: ReadioEffortLevel) -> String {
+        switch effort {
+        case .minimal:
+            AppleLocalization.string("Minimal", defaultValue: "Minimal", locale: locale)
+        case .low:
+            AppleLocalization.string("Low", defaultValue: "Low", locale: locale)
+        case .medium:
+            AppleLocalization.string("Medium", defaultValue: "Medium", locale: locale)
+        case .high:
+            AppleLocalization.string("High", defaultValue: "High", locale: locale)
+        case .xhigh:
+            AppleLocalization.string("Xhigh", defaultValue: "Extra High", locale: locale)
+        case .max:
+            AppleLocalization.string("Max", defaultValue: "Maximum", locale: locale)
         }
     }
 
@@ -234,6 +360,10 @@ struct PlayerBarView: View {
             .buttonStyle(.bordered)
             .controlSize(.mini)
 
+            Button("Change Voice", action: onVoiceTap)
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
+
             // Dismiss button — clears the error without retrying
             Button {
                 engine.dismissError()
@@ -251,18 +381,23 @@ struct PlayerBarView: View {
         )
     }
 
+    private func sleepTimerLabel(at date: Date) -> String {
+        guard let deadline = engine.sleepDeadlineUnixMilliseconds else {
+            return "Sleep"
+        }
+        let remaining = max(
+            0,
+            Double(deadline) / 1_000 - date.timeIntervalSince1970
+        )
+        return "\(Int(ceil(remaining / 60)))m"
+    }
+
     // MARK: - Computed Properties
 
     /// The current playback progress as a fraction (0.0 to 1.0).
     /// Based on the current sentence index relative to total sentences.
     private var progressFraction: CGFloat {
-        // Use a reasonable fallback if the engine doesn't track total sentences.
-        // The engine.currentSentenceIndex is the sentence being played;
-        // progress is mapped from 0 to 1 based on the total count.
-        guard engine.currentSentenceIndex >= 0 else { return 0 }
-        // Approximate: use the sentence index as a proxy for progress.
-        // A more accurate implementation would use the engine's internal total.
-        return CGFloat(max(0, min(1, engine.currentWordProgress)))
+        CGFloat(engine.progressBasisPoints) / 10_000
     }
 
     /// Formats the estimated remaining time into a human-readable string.

@@ -29,6 +29,22 @@ struct EpubChapter: Codable, Identifiable, Sendable {
     /// These represent the semantic elements (headings, paragraphs, images, etc.)
     /// and contain pre-split sentences ready for TTS playback and highlighting.
     let blocks: [ContentBlock]
+
+    /// Navigation entries targeting this chapter. Older locally persisted
+    /// publications omit the field and fall back to one entry per chapter.
+    let tocEntries: [TOCEntry]?
+
+    init(
+        id: String,
+        title: String,
+        blocks: [ContentBlock],
+        tocEntries: [TOCEntry]? = nil
+    ) {
+        self.id = id
+        self.title = title
+        self.blocks = blocks
+        self.tocEntries = tocEntries
+    }
 }
 
 // MARK: - TOCEntry
@@ -55,4 +71,30 @@ struct TOCEntry: Codable, Identifiable, Sendable {
     /// Optional href for deep-linking into a chapter (e.g., "chapter3.xhtml#section-2").
     /// When nil, navigation targets the beginning of the chapter matching `id`.
     let href: String?
+
+    /// Nesting depth from the publication navigation document.
+    let depth: Int?
+
+    /// Rust-resolved semantic target. `blockId == nil` means chapter start.
+    let chapterId: String?
+    let blockId: String?
+    let sentenceIndex: Int?
+
+    init(
+        id: String,
+        title: String,
+        href: String?,
+        depth: Int? = nil,
+        chapterId: String? = nil,
+        blockId: String? = nil,
+        sentenceIndex: Int? = nil
+    ) {
+        self.id = id
+        self.title = title
+        self.href = href
+        self.depth = depth
+        self.chapterId = chapterId
+        self.blockId = blockId
+        self.sentenceIndex = sentenceIndex
+    }
 }

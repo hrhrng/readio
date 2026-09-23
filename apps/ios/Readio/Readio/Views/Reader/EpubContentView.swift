@@ -1,7 +1,7 @@
 import SwiftUI
 
-// MARK: - EpubContentView
-/// Renders EPUB chapter content with rich content blocks and sentence-level TTS highlighting.
+// MARK: - ReaderDocumentView
+/// Projects Reader IR chapters into native semantic blocks and sentence-level highlighting.
 ///
 /// **Layout:**
 /// ```
@@ -26,7 +26,7 @@ import SwiftUI
 /// ```
 ///
 /// **Data Flow:**
-/// - `chapters`: Array of `EpubChapter` objects, each containing an array of `ContentBlock`.
+/// - `chapters`: Reader IR chapter projections containing semantic `ContentBlock` values.
 /// - `currentChapterId`: Determines which chapter is currently displayed.
 /// - Sentence highlighting works across all block types (heading, paragraph, list, blockquote).
 ///
@@ -37,7 +37,18 @@ import SwiftUI
 /// **Auto-Scroll:**
 /// Uses `ScrollViewReader` to follow the active sentence during TTS playback,
 /// scrolling to keep the spoken sentence centered in the viewport.
-struct EpubContentView: View {
+enum ReaderLayoutTokens {
+    static let blockSpacing: CGFloat = 0
+    static let pageInlinePadding: CGFloat = 16
+    static let pageBlockPadding: CGFloat = 16
+    static let chapterNavigationTopPadding: CGFloat = 24
+    static let navigationItemSpacing: CGFloat = 4
+    static let navigationBlockPadding: CGFloat = 12
+    static let navigationInlinePadding: CGFloat = 4
+    static let autoScrollDuration = 0.2
+}
+
+struct ReaderDocumentView: View {
 
     // MARK: - Properties
 
@@ -50,14 +61,16 @@ struct EpubContentView: View {
     /// The global sentence index currently being spoken by TTS.
     let currentSentenceIndex: Int
 
-    /// Word-level progress within the active sentence (0.0 to 1.0).
-    let currentWordProgress: Double
+    /// Rust-selected Unicode-scalar range within the active sentence.
+    let currentWordRange: ReadioScalarRange?
 
     /// Callback when the user taps a sentence to start playback there.
     let onSentenceClick: (Int) -> Void
 
     /// Callback when the user navigates to a different chapter.
     let onChapterChange: (String) -> Void
+
+    var loadImageAsset: ((String) async throws -> Data)? = nil
 
     // MARK: - Computed Properties
 
@@ -95,7 +108,7 @@ struct EpubContentView: View {
         if let chapter = currentChapter {
             ScrollViewReader { proxy in
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 0) {
+                    VStack(alignment: .leading, spacing: ReaderLayoutTokens.blockSpacing) {
                         // MARK: Chapter Content Blocks
                         // Each block is rendered by ContentBlockView which handles
                         // all block types (heading, paragraph, list, etc.).
@@ -103,31 +116,34 @@ struct EpubContentView: View {
                             ContentBlockView(
                                 block: block,
                                 currentSentenceIndex: currentSentenceIndex,
-                                currentWordProgress: currentWordProgress,
-                                onSentenceClick: onSentenceClick
+                                currentWordRange: currentWordRange,
+                                onSentenceClick: onSentenceClick,
+                                loadImageAsset: loadImageAsset
                             )
                             .id("block-\(index)") // For potential block-level scrolling
                         }
 
                         // MARK: Chapter Navigation Footer
-                        chapterNavigationBar
-                            .padding(.top, 24)
+                        if chapters.count > 1 {
+                            chapterNavigationBar
+                                .padding(.top, ReaderLayoutTokens.chapterNavigationTopPadding)
+                        }
                     }
-                    .padding(.horizontal)
-                    .padding(.vertical, 16)
+                    .padding(.horizontal, ReaderLayoutTokens.pageInlinePadding)
+                    .padding(.vertical, ReaderLayoutTokens.pageBlockPadding)
                 }
                 // MARK: Auto-Scroll on Sentence Change
                 // Scroll to keep the active sentence visible during TTS playback.
                 .onChange(of: currentSentenceIndex) { _, newIndex in
                     guard newIndex >= 0 else { return }
-                    withAnimation(.easeInOut(duration: 0.3)) {
+                    withAnimation(.easeInOut(duration: ReaderLayoutTokens.autoScrollDuration)) {
                         // Scroll to the sentence anchor within the content blocks.
                         // SentenceTextView uses `.id(sentence.index)` for this.
                         proxy.scrollTo(newIndex, anchor: .center)
                     }
                 }
             }
-            .background(Color(.systemBackground))
+            .background(.background)
         } else {
             // No chapter available — show empty state
             EmptyStateView(
@@ -152,7 +168,7 @@ struct EpubContentView: View {
                     onChapterChange(chapters[index - 1].id)
                 }
             } label: {
-                HStack(spacing: 4) {
+                HStack(spacing: ReaderLayoutTokens.navigationItemSpacing) {
                     Image(systemName: "chevron.left")
                     Text("Previous")
                 }
@@ -179,7 +195,7 @@ struct EpubContentView: View {
                     onChapterChange(chapters[index + 1].id)
                 }
             } label: {
-                HStack(spacing: 4) {
+                HStack(spacing: ReaderLayoutTokens.navigationItemSpacing) {
                     Text("Next")
                     Image(systemName: "chevron.right")
                 }
@@ -189,15 +205,15 @@ struct EpubContentView: View {
             .disabled(!hasNextChapter)
             .opacity(hasNextChapter ? 1.0 : 0.3)
         }
-        .padding(.vertical, 12)
-        .padding(.horizontal, 4)
+        .padding(.vertical, ReaderLayoutTokens.navigationBlockPadding)
+        .padding(.horizontal, ReaderLayoutTokens.navigationInlinePadding)
     }
 }
 
 // MARK: - Preview
 
 #Preview {
-    EpubContentView(
+    ReaderDocumentView(
         chapters: [
             EpubChapter(
                 id: "ch-1",
@@ -227,7 +243,7 @@ struct EpubContentView: View {
         ],
         currentChapterId: "ch-1",
         currentSentenceIndex: 1,
-        currentWordProgress: 0.5,
+        currentWordRange: ReadioScalarRange(start: 9, end: 13),
         onSentenceClick: { _ in },
         onChapterChange: { _ in }
     )

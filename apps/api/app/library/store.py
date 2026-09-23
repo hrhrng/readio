@@ -1,12 +1,37 @@
 from __future__ import annotations
 
+import json
 import math
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from app.library.models import CreateLibraryItemRequest, LibraryItem, LibraryItemSummary
+from app.library.models import (
+    BookmarkMutationRequest,
+    BookmarkMutationResponse,
+    BookmarkRecord,
+    CreateLibraryItemRequest,
+    LibraryItem,
+    LibraryItemSummary,
+    PositionCandidate,
+    PositionMutationResponse,
+    ReadingPositionMutation,
+    ReadingPositionRecord,
+)
+
+
+class MutationIdReuseError(ValueError):
+    pass
+
+
+class BookmarkIdCollisionError(ValueError):
+    pass
+
+
+def _u64_text(value: int) -> str:
+    """Bind Rust-compatible unsigned values without SQLite's signed-int ceiling."""
+    return str(value)
 
 
 def _format_library_date(now: datetime) -> str:
@@ -115,6 +140,79 @@ class LibraryStore:
                     key TEXT NOT NULL,
                     value TEXT NOT NULL,
                     PRIMARY KEY (user_id, key)
+                )
+                '''
+            )
+            connection.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS reading_positions (
+                    item_id TEXT PRIMARY KEY,
+                    document_revision TEXT NOT NULL,
+                    char_offset TEXT NOT NULL,
+                    affinity TEXT NOT NULL,
+                    observed_at_unix_ms INTEGER NOT NULL,
+                    session_id TEXT NOT NULL,
+                    mutation_id TEXT NOT NULL,
+                    base_version TEXT NOT NULL,
+                    version TEXT NOT NULL
+                )
+                '''
+            )
+            connection.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS reading_position_mutations (
+                    mutation_id TEXT PRIMARY KEY,
+                    item_id TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    result_json TEXT NOT NULL
+                )
+                '''
+            )
+            connection.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS reading_position_conflicts (
+                    conflict_id TEXT PRIMARY KEY,
+                    item_id TEXT NOT NULL,
+                    base_version TEXT NOT NULL,
+                    current_json TEXT,
+                    incoming_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                '''
+            )
+            connection.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS bookmarks (
+                    id TEXT PRIMARY KEY,
+                    item_id TEXT NOT NULL,
+                    char_offset TEXT NOT NULL,
+                    affinity TEXT NOT NULL,
+                    note TEXT NOT NULL,
+                    created_at_unix_ms INTEGER NOT NULL,
+                    updated_at_unix_ms INTEGER NOT NULL,
+                    version TEXT NOT NULL,
+                    UNIQUE(item_id, char_offset)
+                )
+                '''
+            )
+            connection.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS bookmark_mutations (
+                    mutation_id TEXT PRIMARY KEY,
+                    item_id TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    result_json TEXT NOT NULL
+                )
+                '''
+            )
+            connection.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS bookmark_delete_mutations (
+                    mutation_id TEXT PRIMARY KEY,
+                    item_id TEXT NOT NULL,
+                    bookmark_id TEXT NOT NULL,
+                    base_version TEXT NOT NULL,
+                    result TEXT NOT NULL
                 )
                 '''
             )
@@ -373,6 +471,409 @@ class LibraryStore:
             )
             connection.commit()
             return cursor.rowcount > 0
+
+    def get_reading_position(self, item_id: str) -> ReadingPositionRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                '''
+                SELECT document_revision, char_offset, affinity, observed_at_unix_ms,
+                       session_id, mutation_id, base_version, version
+                FROM reading_positions
+                WHERE item_id = ?
+                ''',
+                (item_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return ReadingPositionRecord(**dict(row))
+
+    def apply_reading_position(
+        self,
+        item_id: str,
+        mutation: ReadingPositionMutation,
+    ) -> PositionMutationResponse | None:
+        payload_json = json.dumps(
+            mutation.model_dump(mode='json'),
+            ensure_ascii=False,
+            separators=(',', ':'),
+            sort_keys=True,
+        )
+
+        with self._connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            item = connection.execute(
+                'SELECT id FROM library_items WHERE id = ?',
+                (item_id,),
+            ).fetchone()
+            if item is None:
+                connection.rollback()
+                return None
+
+            replay = connection.execute(
+                '''
+                SELECT item_id, payload_json, result_json
+                FROM reading_position_mutations
+                WHERE mutation_id = ?
+                ''',
+                (mutation.mutation_id,),
+            ).fetchone()
+            if replay is not None:
+                if replay['item_id'] != item_id or replay['payload_json'] != payload_json:
+                    connection.rollback()
+                    raise MutationIdReuseError(
+                        'mutation_id was already used with a different position payload'
+                    )
+                connection.rollback()
+                result = PositionMutationResponse.model_validate_json(replay['result_json'])
+                return result.model_copy(update={'idempotent_replay': True})
+
+            row = connection.execute(
+                '''
+                SELECT document_revision, char_offset, affinity, observed_at_unix_ms,
+                       session_id, mutation_id, base_version, version
+                FROM reading_positions
+                WHERE item_id = ?
+                ''',
+                (item_id,),
+            ).fetchone()
+            current = ReadingPositionRecord(**dict(row)) if row is not None else None
+            current_version = current.version if current is not None else 0
+
+            if mutation.base_version != current_version:
+                incoming = ReadingPositionRecord(
+                    **mutation.model_dump(),
+                    version=max(1, mutation.base_version),
+                )
+                candidates = [
+                    PositionCandidate(origin='current', **current.model_dump())
+                ] if current is not None else []
+                candidates.append(PositionCandidate(origin='incoming', **incoming.model_dump()))
+                conflict_id = f'position-conflict-{uuid4().hex}'
+                result = PositionMutationResponse(
+                    status='conflict',
+                    version=current_version,
+                    position=current,
+                    conflict_id=conflict_id,
+                    candidates=candidates,
+                )
+                connection.execute(
+                    '''
+                    INSERT INTO reading_position_conflicts (
+                        conflict_id, item_id, base_version, current_json, incoming_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ''',
+                    (
+                        conflict_id,
+                        item_id,
+                        _u64_text(mutation.base_version),
+                        current.model_dump_json() if current is not None else None,
+                        incoming.model_dump_json(),
+                        datetime.now(UTC).isoformat() + 'Z',
+                    ),
+                )
+                self._record_position_mutation(
+                    connection,
+                    item_id,
+                    mutation.mutation_id,
+                    payload_json,
+                    result,
+                )
+                connection.commit()
+                return result
+
+            next_version = current_version + 1
+            position = ReadingPositionRecord(
+                **mutation.model_dump(),
+                version=next_version,
+            )
+            connection.execute(
+                '''
+                INSERT INTO reading_positions (
+                    item_id, document_revision, char_offset, affinity, observed_at_unix_ms,
+                    session_id, mutation_id, base_version, version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(item_id) DO UPDATE SET
+                    document_revision = excluded.document_revision,
+                    char_offset = excluded.char_offset,
+                    affinity = excluded.affinity,
+                    observed_at_unix_ms = excluded.observed_at_unix_ms,
+                    session_id = excluded.session_id,
+                    mutation_id = excluded.mutation_id,
+                    base_version = excluded.base_version,
+                    version = excluded.version
+                ''',
+                (
+                    item_id,
+                    position.document_revision,
+                    _u64_text(position.char_offset),
+                    position.affinity,
+                    position.observed_at_unix_ms,
+                    position.session_id,
+                    position.mutation_id,
+                    _u64_text(position.base_version),
+                    _u64_text(position.version),
+                ),
+            )
+            result = PositionMutationResponse(
+                status='applied',
+                version=next_version,
+                position=position,
+            )
+            self._record_position_mutation(
+                connection,
+                item_id,
+                mutation.mutation_id,
+                payload_json,
+                result,
+            )
+            connection.commit()
+            return result
+
+    @staticmethod
+    def _record_position_mutation(
+        connection: sqlite3.Connection,
+        item_id: str,
+        mutation_id: str,
+        payload_json: str,
+        result: PositionMutationResponse,
+    ) -> None:
+        connection.execute(
+            '''
+            INSERT INTO reading_position_mutations (
+                mutation_id, item_id, payload_json, result_json
+            ) VALUES (?, ?, ?, ?)
+            ''',
+            (mutation_id, item_id, payload_json, result.model_dump_json()),
+        )
+
+    def list_bookmarks(self, item_id: str) -> list[BookmarkRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                '''
+                SELECT id, item_id, char_offset, affinity, note,
+                       created_at_unix_ms, updated_at_unix_ms, version
+                FROM bookmarks
+                WHERE item_id = ?
+                ORDER BY length(char_offset), char_offset, created_at_unix_ms, id
+                ''',
+                (item_id,),
+            ).fetchall()
+        return [BookmarkRecord(**dict(row)) for row in rows]
+
+    def apply_bookmark(
+        self,
+        item_id: str,
+        mutation: BookmarkMutationRequest,
+    ) -> BookmarkMutationResponse | None:
+        payload_json = json.dumps(
+            mutation.model_dump(mode='json'),
+            ensure_ascii=False,
+            separators=(',', ':'),
+            sort_keys=True,
+        )
+
+        with self._connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            item = connection.execute(
+                'SELECT id FROM library_items WHERE id = ?',
+                (item_id,),
+            ).fetchone()
+            if item is None:
+                connection.rollback()
+                return None
+
+            replay = connection.execute(
+                '''
+                SELECT item_id, payload_json, result_json
+                FROM bookmark_mutations
+                WHERE mutation_id = ?
+                ''',
+                (mutation.mutation_id,),
+            ).fetchone()
+            if replay is not None:
+                if replay['item_id'] != item_id or replay['payload_json'] != payload_json:
+                    connection.rollback()
+                    raise MutationIdReuseError(
+                        'mutation_id was already used with a different bookmark payload'
+                    )
+                connection.rollback()
+                result = BookmarkMutationResponse.model_validate_json(replay['result_json'])
+                return result.model_copy(update={'idempotent_replay': True})
+
+            row = connection.execute(
+                '''
+                SELECT id, item_id, char_offset, affinity, note,
+                       created_at_unix_ms, updated_at_unix_ms, version
+                FROM bookmarks
+                WHERE item_id = ? AND char_offset = ?
+                ''',
+                (item_id, _u64_text(mutation.char_offset)),
+            ).fetchone()
+            current = BookmarkRecord(**dict(row)) if row is not None else None
+
+            if current is not None and mutation.base_version != current.version:
+                result = BookmarkMutationResponse(status='conflict', bookmark=current)
+                self._record_bookmark_mutation(
+                    connection,
+                    item_id,
+                    mutation.mutation_id,
+                    payload_json,
+                    result,
+                )
+                connection.commit()
+                return result
+
+            if current is None and mutation.base_version != 0:
+                result = BookmarkMutationResponse(status='conflict')
+                self._record_bookmark_mutation(
+                    connection,
+                    item_id,
+                    mutation.mutation_id,
+                    payload_json,
+                    result,
+                )
+                connection.commit()
+                return result
+
+            if current is None:
+                collision = connection.execute(
+                    'SELECT id FROM bookmarks WHERE id = ?',
+                    (mutation.bookmark_id,),
+                ).fetchone()
+                if collision is not None:
+                    connection.rollback()
+                    raise BookmarkIdCollisionError(
+                        'bookmark_id already belongs to another offset'
+                    )
+
+            bookmark = BookmarkRecord(
+                id=current.id if current is not None else mutation.bookmark_id,
+                item_id=item_id,
+                char_offset=mutation.char_offset,
+                affinity=mutation.affinity,
+                note=mutation.note.strip(),
+                created_at_unix_ms=(
+                    current.created_at_unix_ms
+                    if current is not None
+                    else mutation.created_at_unix_ms
+                ),
+                updated_at_unix_ms=mutation.updated_at_unix_ms,
+                version=current.version + 1 if current is not None else 1,
+            )
+            connection.execute(
+                '''
+                INSERT INTO bookmarks (
+                    id, item_id, char_offset, affinity, note,
+                    created_at_unix_ms, updated_at_unix_ms, version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    affinity = excluded.affinity,
+                    note = excluded.note,
+                    updated_at_unix_ms = excluded.updated_at_unix_ms,
+                    version = excluded.version
+                ''',
+                (
+                    bookmark.id,
+                    bookmark.item_id,
+                    _u64_text(bookmark.char_offset),
+                    bookmark.affinity,
+                    bookmark.note,
+                    bookmark.created_at_unix_ms,
+                    bookmark.updated_at_unix_ms,
+                    _u64_text(bookmark.version),
+                ),
+            )
+            result = BookmarkMutationResponse(status='applied', bookmark=bookmark)
+            self._record_bookmark_mutation(
+                connection,
+                item_id,
+                mutation.mutation_id,
+                payload_json,
+                result,
+            )
+            connection.commit()
+            return result
+
+    @staticmethod
+    def _record_bookmark_mutation(
+        connection: sqlite3.Connection,
+        item_id: str,
+        mutation_id: str,
+        payload_json: str,
+        result: BookmarkMutationResponse,
+    ) -> None:
+        connection.execute(
+            '''
+            INSERT INTO bookmark_mutations (
+                mutation_id, item_id, payload_json, result_json
+            ) VALUES (?, ?, ?, ?)
+            ''',
+            (mutation_id, item_id, payload_json, result.model_dump_json()),
+        )
+
+    def delete_bookmark(
+        self,
+        item_id: str,
+        bookmark_id: str,
+        base_version: int,
+        mutation_id: str,
+    ) -> str:
+        with self._connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            replay = connection.execute(
+                '''
+                SELECT item_id, bookmark_id, base_version, result
+                FROM bookmark_delete_mutations
+                WHERE mutation_id = ?
+                ''',
+                (mutation_id,),
+            ).fetchone()
+            if replay is not None:
+                if (
+                    replay['item_id'] != item_id
+                    or replay['bookmark_id'] != bookmark_id
+                    or int(replay['base_version']) != base_version
+                ):
+                    connection.rollback()
+                    raise MutationIdReuseError(
+                        'mutation_id was already used with a different bookmark delete payload'
+                    )
+                connection.rollback()
+                return str(replay['result'])
+
+            row = connection.execute(
+                '''
+                SELECT version FROM bookmarks
+                WHERE id = ? AND item_id = ?
+                ''',
+                (bookmark_id, item_id),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                return 'not_found'
+
+            result = 'deleted' if int(row['version']) == base_version else 'conflict'
+            if result == 'deleted':
+                connection.execute(
+                    'DELETE FROM bookmarks WHERE id = ? AND item_id = ?',
+                    (bookmark_id, item_id),
+                )
+            connection.execute(
+                '''
+                INSERT INTO bookmark_delete_mutations (
+                    mutation_id, item_id, bookmark_id, base_version, result
+                ) VALUES (?, ?, ?, ?, ?)
+                ''',
+                (
+                    mutation_id,
+                    item_id,
+                    bookmark_id,
+                    _u64_text(base_version),
+                    result,
+                ),
+            )
+            connection.commit()
+            return result
 
     def delete_item(self, item_id: str) -> bool:
         with self._connect() as connection:

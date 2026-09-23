@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::Result;
+use readio_sdk::position::TextLocator;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -25,6 +26,11 @@ pub struct Progress {
     pub sessions: u32,
     #[serde(default)]
     pub updated: u64,
+    /// Renderer-independent place in the canonical Rust Document IR. Older
+    /// state files keep using `chars_read`; new writes carry both so a parser
+    /// revision or an inserted block can recover the same reading intent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locator: Option<TextLocator>,
     /// Fine-grained read-aloud position inside the passage that starts at
     /// `(chapter, para)`. Ordinary reading still commits whole paragraph
     /// windows; speech additionally keeps the current sentence so a process
@@ -127,6 +133,34 @@ impl Store {
 
     pub fn get(&self, id: &str) -> Option<&Progress> {
         self.books.get(id)
+    }
+
+    /// Moves a record written under an older identity to its canonical key.
+    /// Existing canonical progress wins; aliases are removed either way so the
+    /// next sync cannot publish two positions for the same virtual document.
+    pub fn migrate_book_key(
+        &mut self,
+        canonical_id: &str,
+        legacy_ids: &[String],
+    ) -> Option<Progress> {
+        if let Some(progress) = self.books.get(canonical_id).cloned() {
+            for legacy_id in legacy_ids {
+                self.books.remove(legacy_id);
+            }
+            return Some(progress);
+        }
+
+        let progress = legacy_ids
+            .iter()
+            .find_map(|legacy_id| self.books.remove(legacy_id));
+        for legacy_id in legacy_ids {
+            self.books.remove(legacy_id);
+        }
+        if let Some(progress) = progress.as_ref() {
+            self.books
+                .insert(canonical_id.to_string(), progress.clone());
+        }
+        progress
     }
 
     pub fn record(&mut self, id: &str, progress: Progress) {

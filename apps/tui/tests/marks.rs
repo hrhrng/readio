@@ -153,6 +153,7 @@ fn a_stale_chapter_index_does_not_send_a_mark_to_the_wrong_page() {
             chars_read: 0,
             sessions: 1,
             updated: 0,
+            locator: None,
             speech: None,
             marks: vec![Mark {
                 chars,

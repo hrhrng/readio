@@ -1,61 +1,40 @@
 import {
   LibraryItem,
+  LibraryItemCategory,
   LibraryItemsResponse,
+  LibraryItemType,
   TTSJobCreateParams,
   TTSJobStatusResponse,
   VoiceListResponse,
 } from "./types";
+import { getBrowserLocalReplicaStore } from "./browser-local-replica";
+import type { LocalReplicaStore } from "./local-replica-store";
+import { webReadioSdk } from "./readio-core-runtime";
+import type { ImportRecord, RustCoreClient } from "./rust-core";
+import { webDiagnostics, type WebDiagnosticLog } from "./diagnostics";
+
+export {
+  fetchReadingPosition,
+  ReadingPositionConflictError,
+  saveReadingPosition,
+} from "./reading-position-api";
 
 const BASE = "";
-
-// Direct backend URL for large uploads (bypasses Next.js proxy 10MB limit)
-const API_DIRECT =
-  process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const BUILTIN_SAMPLE_ITEM_ID = "readio:sample:v1";
 
 /** Wrapper around fetch that includes credentials for cookie-based auth. */
 function apiFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
   return fetch(input, { credentials: "include", ...init });
 }
 
-/**
- * Extract cover image from an EPUB file using epub.js.
- *
- * epub.js reliably locates covers across EPUB 2/3 formats via `book.coverUrl()`,
- * which is more reliable than backend ZipFile-based parsing and has no size limit.
- * The returned data URL is sent as an extra form field during upload so the
- * backend can use it directly instead of its own (size-limited) extraction.
- */
-async function extractEpubCover(file: File): Promise<string | null> {
-  try {
-    const ePub = (await import("epubjs")).default;
-    const arrayBuffer = await file.arrayBuffer();
-    const book = ePub(arrayBuffer);
-    await book.ready;
-
-    const coverUrl = await book.coverUrl();
-    if (!coverUrl) {
-      book.destroy();
-      return null;
-    }
-
-    // Convert the blob URL produced by epub.js into a base64 data URL
-    // that the backend can store directly.
-    const response = await fetch(coverUrl);
-    const blob = await response.blob();
-    const dataUrl = await new Promise<string>((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onloadend = () => resolve(reader.result as string);
-      reader.onerror = reject;
-      reader.readAsDataURL(blob);
-    });
-
-    URL.revokeObjectURL(coverUrl);
-    book.destroy();
-    return dataUrl;
-  } catch {
-    // Cover extraction failure should never block the upload
-    return null;
-  }
+function responseErrorMessage(value: unknown): string | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const body = value as Record<string, unknown>;
+  if (typeof body.detail === "string") return body.detail;
+  const nested = body.error;
+  if (!nested || typeof nested !== "object" || Array.isArray(nested)) return undefined;
+  const message = (nested as Record<string, unknown>).message;
+  return typeof message === "string" ? message : undefined;
 }
 
 interface FetchItemsParams {
@@ -71,100 +50,553 @@ interface FetchItemsParams {
   progress_max?: number;
 }
 
+function libraryCategory(value?: string): LibraryItemCategory | undefined {
+  if (value === undefined) return undefined;
+  if (value === "imported" || value === "podcasts") return value;
+  throw new Error(`Unsupported library category: ${value}`);
+}
+
+function libraryItemType(value?: string): LibraryItemType | undefined {
+  if (value === undefined) return undefined;
+  if (value === "web" || value === "txt" || value === "pdf" || value === "epub") {
+    return value;
+  }
+  throw new Error(`Unsupported library item type: ${value}`);
+}
+
+function librarySortBy(
+  value?: string
+): "created_at" | "title" | "progress" | undefined {
+  if (value === undefined) return undefined;
+  if (value === "created_at" || value === "title" || value === "progress") {
+    return value;
+  }
+  throw new Error(`Unsupported library sort: ${value}`);
+}
+
+function librarySortOrder(
+  value?: string
+): "ascending" | "descending" | undefined {
+  if (value === undefined) return undefined;
+  if (value === "asc" || value === "ascending") return "ascending";
+  if (value === "desc" || value === "descending") return "descending";
+  throw new Error(`Unsupported library sort order: ${value}`);
+}
+
+function importedFileType(fileName: string): LibraryItemType {
+  const extension = fileName.split(".").pop()?.toLowerCase();
+  if (extension === "pdf" || extension === "epub") return extension;
+  if (extension === "txt" || extension === "md" || extension === "markdown") {
+    return "txt";
+  }
+  throw new Error(`Unsupported local file type: ${extension ?? "unknown"}`);
+}
+
+function isMarkdownFileName(fileName: string): boolean {
+  const extension = fileName.split(".").pop()?.toLowerCase();
+  return extension === "md" || extension === "markdown";
+}
+
+function diagnosticFileFormat(
+  fileName: string,
+  type: LibraryItemType
+): string {
+  if (isMarkdownFileName(fileName)) return "markdown";
+  return type === "txt" ? "plain_text" : type;
+}
+
+function titleFromFileName(fileName: string): string {
+  const title = fileName.replace(/\.[^.]+$/, "").trim();
+  return title || "Untitled";
+}
+
+function mediaTypeFor(type: LibraryItemType): string {
+  if (type === "pdf") return "application/pdf";
+  if (type === "epub") return "application/epub+zip";
+  return "text/plain";
+}
+
 export async function fetchItems(
-  params: FetchItemsParams = {}
+  params: FetchItemsParams = {},
+  store?: LocalReplicaStore
 ): Promise<LibraryItemsResponse> {
-  const url = new URL("/api/library/items", window.location.origin);
+  const local = store ?? (await getBrowserLocalReplicaStore());
+  return local.queryLibrary({
+    category: libraryCategory(params.category),
+    search: params.search,
+    folder_id: params.folder_id,
+    type: libraryItemType(params.type),
+    page: params.page,
+    page_size: params.page_size,
+    sort_by: librarySortBy(params.sort_by),
+    sort_order: librarySortOrder(params.sort_order),
+    progress_min: params.progress_min,
+    progress_max: params.progress_max,
+  });
+}
 
-  Object.entries(params).forEach(([key, value]) => {
-    if (value !== undefined && value !== null) {
-      url.searchParams.set(key, String(value));
+export async function fetchItem(
+  id: string,
+  store?: LocalReplicaStore,
+  core: Pick<RustCoreClient, "builtinSample"> = webReadioSdk,
+  languageTag = preferredLanguageTag()
+): Promise<LibraryItem> {
+  if (id === BUILTIN_SAMPLE_ITEM_ID) {
+    const sample = await core.builtinSample(languageTag);
+    if (sample.item_id !== BUILTIN_SAMPLE_ITEM_ID) {
+      throw new Error(`Rust Core returned an unexpected sample: ${sample.item_id}`);
     }
-  });
+    return {
+      id: sample.item_id,
+      legacy_item_ids: sample.legacy_item_ids,
+      locale: sample.locale,
+      title: sample.title,
+      author: sample.author,
+      content: sample.content,
+      type: "txt",
+      progress: 0,
+      date: "",
+      category: "imported",
+      folder_id: "",
+      source: sample.source,
+      file_path: null,
+      cover_image: null,
+      voice: null,
+      speed: null,
+      current_chapter: null,
+      content_format: sample.content_format,
+      markdown_source: sample.markdown_source,
+      is_builtin_sample: sample.is_builtin_sample,
+    };
+  }
 
-  const res = await apiFetch(url.toString());
-  if (!res.ok) throw new Error(`Failed to fetch items: ${res.status}`);
-  return res.json();
+  const local = store ?? (await getBrowserLocalReplicaStore());
+  const [item, content] = await Promise.all([
+    local.libraryItem(id),
+    local.libraryContent(id),
+  ]);
+  if (!item) throw new Error(`Library item not found: ${id}`);
+  return { ...item, content: content?.content ?? "" };
 }
 
-export async function fetchItem(id: string): Promise<LibraryItem> {
-  const res = await apiFetch(`${BASE}/api/library/items/${id}`);
-  if (!res.ok) throw new Error(`Failed to fetch item: ${res.status}`);
-  return res.json();
+function preferredLanguageTag(): string {
+  if (typeof navigator === "undefined") return "en";
+  return navigator.languages[0] || navigator.language || "en";
 }
 
-export async function deleteItem(id: string): Promise<void> {
-  const res = await apiFetch(`${BASE}/api/library/items/${id}`, {
-    method: "DELETE",
-  });
-  if (!res.ok) throw new Error(`Failed to delete item: ${res.status}`);
+export async function deleteItem(
+  id: string,
+  store?: LocalReplicaStore,
+  core: Pick<RustCoreClient, "planForget"> = webReadioSdk
+): Promise<void> {
+  const local = store ?? (await getBrowserLocalReplicaStore());
+  const item = await local.libraryItem(id);
+  const effects = item?.import_record
+    ? await core.planForget(item.import_record)
+    : [{ type: "delete_owned_content" as const, storage_key: `local:${id}` }];
+  await local.delete([{ entityKind: "library_item", entityId: id }]);
+  if (effects.some((effect) => effect.type === "delete_owned_content")) {
+    // Browser-owned content is keyed by item identity; storage_key remains the
+    // portable address used by Rust and other platform adapters.
+    await local.deleteLibraryContent(id);
+  }
 }
 
 export async function searchItems(
-  query: string
+  query: string,
+  store?: LocalReplicaStore
 ): Promise<LibraryItemsResponse> {
-  return fetchItems({ search: query, page_size: 50 });
+  return fetchItems({ search: query, page_size: 50 }, store);
+}
+
+export type ImportProgressStage =
+  | "reading_source"
+  | "acquiring"
+  | "identifying"
+  | "parsing"
+  | "saving"
+  | "complete";
+
+export interface ImportProgress {
+  stage: ImportProgressStage;
+  completed: number;
+  total: number;
+}
+
+interface ImportOptions {
+  folder_id?: string;
+  category?: string;
+  title?: string;
+  diagnostics?: Pick<WebDiagnosticLog, "beginOperation" | "record">;
+  signal?: AbortSignal;
+  onProgress?: (progress: ImportProgress) => void;
+}
+
+function throwIfImportCancelled(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw new DOMException("Import cancelled", "AbortError");
+  }
+}
+
+function reportImportProgress(
+  options: ImportOptions,
+  stage: ImportProgressStage,
+  completed: number,
+  total: number
+): void {
+  throwIfImportCancelled(options.signal);
+  options.onProgress?.({ stage, completed, total });
+  // A progress callback may synchronously cancel the operation. Observe that
+  // before starting the next expensive or durable phase.
+  throwIfImportCancelled(options.signal);
 }
 
 export async function importFile(
   file: File,
-  options: { folder_id?: string; category?: string; title?: string } = {}
+  options: ImportOptions = {},
+  store?: LocalReplicaStore,
+  core: Pick<
+    RustCoreClient,
+    "contentIdentity" | "parseEPUB" | "parsePDF" | "planImport"
+  > = webReadioSdk
 ): Promise<LibraryItem> {
-  const formData = new FormData();
-  formData.append("file", file);
-  formData.append("folder_id", options.folder_id ?? "f1");
-  formData.append("category", options.category ?? "imported");
-  if (options.title) formData.append("title", options.title);
-
-  // For EPUB files, extract the cover on the frontend using epub.js — it's more
-  // reliable than backend ZipFile parsing and has no size limit.
-  if (file.name.toLowerCase().endsWith(".epub")) {
-    try {
-      const cover = await extractEpubCover(file);
-      if (cover) {
-        formData.append("cover_image", cover);
+  const diagnostics = options.diagnostics ?? webDiagnostics;
+  const operationId = diagnostics.beginOperation();
+  const local = store ?? (await getBrowserLocalReplicaStore());
+  reportImportProgress(options, "reading_source", 0, 4);
+  const type = importedFileType(file.name);
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  reportImportProgress(options, "identifying", 1, 4);
+  const identity = await core.contentIdentity(bytes);
+  throwIfImportCancelled(options.signal);
+  const ownedStorageKey = `local:${identity.digest}`;
+  const existingItem = await local.libraryItem(identity.digest);
+  const existing: ImportRecord | null = existingItem
+    ? {
+        item_id: existingItem.id,
+        content_identity: identity,
+        ownership: "copy",
+        source_key: existingItem.source,
+        storage_key: existingItem.file_path ?? ownedStorageKey,
       }
-    } catch {
-      // Never block the upload on cover extraction failure
-    }
+    : null;
+  const plan = await core.planImport({
+    content_identity: identity,
+    ownership: "copy",
+    source_key: `browser-file:${file.name}`,
+    owned_storage_key: ownedStorageKey,
+    existing,
+  });
+  throwIfImportCancelled(options.signal);
+  if (plan.outcome === "reused") {
+    diagnostics.record({
+      operationId,
+      component: "web-library",
+      category: "import",
+      name: "import_completed",
+      fields: {
+        source_kind: "file",
+        document_format: diagnosticFileFormat(file.name, type),
+        byte_count: bytes.byteLength,
+        duplicate: true,
+        outcome: "reused",
+      },
+    });
+    const item = await fetchItem(plan.record.item_id, local);
+    reportImportProgress(options, "complete", 4, 4);
+    return item;
   }
 
-  const res = await apiFetch(`${API_DIRECT}/api/library/import/file`, {
-    method: "POST",
-    body: formData,
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => null);
-    throw new Error(body?.detail ?? `Import failed: ${res.status}`);
+  const id = plan.record.item_id;
+  let content: string;
+  let contentFormat: string;
+  let inferredTitle: string | null = null;
+  let inferredAuthor: string | null = null;
+  let inferredCoverImage: string | null = null;
+  reportImportProgress(options, "parsing", 2, 4);
+  if (type === "txt") {
+    content = new TextDecoder().decode(bytes);
+    contentFormat = isMarkdownFileName(file.name) ? "markdown" : "plaintext";
+  } else if (type === "pdf") {
+    const parsed = await core.parsePDF(bytes);
+    throwIfImportCancelled(options.signal);
+    content = JSON.stringify(parsed);
+    contentFormat = "readio-pdf-v1";
+    inferredTitle = parsed.title?.trim() || null;
+    inferredAuthor = parsed.author?.trim() || null;
+    diagnostics.record({
+      operationId,
+      component: "web-reader-parser",
+      category: "parsing",
+      name: "parse_completed",
+      fields: {
+        document_format: "pdf",
+        byte_count: bytes.byteLength,
+        block_count: parsed.chapters.reduce(
+          (count, chapter) => count + chapter.document.blocks.length,
+          0
+        ),
+        chapter_count: parsed.chapters.length,
+        outcome: "completed",
+      },
+    });
+  } else {
+    const publication = await core.parseEPUB(bytes);
+    throwIfImportCancelled(options.signal);
+    content = JSON.stringify(publication);
+    contentFormat = "readio-epub-v1";
+    inferredTitle = publication.title?.trim() || null;
+    inferredAuthor = publication.author?.trim() || null;
+    inferredCoverImage = publication.cover_asset_id
+      ? `readio-epub-asset:${publication.cover_asset_id}`
+      : null;
+    diagnostics.record({
+      operationId,
+      component: "web-reader-parser",
+      category: "parsing",
+      name: "parse_completed",
+      fields: {
+        document_format: "epub",
+        byte_count: bytes.byteLength,
+        block_count: publication.chapters.reduce(
+          (count, chapter) => count + chapter.document.blocks.length,
+          0
+        ),
+        chapter_count: publication.chapters.length,
+        outcome: "completed",
+      },
+    });
   }
-  return res.json();
+  const item: LibraryItem = {
+    id,
+    title:
+      options.title?.trim() || inferredTitle || titleFromFileName(file.name),
+    ...(inferredAuthor ? { author: inferredAuthor } : {}),
+    content,
+    type,
+    progress: 0,
+    date: new Date().toISOString(),
+    category: libraryCategory(options.category) ?? "imported",
+    folder_id: options.folder_id ?? "f1",
+    source: file.name,
+    file_path: plan.record.storage_key,
+    cover_image: inferredCoverImage,
+    voice: null,
+    speed: null,
+    current_chapter: null,
+    content_format: contentFormat,
+    import_record: plan.record,
+  };
+
+  reportImportProgress(options, "saving", 3, 4);
+
+  for (const effect of plan.effects) {
+    if (effect.type !== "write_owned_content") continue;
+    await local.saveLibraryContent({
+      itemId: id,
+      content,
+      fileBytes: bytes,
+      mediaType: file.type || mediaTypeFor(type),
+      fileName: file.name,
+    });
+    throwIfImportCancelled(options.signal);
+  }
+  try {
+    const { content: _content, ...metadata } = item;
+    await local.upsert([
+      { entityKind: "library_item", entityId: id, payload: metadata },
+    ]);
+    throwIfImportCancelled(options.signal);
+  } catch (error) {
+    await local.deleteLibraryContent(id);
+    throw error;
+  }
+  diagnostics.record({
+    operationId,
+    component: "web-library",
+    category: "import",
+    name: "import_completed",
+    fields: {
+      source_kind: "file",
+      document_format: diagnosticFileFormat(file.name, type),
+      byte_count: bytes.byteLength,
+      duplicate: false,
+      outcome: plan.outcome,
+    },
+  });
+  reportImportProgress(options, "complete", 4, 4);
+  return item;
 }
 
 export async function importUrl(
   url: string,
-  options: { folder_id?: string; category?: string; title?: string } = {}
+  options: ImportOptions = {},
+  store?: LocalReplicaStore,
+  core: Pick<
+    RustCoreClient,
+    "contentIdentity" | "parseHTML" | "planImport"
+  > = webReadioSdk
 ): Promise<LibraryItem> {
-  const res = await apiFetch(`${BASE}/api/library/import/url`, {
+  const diagnostics = options.diagnostics ?? webDiagnostics;
+  const operationId = diagnostics.beginOperation();
+  reportImportProgress(options, "acquiring", 0, 4);
+  const res = await apiFetch(`${BASE}/api/cloud/v1/acquire/url`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      url,
-      folder_id: options.folder_id ?? "f1",
-      category: options.category ?? "imported",
-      title: options.title || undefined,
-    }),
+    body: JSON.stringify({ url }),
+    signal: options.signal,
   });
+  throwIfImportCancelled(options.signal);
   if (!res.ok) {
-    const body = await res.json().catch(() => null);
-    throw new Error(body?.detail ?? `Import failed: ${res.status}`);
+    const body: unknown = await res.json().catch(() => null);
+    throw new Error(responseErrorMessage(body) ?? `Import failed: ${res.status}`);
   }
-  return res.json();
+  const acquired = (await res.json()) as {
+    final_url: string;
+    media_type: string;
+    html: string;
+  };
+  reportImportProgress(options, "parsing", 1, 4);
+  const local = store ?? (await getBrowserLocalReplicaStore());
+  const sourceBytes = new TextEncoder().encode(acquired.html);
+  const document = await core.parseHTML(acquired.html, {
+    max_input_bytes: sourceBytes.byteLength,
+    max_blocks: 100_000,
+    base_url: acquired.final_url,
+  });
+  throwIfImportCancelled(options.signal);
+  diagnostics.record({
+    operationId,
+    component: "web-reader-parser",
+    category: "parsing",
+    name: "parse_completed",
+    fields: {
+      document_format: "html",
+      byte_count: sourceBytes.byteLength,
+      block_count: document.blocks.length,
+      chapter_count: 1,
+      outcome: "completed",
+    },
+  });
+  const content = document.blocks.map((block) => block.text).join("\n");
+  if (!content.trim()) throw new Error("No readable content was found at this URL");
+  reportImportProgress(options, "identifying", 2, 4);
+  const identity = await core.contentIdentity(new TextEncoder().encode(content));
+  throwIfImportCancelled(options.signal);
+  const ownedStorageKey = `local:${identity.digest}`;
+  const existingItem = await local.libraryItem(identity.digest);
+  const existing: ImportRecord | null = existingItem
+    ? existingItem.import_record ?? {
+        item_id: existingItem.id,
+        content_identity: identity,
+        ownership: "copy",
+        source_key: existingItem.source,
+        storage_key: existingItem.file_path ?? ownedStorageKey,
+      }
+    : null;
+  const plan = await core.planImport({
+    content_identity: identity,
+    ownership: "copy",
+    source_key: `url:${acquired.final_url}`,
+    owned_storage_key: ownedStorageKey,
+    existing,
+  });
+  throwIfImportCancelled(options.signal);
+  if (plan.outcome === "reused") {
+    diagnostics.record({
+      operationId,
+      component: "web-library",
+      category: "import",
+      name: "import_completed",
+      fields: {
+        source_kind: "url",
+        document_format: "html",
+        byte_count: sourceBytes.byteLength,
+        duplicate: true,
+        outcome: "reused",
+      },
+    });
+    const item = await fetchItem(plan.record.item_id, local);
+    reportImportProgress(options, "complete", 4, 4);
+    return item;
+  }
+
+  const heading = document.blocks.find((block) => block.kind.type === "heading")?.text;
+  const item: LibraryItem = {
+    id: plan.record.item_id,
+    title:
+      options.title?.trim() ||
+      heading?.trim() ||
+      new URL(acquired.final_url).hostname ||
+      "Untitled",
+    content,
+    type: "web",
+    progress: 0,
+    date: new Date().toISOString(),
+    category: libraryCategory(options.category) ?? "imported",
+    folder_id: options.folder_id ?? "f1",
+    source: acquired.final_url,
+    file_path: plan.record.storage_key,
+    cover_image: null,
+    voice: null,
+    speed: null,
+    current_chapter: null,
+    content_format: "plaintext",
+    import_record: plan.record,
+  };
+  reportImportProgress(options, "saving", 3, 4);
+  for (const effect of plan.effects) {
+    if (effect.type !== "write_owned_content") continue;
+    await local.saveLibraryContent({
+      itemId: item.id,
+      content,
+      fileBytes: sourceBytes,
+      mediaType: acquired.media_type || "text/html",
+      fileName: null,
+    });
+    throwIfImportCancelled(options.signal);
+  }
+  try {
+    const { content: _content, ...metadata } = item;
+    await local.upsert([
+      {
+        entityKind: "library_item",
+        entityId: plan.record.item_id,
+        payload: metadata,
+      },
+    ]);
+    throwIfImportCancelled(options.signal);
+  } catch (error) {
+    await local.deleteLibraryContent(plan.record.item_id);
+    throw error;
+  }
+  diagnostics.record({
+    operationId,
+    component: "web-library",
+    category: "import",
+    name: "import_completed",
+    fields: {
+      source_kind: "url",
+      document_format: "html",
+      byte_count: sourceBytes.byteLength,
+      duplicate: false,
+      outcome: plan.outcome,
+    },
+  });
+  reportImportProgress(options, "complete", 4, 4);
+  return item;
 }
 
-export async function fetchItemFile(id: string): Promise<ArrayBuffer> {
-  const res = await apiFetch(`${BASE}/api/library/items/${id}/file`);
-  if (!res.ok) throw new Error(`Failed to fetch file: ${res.status}`);
-  return res.arrayBuffer();
+export async function fetchItemFile(
+  id: string,
+  store?: LocalReplicaStore
+): Promise<ArrayBuffer> {
+  const local = store ?? (await getBrowserLocalReplicaStore());
+  const content = await local.libraryContent(id);
+  if (!content?.fileBytes) {
+    throw new Error(`Library item file not found: ${id}`);
+  }
+  return content.fileBytes.slice().buffer as ArrayBuffer;
 }
 
 export async function createTTSJob(
@@ -210,46 +642,53 @@ export async function cancelTTSSession(
 
 export async function updateProgress(
   id: string,
-  progress: number
+  progress: number,
+  store?: LocalReplicaStore
 ): Promise<void> {
-  await apiFetch(`${BASE}/api/library/items/${id}/progress`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ progress }),
-  });
+  await updateLocalLibraryItem(id, { progress }, store);
 }
 
 export async function updateVoice(
   id: string,
-  voice: string | null
+  voice: string | null,
+  store?: LocalReplicaStore
 ): Promise<void> {
-  await apiFetch(`${BASE}/api/library/items/${id}/voice`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ voice }),
-  });
+  await updateLocalLibraryItem(id, { voice }, store);
 }
 
 export async function updateSpeed(
   id: string,
-  speed: number | null
+  speed: number | null,
+  store?: LocalReplicaStore
 ): Promise<void> {
-  await apiFetch(`${BASE}/api/library/items/${id}/speed`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ speed }),
-  });
+  await updateLocalLibraryItem(id, { speed }, store);
 }
 
 export async function updateChapter(
   id: string,
-  chapter: string | null
+  chapter: string | null,
+  store?: LocalReplicaStore
 ): Promise<void> {
-  await apiFetch(`${BASE}/api/library/items/${id}/chapter`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chapter }),
-  });
+  await updateLocalLibraryItem(id, { current_chapter: chapter }, store);
+}
+
+async function updateLocalLibraryItem(
+  id: string,
+  patch: Partial<
+    Pick<LibraryItem, "progress" | "voice" | "speed" | "current_chapter">
+  >,
+  store?: LocalReplicaStore
+): Promise<void> {
+  const local = store ?? (await getBrowserLocalReplicaStore());
+  const item = await local.libraryItem(id);
+  if (!item) throw new Error(`Library item not found: ${id}`);
+  await local.upsert([
+    {
+      entityKind: "library_item",
+      entityId: id,
+      payload: { ...item, ...patch },
+    },
+  ]);
 }
 
 export async function fetchVoices(): Promise<VoiceListResponse> {
@@ -286,20 +725,28 @@ export async function fetchModels(provider: string): Promise<ModelListResponse> 
 
 // ── User settings persistence ────────────────────────────────────────────
 
-export async function fetchSettings(): Promise<Record<string, string>> {
-  const res = await apiFetch(`${BASE}/api/settings`);
-  if (!res.ok) throw new Error(`Failed to fetch settings: ${res.status}`);
-  return res.json();
+export async function fetchSettings(
+  store?: LocalReplicaStore
+): Promise<Record<string, string>> {
+  return (store ?? (await getBrowserLocalReplicaStore())).settings();
 }
 
 export async function patchSettings(
-  data: Record<string, string>
+  data: Record<string, string | null>,
+  store?: LocalReplicaStore
 ): Promise<void> {
-  await apiFetch(`${BASE}/api/settings`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(data),
-  });
+  const local = store ?? (await getBrowserLocalReplicaStore());
+  const upserts = Object.entries(data)
+    .filter((entry): entry is [string, string] => entry[1] !== null)
+    .map(([entityId, value]) => ({
+      entityKind: "setting" as const,
+      entityId,
+      payload: { value },
+    }));
+  const deletions = Object.entries(data)
+    .filter(([, value]) => value === null)
+    .map(([entityId]) => ({ entityKind: "setting" as const, entityId }));
+  await local.patch(upserts, deletions);
 }
 
 // ── API Keys management ──────────────────────────────────────────────────

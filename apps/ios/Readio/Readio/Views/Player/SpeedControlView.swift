@@ -71,7 +71,7 @@ struct SpeedControlView: View {
                 .padding(.vertical, 4)
                 .background(
                     RoundedRectangle(cornerRadius: 6)
-                        .fill(Color(.secondarySystemGroupedBackground))
+                        .fill(.background)
                 )
         } primaryAction: {
             // Primary tap action — cycle to the next speed preset.
@@ -97,8 +97,10 @@ struct SpeedControlView: View {
 
     /// Selects a specific speed and triggers haptic feedback.
     private func selectSpeed(_ speed: Double) {
+        #if os(iOS)
         let generator = UIImpactFeedbackGenerator(style: .light)
         generator.impactOccurred()
+        #endif
         onSpeedChange(speed)
     }
 

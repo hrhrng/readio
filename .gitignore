@@ -17,10 +17,16 @@ apps/api/data/
 apps/api/checkpoints/
 third_party/indexTTS2/
 
+# Rust build output
+target/
+apps/tui/target/
+
 # Next.js
 apps/web/.next/
 apps/web/.next-dev/
 apps/web/out/
+apps/web/.open-next/
+apps/web/.wrangler/
 
 # Extension build
 apps/extension/dist/

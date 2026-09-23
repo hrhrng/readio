@@ -463,7 +463,7 @@ voice:
       title: 论语         # written for you to read; nothing reads it back
       engine: espeak
       name: cmn
-# input_log: /tmp/keys.log   # every terminal event appended, for debugging input
+# input_log: /tmp/keys.log   # developer-only raw trace; includes keys and short book excerpts; do not share
 ```
 
 The `engines:` block below that is settings for the engines themselves, and it is the one part of the file readio maintains as well as reads. On startup each built-in engine is reconciled with the binary, in three categories: what the package *is* — the description, the docs link, the PyPI name, the Python it needs — always follows the release, because nobody writes those by hand and a file written before those fields existed would otherwise freeze them empty forever. How to *run* it — the command, the player, whether the text goes on stdin, the language table — is yours, and is replaced only when what is saved is a default readio itself shipped and has since corrected. The exact historical OS player defaults are upgraded to the embedded frame-clock player; anything customised remains yours. Which *voice* — `voice`, `model`, `extra` — is never touched.

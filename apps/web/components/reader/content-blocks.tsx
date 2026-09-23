@@ -8,9 +8,17 @@
  * sentence-level TTS highlighting, word-level progress, and rich rendering.
  */
 
-import { useMemo, memo } from "react";
-import { BOUNDARY } from "@/lib/sentences";
-import { tokenize, countTokens } from "@/lib/cjk";
+import {
+  Fragment,
+  createContext,
+  memo,
+  useContext,
+  useEffect,
+  useState,
+  type ReactNode,
+} from "react";
+import { visualSentenceSeparator } from "@/lib/sentences";
+import type { HighlightTarget } from "@/lib/rust-core";
 
 // ---------------------------------------------------------------------------
 // Data structures
@@ -35,7 +43,13 @@ export interface RichSentence {
 export type ContentBlock =
   | { type: "heading"; level: number; sentences: RichSentence[]; anchorId?: string }
   | { type: "paragraph"; sentences: RichSentence[]; anchorId?: string }
-  | { type: "image"; src: string; alt?: string }
+  | {
+      type: "image";
+      src: string | null;
+      alt?: string;
+      assetId?: string;
+      mediaType?: string;
+    }
   | {
       type: "list";
       ordered: boolean;
@@ -46,99 +60,99 @@ export type ContentBlock =
   | { type: "code"; text: string; language?: string }
   | { type: "separator" };
 
-// ---------------------------------------------------------------------------
-// Sentence splitting — uses shared BOUNDARY regex from lib/sentences.ts
-// ---------------------------------------------------------------------------
+export type ImageAssetResolver = (assetId: string) => Promise<string>;
 
-/**
- * Split an array of StyledRuns into RichSentences by finding sentence
- * boundaries in the concatenated text, then slicing runs at those offsets.
- */
-export function splitRunsIntoSentences(
-  runs: StyledRun[],
-  startIndex: number
-): { sentences: RichSentence[]; nextIndex: number } {
-  const fullText = runs.map((r) => r.text).join("");
-  if (!fullText.trim()) return { sentences: [], nextIndex: startIndex };
+const ReaderHighlightContext = createContext<HighlightTarget | null>(null);
 
-  const parts = fullText.split(BOUNDARY).filter((s) => s.length > 0);
+export function ReaderHighlightProvider({
+  target,
+  children,
+}: {
+  target: HighlightTarget | null;
+  children: ReactNode;
+}) {
+  return (
+    <ReaderHighlightContext.Provider value={target}>
+      {children}
+    </ReaderHighlightContext.Provider>
+  );
+}
 
-  const sentences: RichSentence[] = [];
-  let charCursor = 0;
-  let runIdx = 0;
-  let runOffset = 0;
-  let sentenceIdx = startIndex;
+export function useReaderHighlightTarget(): HighlightTarget | null {
+  return useContext(ReaderHighlightContext);
+}
 
-  for (const part of parts) {
-    if (!part.trim()) {
-      charCursor += part.length;
-      let toSkip = part.length;
-      while (toSkip > 0 && runIdx < runs.length) {
-        const available = runs[runIdx].text.length - runOffset;
-        if (toSkip >= available) {
-          toSkip -= available;
-          runIdx++;
-          runOffset = 0;
-        } else {
-          runOffset += toSkip;
-          toSkip = 0;
-        }
-      }
-      continue;
-    }
-
-    const sentenceRuns: StyledRun[] = [];
-    let remaining = part.length;
-
-    const expectedOffset = fullText.indexOf(part, charCursor);
-    if (expectedOffset > charCursor) {
-      let gap = expectedOffset - charCursor;
-      while (gap > 0 && runIdx < runs.length) {
-        const available = runs[runIdx].text.length - runOffset;
-        if (gap >= available) {
-          gap -= available;
-          runIdx++;
-          runOffset = 0;
-        } else {
-          runOffset += gap;
-          gap = 0;
-        }
-      }
-      charCursor = expectedOffset;
-    }
-
-    while (remaining > 0 && runIdx < runs.length) {
-      const run = runs[runIdx];
-      const available = run.text.length - runOffset;
-      const take = Math.min(remaining, available);
-      const slice = run.text.substring(runOffset, runOffset + take);
-
-      sentenceRuns.push({
-        text: slice,
-        ...(run.bold ? { bold: true } : {}),
-        ...(run.italic ? { italic: true } : {}),
-        ...(run.href ? { href: run.href } : {}),
-      });
-
-      remaining -= take;
-      runOffset += take;
-      if (runOffset >= run.text.length) {
-        runIdx++;
-        runOffset = 0;
-      }
-    }
-
-    charCursor += part.length;
-
-    sentences.push({
-      index: sentenceIdx,
-      text: part.trim(),
-      runs: sentenceRuns,
-    });
-    sentenceIdx++;
+/** Convert Rust's block-local range into the active sentence's scalar space. */
+export function sentenceLocalWordRange(
+  target: HighlightTarget | null,
+  sentenceIndex: number
+): [number, number] | null {
+  if (target?.sentence_index !== sentenceIndex || !target.word_range) return null;
+  const [sentenceStart, sentenceEnd] = target.sentence_range;
+  const [wordStart, wordEnd] = target.word_range;
+  if (
+    wordStart < sentenceStart
+    || wordEnd > sentenceEnd
+    || wordStart >= wordEnd
+  ) {
+    return null;
   }
+  return [wordStart - sentenceStart, wordEnd - sentenceStart];
+}
 
-  return { sentences, nextIndex: sentenceIdx };
+export interface ScalarTextSegment {
+  text: string;
+  range: [number, number];
+  highlighted: boolean;
+}
+
+export interface ScalarTextRun {
+  run: StyledRun;
+  segments: ScalarTextSegment[];
+}
+
+/** Split styled visual runs exactly at Rust's scalar highlight boundaries. */
+export function scalarTextRuns(
+  runs: StyledRun[],
+  highlightRange: [number, number] | null
+): ScalarTextRun[] {
+  let scalarOffset = 0;
+  return runs.map((run) => {
+    const scalars = Array.from(run.text);
+    const runStart = scalarOffset;
+    const runEnd = runStart + scalars.length;
+    scalarOffset = runEnd;
+    if (
+      !highlightRange
+      || highlightRange[1] <= runStart
+      || highlightRange[0] >= runEnd
+    ) {
+      return {
+        run,
+        segments: [{
+          text: run.text,
+          range: [runStart, runEnd],
+          highlighted: false,
+        }],
+      };
+    }
+
+    const highlightStart = Math.max(runStart, highlightRange[0]);
+    const highlightEnd = Math.min(runEnd, highlightRange[1]);
+    const boundaries = [runStart, highlightStart, highlightEnd, runEnd]
+      .filter((value, index, values) => index === 0 || value !== values[index - 1]);
+    const segments: ScalarTextSegment[] = [];
+    for (let index = 0; index < boundaries.length - 1; index += 1) {
+      const start = boundaries[index];
+      const end = boundaries[index + 1];
+      segments.push({
+        text: scalars.slice(start - runStart, end - runStart).join(""),
+        range: [start, end],
+        highlighted: start >= highlightStart && end <= highlightEnd,
+      });
+    }
+    return { run, segments };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -154,7 +168,6 @@ export function splitRunsIntoSentences(
 export const SentenceSpan = memo(function SentenceSpan({
   sentence,
   isActive,
-  wordProgress,
   onClick,
   onLinkClick,
 }: {
@@ -164,15 +177,11 @@ export const SentenceSpan = memo(function SentenceSpan({
   onClick: (index: number) => void;
   onLinkClick?: (href: string) => void;
 }) {
-  const wordCount = useMemo(
-    () => countTokens(sentence.text),
-    [sentence.text]
-  );
-  const highlightedWordIdx = isActive
-    ? Math.min(Math.floor(wordProgress * wordCount), wordCount - 1)
-    : -1;
-
-  let globalWordIdx = 0;
+  const target = useReaderHighlightTarget();
+  const wordRange = isActive
+    ? sentenceLocalWordRange(target, sentence.index)
+    : null;
+  const projectedRuns = scalarTextRuns(sentence.runs, wordRange);
 
   const isExternal = (href: string) =>
     /^(https?:|mailto:)/i.test(href);
@@ -185,25 +194,18 @@ export const SentenceSpan = memo(function SentenceSpan({
         isActive ? "bg-highlight-sentence" : "hover:bg-surface-hover"
       }`}
     >
-      {sentence.runs.map((run, ri) => {
-        const tokens = tokenize(run.text);
-
-        const inner = tokens.map((token, ti) => {
-          if (!token.trim()) {
-            return <span key={ti}>{token}</span>;
-          }
-          const thisIdx = globalWordIdx++;
-          const isHighlighted = isActive && thisIdx === highlightedWordIdx;
+      {projectedRuns.map(({ run, segments }, ri) => {
+        const inner = segments.map((segment, segmentIndex) => {
           return (
             <span
-              key={ti}
+              key={segmentIndex}
               className={
-                isHighlighted
+                segment.highlighted
                   ? "bg-highlight-word-bg rounded-sm"
                   : ""
               }
             >
-              {token}
+              {segment.text}
             </span>
           );
         });
@@ -241,9 +243,16 @@ export const SentenceSpan = memo(function SentenceSpan({
     </span>
   );
 }, (prevProps, nextProps) => {
+  if (
+    prevProps.sentence !== nextProps.sentence
+    || prevProps.onClick !== nextProps.onClick
+    || prevProps.onLinkClick !== nextProps.onLinkClick
+  ) {
+    return false;
+  }
   if (!prevProps.isActive && !nextProps.isActive) return true;
   if (prevProps.isActive !== nextProps.isActive) return false;
-  return prevProps.wordProgress === nextProps.wordProgress;
+  return true; // Rust target arrives through context and bypasses prop memoization.
 });
 
 // ---------------------------------------------------------------------------
@@ -257,15 +266,20 @@ export function renderSentences(
   onSentenceClick: (index: number) => void,
   onLinkClick?: (href: string) => void
 ) {
-  return sentences.map((s) => (
-    <SentenceSpan
-      key={s.index}
-      sentence={s}
-      isActive={s.index === currentSentenceIndex}
-      wordProgress={currentWordProgress}
-      onClick={onSentenceClick}
-      onLinkClick={onLinkClick}
-    />
+  return sentences.map((s, sentenceIndex) => (
+    <Fragment key={s.index}>
+      {visualSentenceSeparator(
+        sentences[sentenceIndex - 1]?.text ?? null,
+        s.text
+      )}
+      <SentenceSpan
+        sentence={s}
+        isActive={s.index === currentSentenceIndex}
+        wordProgress={currentWordProgress}
+        onClick={onSentenceClick}
+        onLinkClick={onLinkClick}
+      />
+    </Fragment>
   ));
 }
 
@@ -307,12 +321,14 @@ export const BlockRenderer = memo(function BlockRenderer({
   currentWordProgress,
   onSentenceClick,
   onLinkClick,
+  resolveImageAsset,
 }: {
   block: ContentBlock;
   currentSentenceIndex: number;
   currentWordProgress: number;
   onSentenceClick: (index: number) => void;
   onLinkClick?: (href: string) => void;
+  resolveImageAsset?: ImageAssetResolver;
 }) {
   switch (block.type) {
     case "heading": {
@@ -353,11 +369,7 @@ export const BlockRenderer = memo(function BlockRenderer({
 
     case "image":
       return (
-        <img
-          src={block.src}
-          alt={block.alt || ""}
-          className="max-w-full h-auto rounded-lg my-4"
-        />
+        <ReaderImage block={block} resolveImageAsset={resolveImageAsset} />
       );
 
     case "list": {
@@ -384,7 +396,10 @@ export const BlockRenderer = memo(function BlockRenderer({
 
     case "blockquote":
       return (
-        <blockquote id={block.anchorId} className="border-l-4 border-border pl-4 italic text-text-secondary mb-4">
+        <blockquote
+          id={block.anchorId}
+          className="rounded-md bg-surface-hover px-4 py-3 italic text-text-secondary mb-4"
+        >
           {renderSentences(
             block.sentences,
             currentSentenceIndex,
@@ -406,6 +421,14 @@ export const BlockRenderer = memo(function BlockRenderer({
       return <hr className="border-border my-4" />;
   }
 }, (prevProps, nextProps) => {
+  if (
+    prevProps.block !== nextProps.block
+    || prevProps.onSentenceClick !== nextProps.onSentenceClick
+    || prevProps.onLinkClick !== nextProps.onLinkClick
+    || prevProps.resolveImageAsset !== nextProps.resolveImageAsset
+  ) {
+    return false;
+  }
   const range = getBlockSentenceRange(nextProps.block);
   if (!range) return true;
 
@@ -416,3 +439,58 @@ export const BlockRenderer = memo(function BlockRenderer({
 
   return false;
 });
+
+function ReaderImage({
+  block,
+  resolveImageAsset,
+}: {
+  block: Extract<ContentBlock, { type: "image" }>;
+  resolveImageAsset?: ImageAssetResolver;
+}) {
+  const [source, setSource] = useState(block.src);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    setSource(block.src);
+    setFailed(false);
+    if (block.src || !block.assetId || !resolveImageAsset) {
+      if (!block.src) setFailed(true);
+      return;
+    }
+
+    let active = true;
+    void resolveImageAsset(block.assetId)
+      .then((resolved) => {
+        if (active) setSource(resolved);
+      })
+      .catch(() => {
+        if (active) setFailed(true);
+      });
+    return () => {
+      active = false;
+    };
+  }, [block.assetId, block.src, resolveImageAsset]);
+
+  if (!source) {
+    return (
+      <div
+        role="img"
+        aria-label={block.alt || "Book illustration"}
+        aria-busy={failed ? undefined : true}
+        className="my-4 flex min-h-32 items-center justify-center rounded-lg border border-border bg-surface-subtle text-sm text-text-secondary"
+      >
+        {failed ? "Image unavailable" : "Loading image…"}
+      </div>
+    );
+  }
+
+  return (
+    // EPUB/PDF images can be blob URLs, so next/image cannot optimize them.
+    // eslint-disable-next-line @next/next/no-img-element
+    <img
+      src={source}
+      alt={block.alt || ""}
+      className="max-w-full h-auto rounded-lg my-4"
+    />
+  );
+}

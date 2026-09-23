@@ -1,0 +1,19 @@
+[package]
+name = "readio-ffi"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "C ABI for embedding the Readio core engine in Apple applications"
+
+[lib]
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+base64 = "0.22.1"
+readio-bridge = { path = "../readio-bridge" }
+readio-sdk = { path = "../readio-sdk", features = ["native-media"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+zip.workspace = true

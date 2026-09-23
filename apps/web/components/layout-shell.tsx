@@ -12,9 +12,9 @@ export function LayoutShell({ children }: { children: React.ReactNode }) {
   }
 
   return (
-    <div className="flex min-h-screen">
+    <div className="app-shell">
       <Sidebar />
-      <main className="flex-1 ml-60 p-8">{children}</main>
+      <div className="app-main">{children}</div>
     </div>
   );
 }

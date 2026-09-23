@@ -224,6 +224,7 @@ fn a_character_offset_outranks_a_stale_chapter_index() {
             chars_read: target as u64,
             sessions: 1,
             updated: 0,
+            locator: None,
             speech: None,
             marks: Vec::new(),
         },
@@ -237,6 +238,62 @@ fn a_character_offset_outranks_a_stale_chapter_index() {
     assert!(
         header.contains("3/3"),
         "the reader should land where the offset says, not where the index says: {header}"
+    );
+}
+
+#[test]
+fn a_text_locator_survives_a_block_inserted_before_the_saved_paragraph() {
+    let dir = common::isolated_home()
+        .join("sources")
+        .join("locator-revision");
+    std::fs::create_dir_all(&dir).expect("source dir");
+    let path = dir.join("locator.html");
+    std::fs::write(
+        &path,
+        "<html><body><p>Opening context.</p><p>The durable target sentence.</p></body></html>",
+    )
+    .expect("write original document");
+
+    let mut original = Book::load(Some(&path)).expect("load original document");
+    original.id = "stable-library-item".to_string();
+    let mut app = App::new(
+        Library::ephemeral(),
+        Store::ephemeral(),
+        Some(original),
+        None,
+    );
+    app.pos = readio::app::flow::Pos {
+        chapter: 0,
+        para: 1,
+    };
+    app.save_progress();
+    let saved = app
+        .store
+        .get("stable-library-item")
+        .cloned()
+        .expect("saved progress");
+
+    let encoded = serde_json::to_value(&saved).expect("serialize progress");
+    assert!(
+        encoded["locator"].is_object(),
+        "TUI progress must persist the shared Rust text locator: {encoded}"
+    );
+
+    std::fs::write(
+        &path,
+        "<html><body><p>A newly inserted preface.</p><p>Opening context.</p><p>The durable target sentence.</p></body></html>",
+    )
+    .expect("write revised document");
+    let mut revised = Book::load(Some(&path)).expect("load revised document");
+    revised.id = "stable-library-item".to_string();
+    let mut store = Store::ephemeral();
+    store.record("stable-library-item", saved);
+
+    let restored = App::new(Library::ephemeral(), store, Some(revised), None);
+    assert_eq!(
+        restored.position(),
+        (0, 2),
+        "the inserted preface must not move the durable reading intent"
     );
 }
 

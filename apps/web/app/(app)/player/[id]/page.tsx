@@ -1,32 +1,83 @@
 "use client";
 
-import { use, useCallback, useEffect, useRef, useState } from "react";
+import {
+  use,
+  useCallback,
+  useEffect,
+  useReducer,
+  useRef,
+  useState,
+} from "react";
 import { useLibraryItem, useSettings, useVoices } from "@/lib/hooks";
 import { updateProgress, updateVoice, updateSpeed, updateChapter } from "@/lib/api";
 import { Sentence } from "@/lib/types";
 import { useTTSPlayer } from "@/lib/use-tts-player";
+import { useTextAdvancePlayer } from "@/lib/use-text-advance-player";
 import { TopBar } from "@/components/reader/top-bar";
 import { PlayerBar } from "@/components/reader/player-bar";
 import { ContentRouter } from "@/components/reader/content-router";
-import { TOCPanel } from "@/components/reader/toc-panel";
+import { ReaderHighlightProvider } from "@/components/reader/content-blocks";
+import {
+  TOCPanel,
+  type TOCItem,
+} from "@/components/reader/toc-panel";
 import { SettingsDialog } from "@/components/settings-dialog";
+import { Sheet } from "@/components/sheet";
+import { ReaderToolsInspector } from "@/components/reader/reader-tools-inspector";
+import { resolveReaderHighlight } from "@/lib/reader-highlight";
+import { webRustCore } from "@/lib/readio-core-runtime";
+import {
+  reduceReaderOverlay,
+  shouldOpenReaderSearch,
+} from "@/lib/reader-tools-navigation";
+import type {
+  HighlightTarget,
+  ReaderIR,
+  ReadingPace,
+} from "@/lib/rust-core";
+import {
+  resolveInitialPlaybackRate,
+  resolveStoredReadingPace,
+} from "@/lib/settings-utils";
+import { transitionReadingMode } from "@/lib/reading-mode-transition";
+import { ReaderProgressCommitter } from "@/lib/reader-progress";
+import { ReaderProgressRestoreGate } from "@/lib/reader-progress-restore";
+import { resolveSentenceProgressSeek } from "@/lib/reading-progress-adapter";
+import { useWebMediaSession } from "@/lib/use-web-media-session";
+import { resolvePlayerItemId } from "@/lib/player-route";
+import { useLocale } from "@/components/locale-provider";
 
 export default function PlayerPage({
   params,
 }: {
   params: Promise<{ id: string }>;
 }) {
-  const { id } = use(params);
+  const { t } = useLocale();
+  const { id: routeId } = use(params);
+  const id = resolvePlayerItemId(routeId);
   const { data: item, isLoading } = useLibraryItem(id);
   const [sentences, setSentences] = useState<Sentence[]>([]);
-  const [tocOpen, setTocOpen] = useState(false);
+  const [readerSource, setReaderSource] = useState<{
+    itemId: string;
+    reader: ReaderIR;
+  } | null>(null);
+  const readerIR = readerSource?.itemId === id ? readerSource.reader : null;
+  const readerDocument = readerIR?.document ?? null;
+  const readerTextIndex = readerIR?.text_index ?? null;
+  const [highlightTarget, setHighlightTarget] = useState<HighlightTarget | null>(null);
+  const readerDocumentError = null;
+  const [readerOverlay, dispatchReaderOverlay] = useReducer(
+    reduceReaderOverlay,
+    { tocOpen: false, activeTool: null }
+  );
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const tocPanelRef = useRef<HTMLDivElement>(null);
-  const { settings } = useSettings();
+  const { settings, isLoading: settingsLoading } = useSettings();
   const [speed, setSpeed] = useState(1.0);
-  const [tocItems, setTocItems] = useState<
-    { id: string; title: string; depth?: number }[]
-  >([]);
+  const [readingPace, setReadingPace] = useState<ReadingPace | null>(null);
+  const [positionReady, setPositionReady] = useState(false);
+  const progressCommitterRef = useRef<ReaderProgressCommitter | null>(null);
+  const pendingProgressSentenceRef = useRef<number | null>(null);
+  const [tocItems, setTocItems] = useState<TOCItem[]>([]);
 
   // Per-item voice preference — initialized from backend item data
   const [voice, setVoice] = useState<string | null>(null);
@@ -53,38 +104,159 @@ export default function PlayerPage({
   // the CSS var globally; this local value drives the inline style for the reader)
   const fontSize = `${settings.font_size ?? "18"}px`;
 
-  // Initialize TTS speed: per-book speed takes priority over global setting.
-  // The per-book value comes from item.speed (backend), the global fallback
-  // comes from settings.tts_speed. Only runs once on first load.
+  // A per-book override wins; otherwise the shared Rust effort ladder supplies
+  // the audio rate. Waiting for local settings avoids briefly locking in 1×.
   const speedInitialized = useRef(false);
   useEffect(() => {
     if (speedInitialized.current) return;
     if (!item) return;
-
-    // Per-book speed has the highest priority
-    if (item.speed != null) {
-      setSpeed(item.speed);
+    if (item.speed == null && settingsLoading) return;
+    let active = true;
+    void resolveInitialPlaybackRate(item.speed, settings).then((rate) => {
+      if (!active || speedInitialized.current) return;
+      setSpeed(rate);
       speedInitialized.current = true;
+    });
+    return () => {
+      active = false;
+    };
+  }, [item, settings, settingsLoading]);
+
+  useEffect(() => {
+    if (settingsLoading) return;
+    let active = true;
+    void resolveStoredReadingPace(settings).then((pace) => {
+      if (active) setReadingPace(pace);
+    });
+    return () => {
+      active = false;
+    };
+  }, [settings, settingsLoading]);
+
+  const persistSentenceProgress = useCallback(async (sentence: number) => {
+    const committer = progressCommitterRef.current;
+    if (!committer) {
+      pendingProgressSentenceRef.current = sentence;
       return;
     }
-
-    // Fall back to global TTS speed setting
-    const persisted = settings.tts_speed;
-    if (persisted) {
-      const parsed = parseFloat(persisted);
-      if (!isNaN(parsed)) {
-        setSpeed(parsed);
-        speedInitialized.current = true;
-      }
-    }
-  }, [item, settings.tts_speed]);
-
-  const player = useTTSPlayer({
+    await committer.commitSentence(sentence);
+  }, []);
+  const audioPlayer = useTTSPlayer({
     itemId: id,
     sentences,
     speed,
     voice,
+    language: item?.locale ?? "en",
+    onPersistProgress: persistSentenceProgress,
   });
+  const readingMode = readingPace?.mode ?? "manual";
+  const activeReadingMode = positionReady ? readingMode : "manual";
+  const effortRate = readingPace?.audio_playback_rate ?? 1;
+  const textCharactersPerSecond =
+    ((readingPace?.text_characters_per_second ?? 46) / effortRate) * speed;
+  const textPlayer = useTextAdvancePlayer({
+    sentences,
+    charactersPerSecond: textCharactersPerSecond,
+    enabled: activeReadingMode === "auto",
+    onPersistProgress: persistSentenceProgress,
+  });
+  const player = activeReadingMode === "read_aloud" ? audioPlayer : textPlayer;
+  const seekTextToSentence = textPlayer.seekToSentence;
+  useWebMediaSession({
+    enabled: positionReady && readingMode === "read_aloud",
+    title: item?.title ?? "Readio",
+    artwork: item?.cover_image ?? null,
+    player: audioPlayer,
+  });
+
+  const previousReadingMode = useRef(activeReadingMode);
+  useEffect(() => {
+    const previous = previousReadingMode.current;
+    transitionReadingMode(
+      previous,
+      activeReadingMode,
+      {
+        currentSentenceIndex: audioPlayer.currentSentenceIndex,
+        pause: audioPlayer.pause,
+        playFromSentence: audioPlayer.playFromSentence,
+        seekToSentence: audioPlayer.seekToSentence,
+      },
+      {
+        currentSentenceIndex: textPlayer.currentSentenceIndex,
+        pause: textPlayer.pause,
+        playFromSentence: textPlayer.playFromSentence,
+        seekToSentence: seekTextToSentence,
+      }
+    );
+    previousReadingMode.current = activeReadingMode;
+  }, [
+    activeReadingMode,
+    audioPlayer.currentSentenceIndex,
+    audioPlayer.pause,
+    audioPlayer.playFromSentence,
+    audioPlayer.seekToSentence,
+    seekTextToSentence,
+    textPlayer.currentSentenceIndex,
+    textPlayer.pause,
+    textPlayer.playFromSentence,
+  ]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!readerDocument || !readerTextIndex) {
+      setHighlightTarget(null);
+      return () => {
+        cancelled = true;
+      };
+    }
+    void resolveReaderHighlight(
+      webRustCore,
+      readerDocument,
+      readerTextIndex,
+      player.currentSentenceIndex,
+      player.currentWordProgress
+    )
+      .then((target) => {
+        if (!cancelled) setHighlightTarget(target);
+      })
+      .catch(() => {
+        if (!cancelled) setHighlightTarget(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    player.currentSentenceIndex,
+    player.currentWordProgress,
+    readerDocument,
+    readerTextIndex,
+  ]);
+
+  useEffect(() => {
+    if (!readerDocument) {
+      progressCommitterRef.current = null;
+      return;
+    }
+    const committer = new ReaderProgressCommitter({
+      itemId: id,
+      document: readerDocument,
+      core: webRustCore,
+    });
+    progressCommitterRef.current = committer;
+    const pendingSentence = pendingProgressSentenceRef.current;
+    pendingProgressSentenceRef.current = null;
+    if (pendingSentence !== null) {
+      void committer.commitSentence(pendingSentence).catch(() => {
+        // The player hook reports future persistence failures without stopping
+        // its Rust playback/text deadline loop.
+      });
+    }
+    return () => {
+      if (progressCommitterRef.current === committer) {
+        progressCommitterRef.current = null;
+      }
+    };
+  }, [id, readerDocument]);
 
   // Resolve voice label for display in the PlayerBar
   const { data: voiceData } = useVoices();
@@ -95,37 +267,26 @@ export default function PlayerPage({
     return match?.label ?? null;
   })();
 
-  // Close TOC panel on click-outside
-  useEffect(() => {
-    if (!tocOpen) return;
-
-    const handleClickOutside = (e: MouseEvent) => {
-      const target = e.target as HTMLElement;
-      // Ignore clicks on the TOC toggle button — let its onClick handle the toggle
-      if (target.closest("[data-toc-toggle]")) return;
-      if (
-        tocPanelRef.current &&
-        !tocPanelRef.current.contains(target)
-      ) {
-        setTocOpen(false);
-      }
-    };
-
-    // Use mousedown so the panel closes before any other click handlers fire
-    document.addEventListener("mousedown", handleClickOutside);
-    return () => document.removeEventListener("mousedown", handleClickOutside);
-  }, [tocOpen]);
-
   // Keyboard shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Don't capture when typing in inputs
-      if (
+      const isEditable =
         e.target instanceof HTMLInputElement ||
-        e.target instanceof HTMLTextAreaElement
+        e.target instanceof HTMLTextAreaElement ||
+        (e.target instanceof HTMLElement && e.target.isContentEditable);
+      if (
+        shouldOpenReaderSearch({
+          key: e.key,
+          metaKey: e.metaKey,
+          ctrlKey: e.ctrlKey,
+          isEditable,
+        })
       ) {
+        e.preventDefault();
+        dispatchReaderOverlay({ type: "open-tool", tool: "search" });
         return;
       }
+      if (isEditable) return;
 
       switch (e.key) {
         case " ":
@@ -173,15 +334,26 @@ export default function PlayerPage({
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [player, speed]);
 
+  const jumpToSentence = useCallback(
+    (index: number) => {
+      player.seekToSentence(index);
+      requestAnimationFrame(() => {
+        document
+          .querySelector(`[data-sentence-id="${index}"]`)
+          ?.scrollIntoView({ behavior: "smooth", block: "center" });
+      });
+    },
+    [player]
+  );
+
   // Track latest progress values in a ref so the save callback is always fresh
   // without re-running the effect (which was causing the PATCH storm).
-  const progressRef = useRef({ currentSentenceIndex: 0, sentencesLength: 0 });
+  const progressRef = useRef({ progressBasisPoints: 0 });
   useEffect(() => {
     progressRef.current = {
-      currentSentenceIndex: player.currentSentenceIndex,
-      sentencesLength: sentences.length,
+      progressBasisPoints: player.progressBasisPoints,
     };
-  }, [player.currentSentenceIndex, sentences.length]);
+  }, [player.progressBasisPoints]);
 
   // Track current chapter for EPUB/PDF chapter position persistence.
   // Updated when the active sentence changes — finds the chapter element
@@ -206,11 +378,8 @@ export default function PlayerPage({
   // Progress + chapter persistence — only fires on page unload / component unmount
   useEffect(() => {
     const saveProgress = () => {
-      const { currentSentenceIndex, sentencesLength } = progressRef.current;
-      if (sentencesLength === 0) return;
-      const progress = Math.round(
-        (currentSentenceIndex / sentencesLength) * 100
-      );
+      const { progressBasisPoints } = progressRef.current;
+      const progress = Math.round(progressBasisPoints / 100);
       updateProgress(id, progress).catch(() => {});
 
       // Persist current EPUB chapter position alongside progress
@@ -226,34 +395,49 @@ export default function PlayerPage({
     };
   }, [id]);
 
-  // Restore reading position when sentences are extracted and item has progress.
-  // Calculates the target sentence index from progress percentage and scrolls
-  // to that position without auto-playing. Uses a ref to prevent re-triggering.
-  const progressRestored = useRef(false);
+  // Restore the exact Rust scalar cursor before activating Auto/read-aloud. The
+  // legacy percentage remains a one-way fallback for pre-Replica libraries.
+  const progressRestoreGate = useRef(new ReaderProgressRestoreGate());
   useEffect(() => {
-    if (progressRestored.current) return;
-    if (!item || sentences.length === 0) return;
+    if (!item || !readerDocument || sentences.length === 0) return;
+    const gate = progressRestoreGate.current;
+    const attempt = gate.begin(
+      `${id}:${readerDocument.revision?.revision_digest ?? "unversioned"}`
+    );
+    if (attempt === null) return;
+    let cancelled = false;
 
-    // For EPUB/PDF with a saved chapter, scroll to the chapter element first
-    if ((item.type === "epub" || item.type === "pdf") && item.current_chapter) {
-      const chapterEl = document.querySelector(
-        `[data-chapter="${item.current_chapter}"]`
-      );
-      if (chapterEl) {
-        chapterEl.scrollIntoView({ behavior: "instant", block: "start" });
+    void (async () => {
+      // For EPUB/PDF with a saved chapter, scroll to the chapter element first.
+      if ((item.type === "epub" || item.type === "pdf") && item.current_chapter) {
+        document
+          .querySelector(`[data-chapter="${item.current_chapter}"]`)
+          ?.scrollIntoView({ behavior: "instant", block: "start" });
       }
-    }
 
-    // Restore sentence-level position from progress percentage
-    if (item.progress > 0 && item.progress < 100) {
-      const restoredIndex = Math.round(
-        (item.progress / 100) * (sentences.length - 1)
-      );
-      if (restoredIndex > 0) {
-        player.seekToSentence(restoredIndex);
+      let restoredIndex: number | null = null;
+      try {
+        restoredIndex =
+          (await progressCommitterRef.current?.restoreSentence()) ?? null;
+      } catch {
+        // A damaged/missing local cursor falls through to the compatibility
+        // percentage; it must never prevent the reader from becoming usable.
+      }
+      if (restoredIndex == null && item.progress > 0 && item.progress < 100) {
+        restoredIndex = (
+          await resolveSentenceProgressSeek(
+            webRustCore,
+            sentences,
+            item.progress / 100
+          )
+        ).segment;
+      }
+      if (cancelled) return;
+      if (restoredIndex !== null && restoredIndex > 0) {
+        // Text is the neutral/manual cursor owner while positionReady is false.
+        // Activating the selected mode then transfers this cursor exactly once.
+        seekTextToSentence(restoredIndex);
 
-        // Scroll to the restored sentence after a short delay to let the DOM settle
-        // (especially for EPUBs where chapter scroll may still be animating)
         requestAnimationFrame(() => {
           const el = document.querySelector(
             `[data-sentence-id="${restoredIndex}"]`
@@ -263,10 +447,15 @@ export default function PlayerPage({
           }
         });
       }
-    }
+      setPositionReady(true);
+      gate.complete(attempt);
+    })();
 
-    progressRestored.current = true;
-  }, [item, sentences, player]);
+    return () => {
+      cancelled = true;
+      gate.cancel(attempt);
+    };
+  }, [id, item, readerDocument, seekTextToSentence, sentences]);
 
   const handleSentencesExtracted = useCallback(
     (extracted: Sentence[]) => {
@@ -275,8 +464,12 @@ export default function PlayerPage({
     []
   );
 
+  const handleReaderIRExtracted = useCallback((reader: ReaderIR) => {
+    setReaderSource({ itemId: id, reader });
+  }, [id]);
+
   const handleChaptersExtracted = useCallback(
-    (chapters: { id: string; title: string; depth?: number }[]) => {
+    (chapters: TOCItem[]) => {
       setTocItems(chapters);
     },
     []
@@ -321,84 +514,110 @@ export default function PlayerPage({
 
   if (isLoading) {
     return (
-      <div className="flex items-center justify-center min-h-screen">
-        <div className="animate-pulse space-y-4 w-full max-w-prose px-6">
-          <div className="h-8 w-64 bg-surface-hover rounded" />
-          <div className="h-4 w-48 bg-surface-hover rounded" />
-          <div className="space-y-3 mt-8">
-            {Array.from({ length: 10 }).map((_, i) => (
-              <div
-                key={i}
-                className="h-4 bg-surface-hover rounded"
-                style={{ width: `${60 + Math.random() * 30}%` }}
-              />
-            ))}
+      <main className="reader-shell">
+        <div className="reader-scroll">
+          <div className="reader-content reader-loading">
+            <div className="skeleton reader-loading-title" />
+            <div className="skeleton reader-loading-meta" />
+            <div className="reader-loading-copy">
+              {Array.from({ length: 10 }, (_, index) => (
+                <div
+                  key={index}
+                  className={`skeleton skeleton-line ${
+                    index % 4 === 3 ? "skeleton-line--short" : ""
+                  }`}
+                />
+              ))}
+            </div>
           </div>
         </div>
-      </div>
+      </main>
     );
   }
 
   if (!item) {
     return (
-      <div className="flex flex-col items-center justify-center min-h-screen text-center">
-        <h2 className="text-xl font-medium text-text-primary">
-          Item not found
-        </h2>
-        <p className="text-sm text-text-secondary mt-2">
-          The item you are looking for does not exist.
+      <main className="reader-shell ui-empty-state">
+        <h1 className="ui-state-title">{t("reader.itemNotFound")}</h1>
+        <p className="ui-state-description">
+          {t("reader.itemNotFoundDescription")}
         </p>
-      </div>
+      </main>
     );
   }
 
   return (
-    <>
+    <main className="reader-shell">
       <TopBar
         title={item.title}
-        onToggleToc={() => setTocOpen(!tocOpen)}
-        onToggleSettings={() => setSettingsOpen(!settingsOpen)}
-        tocOpen={tocOpen}
+        onToggleToc={() => dispatchReaderOverlay({ type: "toggle-toc" })}
+        onToggleSettings={() => {
+          dispatchReaderOverlay({ type: "close-all" });
+          setSettingsOpen(true);
+        }}
+        onOpenTool={(tool) =>
+          dispatchReaderOverlay({ type: "open-tool", tool })
+        }
+        activeTool={readerOverlay.activeTool}
+        tocOpen={readerOverlay.tocOpen}
       />
+
+      <Sheet
+        open={readerOverlay.tocOpen}
+        title={t("reader.toc")}
+        onClose={() => dispatchReaderOverlay({ type: "toggle-toc" })}
+      >
+        <TOCPanel
+          items={tocItems}
+          currentSentenceIndex={player.currentSentenceIndex}
+          onNavigate={jumpToSentence}
+          onItemClick={handleTocItemClick}
+        />
+      </Sheet>
+
+      <Sheet
+        open={readerOverlay.activeTool !== null}
+        title={t("reader.tools")}
+        onClose={() => dispatchReaderOverlay({ type: "close-tools" })}
+      >
+        <ReaderToolsInspector
+          activeTool={readerOverlay.activeTool ?? "search"}
+          onToolChange={(tool) =>
+            dispatchReaderOverlay({ type: "open-tool", tool })
+          }
+          itemId={id}
+          document={readerDocument}
+          textIndex={readerTextIndex}
+          documentError={readerDocumentError}
+          currentSentenceIndex={player.currentSentenceIndex}
+          onJumpToSentence={jumpToSentence}
+        />
+      </Sheet>
 
       <SettingsDialog
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}
       />
 
-      <div className="flex pt-12 h-screen overflow-hidden">
-        {/* TOC as floating popover — click outside to dismiss */}
-        {tocOpen && (
-          <div
-            ref={tocPanelRef}
-            className="fixed left-3 top-14 z-30"
-          >
-            <TOCPanel
-              items={tocItems}
-              onItemClick={handleTocItemClick}
-            />
-          </div>
-        )}
-
-        <div className="flex-1 flex justify-center overflow-y-auto">
-          <div
-            className="max-w-prose w-full px-6 pt-8 pb-24"
-            style={{ fontSize }}
-          >
-            <ContentRouter
-              item={item}
-              onSentencesExtracted={handleSentencesExtracted}
-              currentSentenceIndex={player.currentSentenceIndex}
-              currentWordProgress={player.currentWordProgress}
-              onSentenceClick={player.playFromSentence}
-              onChaptersExtracted={handleChaptersExtracted}
-            />
-          </div>
-        </div>
+      <div className="reader-scroll">
+          <article className="reader-content" style={{ fontSize }}>
+            <ReaderHighlightProvider target={highlightTarget}>
+              <ContentRouter
+                item={item}
+                onSentencesExtracted={handleSentencesExtracted}
+                onReaderIRExtracted={handleReaderIRExtracted}
+                currentSentenceIndex={player.currentSentenceIndex}
+                currentWordProgress={player.currentWordProgress}
+                onSentenceClick={player.playFromSentence}
+                onChaptersExtracted={handleChaptersExtracted}
+              />
+            </ReaderHighlightProvider>
+          </article>
       </div>
 
       <PlayerBar
         player={player}
+        mode={readingMode}
         speed={speed}
         onSpeedChange={(s) => {
           setSpeed(s);
@@ -406,11 +625,10 @@ export default function PlayerPage({
           // Persist per-book speed (fire-and-forget)
           updateSpeed(id, s).catch(() => {});
         }}
-        totalSentences={sentences.length}
         voice={voice}
         onVoiceChange={handleVoiceChange}
         voiceLabel={currentVoiceLabel}
       />
-    </>
+    </main>
   );
 }

@@ -1,9 +1,14 @@
+import type { ImportRecord } from "./rust-core";
+
 export type LibraryItemType = "web" | "txt" | "pdf" | "epub";
 export type LibraryItemCategory = "imported" | "podcasts";
 
 export interface LibraryItem {
   id: string;
+  legacy_item_ids?: string[];
+  locale?: string;
   title: string;
+  author?: string;
   content: string;
   type: LibraryItemType;
   progress: number;
@@ -17,6 +22,9 @@ export interface LibraryItem {
   speed: number | null;
   current_chapter: string | null;
   content_format: string | null;
+  markdown_source?: string;
+  is_builtin_sample?: boolean;
+  import_record?: ImportRecord | null;
 }
 
 /** 列表接口返回的轻量模型，不含 content */
@@ -34,6 +42,7 @@ export interface LibraryItemSummary {
   voice: string | null;
   speed: number | null;
   content_format: string | null;
+  import_record?: ImportRecord | null;
 }
 
 export interface LibraryItemsResponse {

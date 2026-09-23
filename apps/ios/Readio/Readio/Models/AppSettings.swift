@@ -51,12 +51,23 @@ enum AppSettingsKeys {
     static let fontSize = "readio.fontSize"
 
     /// Default TTS voice ID used for new items that don't have a per-item override.
-    /// Should match a `voice_id` from the `/api/tts/voices` response.
+    /// Should match an installed `AVSpeechSynthesisVoice` identifier.
     static let defaultVoice = "readio.defaultVoice"
 
     /// Default TTS playback speed multiplier.
     /// 1.0 = normal speed. Typical range: 0.5–3.0.
     static let defaultSpeed = "readio.defaultSpeed"
+
+    /// Device-local playback provider. Native is the offline-first default;
+    /// Cloud is an explicit opt-in because it requires an authenticated account.
+    static let ttsMode = "readio.tts.mode"
+
+    /// Voice identifier sent to the authenticated Cloudflare TTS job API.
+    static let cloudVoiceID = "readio.tts.cloudVoiceID"
+
+    static let readingMode = "readio.reading.mode"
+    static let readingEffort = "readio.reading.effort"
+    static let readingBaseCharactersPerSecond = "readio.reading.baseCharactersPerSecond"
 }
 
 // MARK: - AppSettings
@@ -119,7 +130,7 @@ final class AppSettings: Sendable {
         let defaults = UserDefaults.standard
         self.serverURL = defaults.string(forKey: AppSettingsKeys.serverURL) ?? "http://localhost:8000"
         self.theme = AppTheme(rawValue: defaults.string(forKey: AppSettingsKeys.theme) ?? "system") ?? .system
-        self.accentColor = defaults.string(forKey: AppSettingsKeys.accentColor) ?? "#4F46E5"
+        self.accentColor = "clover"
         self.fontSize = defaults.double(forKey: AppSettingsKeys.fontSize) != 0
             ? defaults.double(forKey: AppSettingsKeys.fontSize)
             : 18.0

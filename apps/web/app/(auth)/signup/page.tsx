@@ -4,8 +4,12 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { signUp } from "@/lib/auth-client";
+import { BrandMark } from "@/components/brand-mark";
+import { InlineFeedback } from "@/components/feedback";
+import { useLocale } from "@/components/locale-provider";
 
 export default function SignupPage() {
+  const { t } = useLocale();
   const router = useRouter();
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
@@ -25,7 +29,7 @@ export default function SignupPage() {
     });
 
     if (authError) {
-      setError(authError.message ?? "Sign up failed");
+      setError(authError.message ?? t("auth.signUpFailed"));
       setLoading(false);
       return;
     }
@@ -35,27 +39,23 @@ export default function SignupPage() {
   }
 
   return (
-    <div className="w-full max-w-sm space-y-6">
-      <div className="text-center">
-        <h1 className="text-3xl font-bold font-serif text-text-primary">
-          Readio
+    <div className="auth-frame auth-stack">
+      <div className="auth-heading">
+        <h1 className="auth-brand">
+          <BrandMark size="lg" />
         </h1>
-        <p className="mt-2 text-sm text-text-secondary">Create your account</p>
+        <p className="auth-description">{t("auth.createAccount")}</p>
       </div>
 
-      <form onSubmit={handleSubmit} className="space-y-4">
-        {error && (
-          <div className="rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 p-3 text-sm text-red-700 dark:text-red-400">
-            {error}
-          </div>
-        )}
+      <form onSubmit={handleSubmit} className="auth-form">
+        {error && <InlineFeedback tone="danger">{error}</InlineFeedback>}
 
-        <div>
+        <div className="form-field">
           <label
             htmlFor="name"
-            className="block text-sm font-medium text-text-primary mb-1"
+            className="form-label"
           >
-            Name
+            {t("auth.name")}
           </label>
           <input
             id="name"
@@ -63,17 +63,17 @@ export default function SignupPage() {
             required
             value={name}
             onChange={(e) => setName(e.target.value)}
-            className="w-full rounded-lg border border-border bg-surface-card px-3 py-2 text-sm text-text-primary placeholder:text-text-tertiary focus:outline-none focus:ring-2 focus:ring-accent"
-            placeholder="Your name"
+            className="ui-input"
+            placeholder={t("auth.yourName")}
           />
         </div>
 
-        <div>
+        <div className="form-field">
           <label
             htmlFor="email"
-            className="block text-sm font-medium text-text-primary mb-1"
+            className="form-label"
           >
-            Email
+            {t("auth.email")}
           </label>
           <input
             id="email"
@@ -81,17 +81,17 @@ export default function SignupPage() {
             required
             value={email}
             onChange={(e) => setEmail(e.target.value)}
-            className="w-full rounded-lg border border-border bg-surface-card px-3 py-2 text-sm text-text-primary placeholder:text-text-tertiary focus:outline-none focus:ring-2 focus:ring-accent"
+            className="ui-input"
             placeholder="you@example.com"
           />
         </div>
 
-        <div>
+        <div className="form-field">
           <label
             htmlFor="password"
-            className="block text-sm font-medium text-text-primary mb-1"
+            className="form-label"
           >
-            Password
+            {t("auth.password")}
           </label>
           <input
             id="password"
@@ -100,24 +100,24 @@ export default function SignupPage() {
             minLength={8}
             value={password}
             onChange={(e) => setPassword(e.target.value)}
-            className="w-full rounded-lg border border-border bg-surface-card px-3 py-2 text-sm text-text-primary placeholder:text-text-tertiary focus:outline-none focus:ring-2 focus:ring-accent"
-            placeholder="At least 8 characters"
+            className="ui-input"
+            placeholder={t("auth.passwordHint")}
           />
         </div>
 
         <button
           type="submit"
           disabled={loading}
-          className="w-full rounded-lg bg-accent px-4 py-2 text-sm font-medium text-white hover:opacity-90 transition-opacity disabled:opacity-50 cursor-pointer"
+          className="ui-button ui-button--primary w-full"
         >
-          {loading ? "Creating account..." : "Sign up"}
+          {loading ? t("auth.creatingAccount") : t("auth.signUp")}
         </button>
       </form>
 
-      <p className="text-center text-sm text-text-secondary">
-        Already have an account?{" "}
-        <Link href="/login" className="text-accent hover:underline">
-          Sign in
+      <p className="auth-footer text-center">
+        {t("auth.haveAccount")}{" "}
+        <Link href="/login" className="text-accent hover:underline underline-offset-4">
+          {t("auth.signIn")}
         </Link>
       </p>
     </div>

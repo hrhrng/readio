@@ -79,6 +79,42 @@ fn html_does_not_duplicate_nested_containers() {
     assert_eq!(hits, 1, "div + p wrapping should collapse: {paras:?}");
 }
 
+#[test]
+fn html_file_loads_through_the_shared_document_engine() {
+    let dir = std::env::temp_dir().join(format!("readio-html-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create HTML fixture dir");
+    let path = dir.join("portable.html");
+    std::fs::write(
+        &path,
+        r#"<html><body>
+            <h1>A portable book</h1>
+            <p>Shared parsing keeps this paragraph.</p>
+            <blockquote>And this quotation.</blockquote>
+            <script>Never render this.</script>
+        </body></html>"#,
+    )
+    .expect("write HTML fixture");
+
+    let book = Book::load(Some(&path)).expect("load HTML through shared core");
+
+    assert_eq!(book.title, "A portable book");
+    assert_eq!(book.chapters.len(), 1);
+    assert!(
+        book.chapters[0]
+            .paras
+            .iter()
+            .any(|para| matches!(para, Para::Quote(text) if text == "And this quotation."))
+    );
+    assert!(
+        !book.chapters[0]
+            .paras
+            .iter()
+            .any(|para| para.text().contains("Never render"))
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 // ── plain text ───────────────────────────────────────────────────────────────
 
 #[test]
@@ -104,6 +140,50 @@ fn text_preserves_fenced_code() {
         })
         .expect("code block");
     assert!(code.contains("fn main"), "code lost: {code}");
+}
+
+#[test]
+fn markdown_file_projects_the_shared_reader_ir_semantics() {
+    let dir = std::env::temp_dir().join(format!("readio-markdown-ir-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create Markdown fixture dir");
+    let path = dir.join("shared.md");
+    std::fs::write(
+        &path,
+        "# Shared Markdown\n\nRead **one thing** well.\n\n> A shared quote.\n\n```rs\nlet calm = true;\n```\n",
+    )
+    .expect("write Markdown fixture");
+
+    let book = Book::load(Some(&path)).expect("load Markdown through shared Reader IR");
+    let paras = book
+        .chapters
+        .iter()
+        .flat_map(|chapter| chapter.paras.iter())
+        .collect::<Vec<_>>();
+    let paragraph = paras
+        .iter()
+        .find(|para| matches!(para, Para::Text(text) if text.text == "Read one thing well."))
+        .expect("Markdown paragraph without source markers");
+    let emphasis = paragraph.emphasis();
+
+    assert_eq!(book.title, "Shared Markdown");
+    assert_eq!(emphasis.len(), 1);
+    assert_eq!(
+        &paragraph.text()[emphasis[0].start as usize..emphasis[0].end as usize],
+        "one thing"
+    );
+    assert!(emphasis[0].strong);
+    assert!(
+        paras
+            .iter()
+            .any(|para| matches!(para, Para::Quote(text) if text.text == "A shared quote."))
+    );
+    assert!(
+        paras
+            .iter()
+            .any(|para| matches!(para, Para::Code(text) if text == "let calm = true;"))
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 // ── book arithmetic ──────────────────────────────────────────────────────────
@@ -155,6 +235,35 @@ fn progress_and_search_agree_with_the_content() {
         hits.total >= hits.shown.len() && hits.paragraphs > 0,
         "totals should be counted, not inferred from the shown list"
     );
+}
+
+#[test]
+fn tui_search_projects_the_shared_rust_snippet_and_source_range() {
+    let dir = std::env::temp_dir().join(format!("readio-search-ir-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create search fixture dir");
+    let path = dir.join("search.md");
+    std::fs::write(
+        &path,
+        "# Search\n\nabcdefghijklmnopqrstuvwxNEEDLEabcdefghijklmnopqrstuvwx\n",
+    )
+    .expect("write search fixture");
+    let book = Book::load(Some(&path)).expect("load search fixture");
+
+    let hits = book.search("needle", 10);
+
+    assert_eq!(hits.total, 1);
+    assert_eq!(hits.paragraphs, 1);
+    assert_eq!(
+        hits.shown[0].excerpt,
+        "abcdefghijklmnopqrstuvwxNEEDLEabcdefghijklmnopqrstuvwx"
+    );
+    assert_eq!(
+        &book.chapters[hits.shown[0].chapter].paras[hits.shown[0].para].text()
+            [hits.shown[0].range.0..hits.shown[0].range.1],
+        "NEEDLE"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 // ── reading flow ─────────────────────────────────────────────────────────────

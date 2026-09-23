@@ -871,6 +871,14 @@ pub static COMMANDS: &[Command] = &[
         example: "",
     },
     Command {
+        name: "sleep", args: "<minutes|off>",
+        zh: "按墙钟设定睡眠暂停",
+        en: "Pause reading on a wall-clock deadline",
+        zh_more: "输入分钟数设置截止时间，+分钟在当前截止时间上延长，off 取消。界面挂起也不会丢掉时间；到点只暂停，不会改变手动、自动或朗读模式。",
+        en_more: "Set an absolute deadline in minutes, extend it with +minutes, or cancel with off. UI suspension cannot lose wall-clock time; expiry pauses without changing Manual, Auto, or Read-aloud.",
+        example: "/sleep 30",
+    },
+    Command {
         name: "plan", args: "",
         zh: "把章节当待办清单看",
         en: "The chapters as a checklist",
@@ -949,6 +957,14 @@ pub static COMMANDS: &[Command] = &[
         zh_more: "把上面读过的内容从屏幕上抹掉，好让下一段干净地开始。阅读位置、标记、这次的读数都不受影响——清掉的只是屏幕，不是进度。^l 也一样。",
         en_more: "Wipes what is on screen so the next passage starts on a clean one. Your position, your marks and this session's readout are untouched — only the screen is cleared, not the progress. ^l does the same.",
         example: "",
+    },
+    Command {
+        name: "diagnostics", args: "",
+        zh: "导出这次会话的脱敏支持包",
+        en: "Export a redacted support bundle for this session",
+        zh_more: "把最近的导入、解析、同步、TTS 和播放时钟事实写到 ~/.readio/support。所有字段都再次经过 Rust 白名单；正文、网址、凭据和 API 密钥绝不会进入支持包。",
+        en_more: "Writes recent import, parsing, sync, TTS and playback-clock facts under ~/.readio/support. Rust applies its allowlist again; book text, URLs, credentials and API keys never enter the bundle.",
+        example: "/diagnostics",
     },
     Command {
         name: "help", args: "",

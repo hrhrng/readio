@@ -52,15 +52,6 @@ final class APIClientTests: XCTestCase {
         XCTAssertEqual(APIEndpoints.updateChapter(id: id), "/api/library/items/doc-abc123/chapter")
     }
 
-    /// Verify TTS endpoints.
-    func testTTSEndpoints() {
-        XCTAssertEqual(APIEndpoints.ttsJobs, "/api/tts/jobs")
-        XCTAssertEqual(APIEndpoints.ttsJob(id: "job-1"), "/api/tts/jobs/job-1")
-        XCTAssertEqual(APIEndpoints.ttsJobWithAudio(id: "job-1"), "/api/tts/jobs/job-1?include_audio=true")
-        XCTAssertEqual(APIEndpoints.cancelSession(id: "sess-1"), "/api/tts/sessions/sess-1/cancel")
-        XCTAssertEqual(APIEndpoints.voices, "/api/tts/voices")
-    }
-
     // MARK: - JSON decoding
 
     /// Verify that the JSON decoder handles snake_case → camelCase conversion
@@ -118,41 +109,6 @@ final class APIClientTests: XCTestCase {
         XCTAssertEqual(response.page, 1)
         XCTAssertEqual(response.pageSize, 20)
         XCTAssertEqual(response.totalPages, 0)
-    }
-
-    /// Verify TTS job status decoding with all optional fields present.
-    func testTTSJobStatusDecoding() throws {
-        let json = """
-        {
-            "job_id": "job-xyz",
-            "session_id": "sess-123",
-            "item_id": "doc-001",
-            "chapter_id": "main",
-            "priority": "user",
-            "status": "completed",
-            "provider": "minimax",
-            "trace_id": "trace-456",
-            "duration_ms": 3200.5,
-            "sample_rate": 24000,
-            "error": null,
-            "cache_hit": true,
-            "created_at_ms": 1700000000000,
-            "started_at_ms": 1700000000100,
-            "finished_at_ms": 1700000003300,
-            "audio_base64": "SGVsbG8="
-        }
-        """.data(using: .utf8)!
-
-        let decoder = JSONDecoder()
-        decoder.keyDecodingStrategy = .convertFromSnakeCase
-
-        let status = try decoder.decode(TTSJobStatusResponse.self, from: json)
-        XCTAssertEqual(status.jobId, "job-xyz")
-        XCTAssertEqual(status.status, .completed)
-        XCTAssertEqual(status.priority, .user)
-        XCTAssertTrue(status.cacheHit)
-        XCTAssertEqual(status.durationMs, 3200.5)
-        XCTAssertEqual(status.audioBase64, "SGVsbG8=")
     }
 
     // MARK: - ReadingStatus computation

@@ -3,7 +3,7 @@
 import { useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { createPortal } from "react-dom";
-import { Settings, HelpCircle, LogOut } from "lucide-react";
+import { Settings, HelpCircle, LogIn, LogOut } from "lucide-react";
 import { useSession, signOut } from "@/lib/auth-client";
 
 interface UserPopoverProps {
@@ -49,30 +49,33 @@ export function UserPopover({ open, onClose, onOpenSettings, triggerRef }: UserP
 
   if (!open) return null;
 
-  // Horizontally centered within the sidebar (w-60 = 240px), above trigger
-  const SIDEBAR_WIDTH = 240;
-  const POPOVER_WIDTH = SIDEBAR_WIDTH - 24;
   const triggerRect = triggerRef.current?.getBoundingClientRect();
   const style: React.CSSProperties = {
     position: "fixed",
-    bottom: triggerRect ? window.innerHeight - triggerRect.top + 6 : 60,
-    left: (SIDEBAR_WIDTH - POPOVER_WIDTH) / 2,
-    width: POPOVER_WIDTH,
+    bottom: triggerRect
+      ? `calc(100vh - ${triggerRect.top}px + var(--space-2))`
+      : "var(--space-16)",
+    left: triggerRect?.left ?? "var(--space-3)",
+    width: triggerRect?.width ?? "calc(var(--shell-sidebar-width) - var(--space-6))",
   };
 
-  const userEmail = session?.user?.email ?? "reader@readio.app";
+  const userEmail = session?.user?.email;
 
   return createPortal(
     <div
       ref={panelRef}
       style={style}
-      className="z-50 bg-surface-card border border-border rounded-xl shadow-lg py-1.5"
+      className="surface-popover"
     >
-      {/* User info */}
-      <div className="px-3.5 py-2.5">
+      <div className="px-3 py-2">
         <p className="text-sm font-medium text-text-primary truncate">
-          {userEmail}
+          {userEmail ?? "Local library"}
         </p>
+        {!userEmail && (
+          <p className="mt-0.5 text-xs text-text-secondary">
+            Stored on this device
+          </p>
+        )}
       </div>
 
       <Divider />
@@ -81,7 +84,6 @@ export function UserPopover({ open, onClose, onOpenSettings, triggerRef }: UserP
       <PopoverItem
         icon={Settings}
         label="Settings"
-        shortcut="⌘,"
         onClick={onOpenSettings}
       />
 
@@ -97,16 +99,26 @@ export function UserPopover({ open, onClose, onOpenSettings, triggerRef }: UserP
 
       <Divider />
 
-      {/* Log out */}
-      <PopoverItem
-        icon={LogOut}
-        label="Log out"
-        onClick={async () => {
-          onClose();
-          await signOut();
-          router.push("/login");
-        }}
-      />
+      {session ? (
+        <PopoverItem
+          icon={LogOut}
+          label="Log out"
+          onClick={async () => {
+            onClose();
+            await signOut();
+            router.push("/");
+          }}
+        />
+      ) : (
+        <PopoverItem
+          icon={LogIn}
+          label="Sign in to sync"
+          onClick={() => {
+            onClose();
+            router.push("/login");
+          }}
+        />
+      )}
     </div>,
     document.body
   );
@@ -121,24 +133,23 @@ function Divider() {
 function PopoverItem({
   icon: Icon,
   label,
-  shortcut,
   onClick,
 }: {
-  icon: React.ComponentType<{ size?: number; strokeWidth?: number }>;
+  icon: React.ComponentType<{
+    size?: number;
+    strokeWidth?: number;
+    className?: string;
+  }>;
   label: string;
-  shortcut?: string;
   onClick?: () => void;
 }) {
   return (
     <button
       onClick={onClick}
-      className="flex items-center gap-3 w-full px-3.5 py-2 text-sm text-text-secondary hover:bg-surface-hover hover:text-text-primary transition-colors cursor-pointer"
+      className="popover-item"
     >
-      <Icon size={16} strokeWidth={1.5} />
+      <Icon className="ui-icon-sm" />
       <span className="flex-1 text-left">{label}</span>
-      {shortcut && (
-        <span className="text-xs text-text-tertiary">{shortcut}</span>
-      )}
     </button>
   );
 }

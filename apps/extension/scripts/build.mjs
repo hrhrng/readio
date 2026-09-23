@@ -16,6 +16,10 @@ const entries = [
 function copyStaticFiles() {
   copyFileSync(resolve(rootDir, 'manifest.json'), resolve(distDir, 'manifest.json'))
   copyFileSync(resolve(rootDir, 'src/popup.html'), resolve(distDir, 'popup.html'))
+  copyFileSync(
+    resolve(rootDir, '../web/wasm/readio_wasm_bg.wasm'),
+    resolve(distDir, 'readio_wasm_bg.wasm'),
+  )
 }
 
 function ensureDist() {

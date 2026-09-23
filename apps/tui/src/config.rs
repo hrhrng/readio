@@ -561,7 +561,7 @@ impl Config {
             },
             input_log = match &self.input_log {
                 Some(path) => format!(
-                    "\n# 调试：记录按键、断句和音频时钟 / log input and voice timing\ninput_log: {path}\n"
+                    "\n# 开发者原始日志：含按键、断句和最多 120 字正文，不要分享\n# developer raw log: includes keys, sentence boundaries and up to 120 book chars; do not share\ninput_log: {path}\n"
                 ),
                 None => String::new(),
             },

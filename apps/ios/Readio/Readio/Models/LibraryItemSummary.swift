@@ -29,6 +29,7 @@ struct LibraryItemSummary: Codable, Identifiable, Sendable {
     let voice: String?
     let speed: Double?
     let contentFormat: String?
+    var importRecord: ReadioImportRecord? = nil
 
     // MARK: - Computed Properties
 
@@ -55,5 +56,6 @@ struct LibraryItemSummary: Codable, Identifiable, Sendable {
         case voice
         case speed
         case contentFormat = "content_format"
+        case importRecord = "import_record"
     }
 }

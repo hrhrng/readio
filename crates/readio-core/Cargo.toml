@@ -1,0 +1,25 @@
+[package]
+name = "readio-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Platform-independent domain and application engine for Readio"
+
+[features]
+default = []
+native-media = ["dep:pdf-extract", "dep:quick-xml", "dep:zip"]
+
+[dependencies]
+blake3.workspace = true
+html5ever.workspace = true
+markup5ever_rcdom.workspace = true
+pdf-extract = { workspace = true, optional = true }
+pulldown-cmark.workspace = true
+quick-xml = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+url.workspace = true
+unicode-segmentation.workspace = true
+zip = { workspace = true, optional = true }

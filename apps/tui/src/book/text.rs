@@ -6,7 +6,9 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
+use readio_sdk::ReadioSdk;
+use readio_sdk::documents::HtmlParseOptions;
 
 use super::{Book, Chapter, Para, Source};
 
@@ -50,6 +52,79 @@ pub fn load(path: &Path, assets: Option<&Path>) -> Result<Book> {
         chapters,
         cover: None,
     })
+}
+
+/// Load Markdown through the shared Reader IR and only project its semantic
+/// blocks into terminal chapters. Markdown syntax never reaches the renderer.
+pub fn load_markdown(path: &Path, assets: Option<&Path>) -> Result<Book> {
+    let raw = std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
+    let markdown = String::from_utf8_lossy(&raw).replace("\r\n", "\n");
+    let href = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "book.md".to_string());
+    let mut chapters = parse_markdown(&markdown, &href)?;
+    let base = path.parent().unwrap_or(Path::new("."));
+    for chapter in &mut chapters {
+        resolve_images(&mut chapter.paras, base, assets);
+    }
+    anyhow::ensure!(
+        !chapters.is_empty(),
+        "{} has no readable text",
+        path.display()
+    );
+    let title = chapters
+        .first()
+        .map(|chapter| chapter.title.clone())
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| {
+            path.file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Untitled".to_string())
+        });
+
+    Ok(Book {
+        id: String::new(),
+        title,
+        author: None,
+        path: Some(path.to_path_buf()),
+        source: Source::Text,
+        chapters,
+        cover: None,
+    })
+}
+
+/// Shared Markdown parsing plus the TUI-specific chapter projection. Chapter
+/// cuts inspect semantic heading blocks emitted by Rust Core, never source
+/// markers, so block text and inline ranges stay identical across clients.
+pub fn parse_markdown(markdown: &str, href: &str) -> Result<Vec<Chapter>> {
+    let reader = ReadioSdk::new()
+        .documents
+        .parse_markdown_reader(markdown, &HtmlParseOptions::default())
+        .map_err(|error| anyhow!("cannot parse Markdown: {error:?}"))?;
+    let paras = super::html::project_document(&reader.document);
+    Ok(split_semantic_chapters(paras, href))
+}
+
+fn split_semantic_chapters(paras: Vec<Para>, href: &str) -> Vec<Chapter> {
+    let mut chapters = Vec::new();
+    let mut current = Chapter::new(String::new(), href.to_string(), Vec::new());
+    for para in paras {
+        if let Para::Heading { level, text } = &para {
+            if *level <= 2 && !current.paras.is_empty() {
+                chapters.push(finish(current, chapters.len()));
+                current = Chapter::new(text.clone(), href.to_string(), Vec::new());
+            }
+            if current.title.is_empty() {
+                current.title = text.clone();
+            }
+        }
+        current.paras.push(para);
+    }
+    if !current.paras.is_empty() {
+        chapters.push(finish(current, chapters.len()));
+    }
+    chapters
 }
 
 /// `![alt](path)` on a line of its own → an illustration.

@@ -25,6 +25,8 @@ import SwiftUI
 ///   (the parent `HomeView` handles section visibility).
 struct SectionCarouselView: View {
 
+    @Environment(\.readioTheme) private var theme
+
     // MARK: - Properties
 
     /// The section header title (e.g., "Continue Reading", "Recently Added").
@@ -32,6 +34,17 @@ struct SectionCarouselView: View {
 
     /// The items to display as book cards in the horizontal scroller.
     let items: [LibraryItemSummary]
+    let onOpenReader: ((String) -> Void)?
+
+    init(
+        title: String,
+        items: [LibraryItemSummary],
+        onOpenReader: ((String) -> Void)? = nil
+    ) {
+        self.title = title
+        self.items = items
+        self.onOpenReader = onOpenReader
+    }
 
     // MARK: - Body
 
@@ -51,25 +64,41 @@ struct SectionCarouselView: View {
                 horizontalCarousel
             }
         }
+        .frame(width: desktopShelfWidth, alignment: .leading)
+    }
+
+    private var desktopShelfWidth: CGFloat? {
+        #if os(macOS)
+        CGFloat(
+            AppleReaderSurfacePolicy.homeShelfWidth(
+                itemCount: items.count,
+                cardWidth: Double(ReadioAppleLayout.bookCoverWidth)
+            )
+        )
+        #else
+        nil
+        #endif
     }
 
     // MARK: - Section Header
 
-    /// The title row with a "See All" navigation link on the trailing side.
+    /// Keep the action attached to its label. An item-count-sized shelf must
+    /// not turn the same action into a different floating coordinate per row.
     private var sectionHeader: some View {
-        HStack(alignment: .firstTextBaseline) {
+        HStack(
+            alignment: .firstTextBaseline,
+            spacing: AppleReaderSurfacePolicy.homeShelfHeaderGap
+        ) {
             Text(title)
                 .font(.title3)
                 .fontWeight(.bold)
                 .foregroundStyle(.primary)
 
-            Spacer()
-
             // "See All" navigates to the full library view.
             // In a real implementation, this would pass a filter parameter
             // so the LibraryView pre-filters to the relevant subset.
             NavigationLink {
-                LibraryView()
+                LibraryView(onOpenReader: onOpenReader)
             } label: {
                 HStack(spacing: 2) {
                     Text("See All")
@@ -78,9 +107,11 @@ struct SectionCarouselView: View {
                     Image(systemName: "chevron.right")
                         .font(.caption)
                 }
-                .foregroundStyle(.accentColor)
+                .foregroundStyle(theme.shelfAction)
             }
+            .buttonStyle(.plain)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal)
     }
 
@@ -95,8 +126,18 @@ struct SectionCarouselView: View {
         ScrollView(.horizontal, showsIndicators: false) {
             LazyHStack(spacing: 14) {
                 ForEach(items) { item in
-                    NavigationLink(value: item.id) {
-                        BookCardView(item: item)
+                    Group {
+                        if let onOpenReader {
+                            Button {
+                                onOpenReader(item.id)
+                            } label: {
+                                BookCardView(item: item)
+                            }
+                        } else {
+                            NavigationLink(value: item.id) {
+                                BookCardView(item: item)
+                            }
+                        }
                     }
                     .buttonStyle(.plain) // Prevents the default blue tint on the card
                 }
@@ -132,7 +173,7 @@ struct SectionCarouselView: View {
         }
         .background(
             RoundedRectangle(cornerRadius: 12)
-                .fill(Color(.secondarySystemGroupedBackground))
+                .fill(.background)
         )
         .padding(.horizontal)
     }

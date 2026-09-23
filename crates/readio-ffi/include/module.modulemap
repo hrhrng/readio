@@ -1,0 +1,4 @@
+module ReadioCore {
+    header "readio.h"
+    export *
+}

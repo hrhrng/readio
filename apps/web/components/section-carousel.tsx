@@ -1,5 +1,8 @@
+"use client";
+
 import Link from "next/link";
 import { ChevronRight } from "lucide-react";
+import { useLocale } from "./locale-provider";
 
 interface SectionCarouselProps {
   title: string;
@@ -14,28 +17,27 @@ export function SectionCarousel({
   href,
   children,
 }: SectionCarouselProps) {
+  const { t } = useLocale();
   return (
-    <section className="mb-10">
-      <div className="flex items-baseline justify-between mb-4">
+    <section className="content-section">
+      <div className="section-header">
         <div>
-          <h2 className="text-2xl font-bold text-text-primary font-serif">
-            {title}
-          </h2>
+          <h2 className="section-title">{title}</h2>
           {subtitle && (
-            <p className="text-sm text-text-secondary mt-0.5">{subtitle}</p>
+            <p className="section-description">{subtitle}</p>
           )}
         </div>
         {href && (
           <Link
             href={href}
-            className="flex items-center gap-1 text-sm text-accent hover:underline"
+            className="section-link"
           >
-            See All
-            <ChevronRight size={16} />
+            {t("common.seeAll")}
+            <ChevronRight className="ui-icon-sm" aria-hidden="true" />
           </Link>
         )}
       </div>
-      <div className="flex gap-4 overflow-x-auto scrollbar-hide pb-2">
+      <div className="carousel-track">
         {children}
       </div>
     </section>

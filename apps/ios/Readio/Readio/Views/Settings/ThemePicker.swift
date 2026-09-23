@@ -27,6 +27,8 @@ import SwiftUI
 /// view hierarchy (typically in `ContentView` or the `App` struct) based on this value.
 struct ThemePicker: View {
 
+    @Environment(\.locale) private var locale
+
     // MARK: - Properties
 
     /// Binding to the current theme string. Valid values: "system", "light", "dark".
@@ -52,7 +54,14 @@ struct ThemePicker: View {
             // control appearance. Each segment shows an icon and label.
             Picker("Theme", selection: $theme) {
                 ForEach(options, id: \.id) { option in
-                    Label(option.label, systemImage: option.icon)
+                    Label(
+                        AppleLocalization.string(
+                            option.label,
+                            defaultValue: option.label,
+                            locale: locale
+                        ),
+                        systemImage: option.icon
+                    )
                         .tag(option.id)
                 }
             }

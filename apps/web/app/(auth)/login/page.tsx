@@ -4,8 +4,12 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { signIn } from "@/lib/auth-client";
+import { BrandMark } from "@/components/brand-mark";
+import { InlineFeedback } from "@/components/feedback";
+import { useLocale } from "@/components/locale-provider";
 
 export default function LoginPage() {
+  const { t } = useLocale();
   const router = useRouter();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -23,39 +27,38 @@ export default function LoginPage() {
     });
 
     if (authError) {
-      setError(authError.message ?? "Sign in failed");
+      setError(authError.message ?? t("auth.signInFailed"));
       setLoading(false);
       return;
     }
 
-    router.push("/");
+    const requested = new URLSearchParams(window.location.search).get("redirect");
+    const destination =
+      requested?.startsWith("/") && !requested.startsWith("//")
+        ? requested
+        : "/";
+    router.push(destination);
     router.refresh();
   }
 
   return (
-    <div className="w-full max-w-sm space-y-6">
-      <div className="text-center">
-        <h1 className="text-3xl font-bold font-serif text-text-primary">
-          Readio
+    <div className="auth-frame auth-stack">
+      <div className="auth-heading">
+        <h1 className="auth-brand">
+          <BrandMark size="lg" />
         </h1>
-        <p className="mt-2 text-sm text-text-secondary">
-          Sign in to your account
-        </p>
+        <p className="auth-description">{t("auth.signInDescription")}</p>
       </div>
 
-      <form onSubmit={handleSubmit} className="space-y-4">
-        {error && (
-          <div className="rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 p-3 text-sm text-red-700 dark:text-red-400">
-            {error}
-          </div>
-        )}
+      <form onSubmit={handleSubmit} className="auth-form">
+        {error && <InlineFeedback tone="danger">{error}</InlineFeedback>}
 
-        <div>
+        <div className="form-field">
           <label
             htmlFor="email"
-            className="block text-sm font-medium text-text-primary mb-1"
+            className="form-label"
           >
-            Email
+            {t("auth.email")}
           </label>
           <input
             id="email"
@@ -63,17 +66,17 @@ export default function LoginPage() {
             required
             value={email}
             onChange={(e) => setEmail(e.target.value)}
-            className="w-full rounded-lg border border-border bg-surface-card px-3 py-2 text-sm text-text-primary placeholder:text-text-tertiary focus:outline-none focus:ring-2 focus:ring-accent"
+            className="ui-input"
             placeholder="you@example.com"
           />
         </div>
 
-        <div>
+        <div className="form-field">
           <label
             htmlFor="password"
-            className="block text-sm font-medium text-text-primary mb-1"
+            className="form-label"
           >
-            Password
+            {t("auth.password")}
           </label>
           <input
             id="password"
@@ -81,24 +84,29 @@ export default function LoginPage() {
             required
             value={password}
             onChange={(e) => setPassword(e.target.value)}
-            className="w-full rounded-lg border border-border bg-surface-card px-3 py-2 text-sm text-text-primary placeholder:text-text-tertiary focus:outline-none focus:ring-2 focus:ring-accent"
-            placeholder="Enter your password"
+            className="ui-input"
+            placeholder={t("auth.enterPassword")}
           />
         </div>
 
         <button
           type="submit"
           disabled={loading}
-          className="w-full rounded-lg bg-accent px-4 py-2 text-sm font-medium text-white hover:opacity-90 transition-opacity disabled:opacity-50 cursor-pointer"
+          className="ui-button ui-button--primary w-full"
         >
-          {loading ? "Signing in..." : "Sign in"}
+          {loading ? t("auth.signingIn") : t("auth.signIn")}
         </button>
       </form>
 
-      <p className="text-center text-sm text-text-secondary">
-        Don&apos;t have an account?{" "}
-        <Link href="/signup" className="text-accent hover:underline">
-          Sign up
+      <p className="auth-footer text-center">
+        {t("auth.noAccount")}{" "}
+        <Link href="/signup" className="text-accent hover:underline underline-offset-4">
+          {t("auth.signUp")}
+        </Link>
+      </p>
+      <p className="auth-footer text-center">
+        <Link href="/" className="text-text-secondary hover:text-text-primary">
+          {t("auth.continueLocal")}
         </Link>
       </p>
     </div>

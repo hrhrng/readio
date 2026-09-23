@@ -107,60 +107,6 @@ enum APIEndpoints {
         "/api/library/items/\(id)/chapter"
     }
 
-    // MARK: - Library Import
-
-    /// Path for importing a document via file upload (multipart form POST).
-    /// `POST /api/library/import/file`
-    /// Accepts: file, category, folder_id, title, cover_image
-    static var importFile: String {
-        "/api/library/import/file"
-    }
-
-    /// Path for importing a document from a URL.
-    /// `POST /api/library/import/url`
-    /// Body: `{"url": "https://...", "category": "imported", "folder_id": "f1"}`
-    static var importURL: String {
-        "/api/library/import/url"
-    }
-
-    // MARK: - TTS Jobs
-
-    /// Path for creating a new TTS synthesis job.
-    /// `POST /api/tts/jobs`
-    static var ttsJobs: String {
-        "/api/tts/jobs"
-    }
-
-    /// Path for polling a TTS job's status (without audio data).
-    /// `GET /api/tts/jobs/{id}`
-    static func ttsJob(id: String) -> String {
-        "/api/tts/jobs/\(id)"
-    }
-
-    /// Path for polling a TTS job's status WITH the audio data included.
-    /// `GET /api/tts/jobs/{id}?include_audio=true`
-    ///
-    /// Only use this when the job status is `.completed` and you need the audio.
-    /// The audio_base64 field can be very large, so avoid requesting it unnecessarily.
-    static func ttsJobWithAudio(id: String) -> String {
-        "/api/tts/jobs/\(id)?include_audio=true"
-    }
-
-    /// Path for cancelling all pending jobs in a TTS session.
-    /// `POST /api/tts/sessions/{id}/cancel`
-    /// Body: `{"keep_item_id": "...", "keep_chapter_id": "..."}`
-    static func cancelSession(id: String) -> String {
-        "/api/tts/sessions/\(id)/cancel"
-    }
-
-    // MARK: - TTS Voices
-
-    /// Path for listing all available TTS voices.
-    /// `GET /api/tts/voices`
-    static var voices: String {
-        "/api/tts/voices"
-    }
-
     // MARK: - User Settings
 
     /// Path for reading/updating user settings (key-value store).

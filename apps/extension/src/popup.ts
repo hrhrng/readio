@@ -1,10 +1,14 @@
 import { buildSynthesizeUrl, createSynthesizePayload, type SynthesizeResponse, type TtsProvider } from './lib/tts-client'
 import { pickPlayableText, trimForTts } from './lib/selection'
-import { buildCreateLibraryItemUrl, buildLibraryItemPayload } from './lib/library-client'
+import { saveCapturedPage } from './lib/library-client'
+import { ChromeExtensionLibraryRepository } from './lib/extension-local-library'
+import { extensionReadioSdk } from './lib/readio-runtime'
 
 type ExtractResult = {
   selected: string
   article: string
+  selectedHtml: string
+  articleHtml: string
   pageTitle: string
   pageUrl: string
 }
@@ -41,6 +45,11 @@ const saveBtn = byId<HTMLButtonElement>('saveLibrary')
 const stopBtn = byId<HTMLButtonElement>('stopAudio')
 const audioEl = byId<HTMLAudioElement>('player')
 let lastCaptureMeta: { pageTitle: string; pageUrl: string } | null = null
+let lastCapture: ExtractResult | null = null
+const localLibrary = new ChromeExtensionLibraryRepository(
+  chrome.storage.local,
+  extensionReadioSdk,
+)
 
 function setStatus(message: string, isError: boolean = false): void {
   statusEl.textContent = message
@@ -76,7 +85,15 @@ async function extractFromActiveTab(): Promise<ExtractResult> {
   const injected = await chrome.scripting.executeScript({
     target: { tabId: tab.id },
     func: () => {
-      const selection = window.getSelection()?.toString().trim() ?? ''
+      const selection = window.getSelection()
+      const selected = selection?.toString().trim() ?? ''
+      let selectedHtml = ''
+      if (selection && selection.rangeCount > 0) {
+        const container = document.createElement('div')
+        container.append(selection.getRangeAt(0).cloneContents())
+        selectedHtml = container.innerHTML
+      }
+      const articleRoot = document.querySelector('article, main') || document.body
       const paragraphText = Array.from(document.querySelectorAll('article p, main p, p'))
         .slice(0, 24)
         .map((node) => node.textContent?.trim() ?? '')
@@ -84,8 +101,10 @@ async function extractFromActiveTab(): Promise<ExtractResult> {
         .join(' ')
 
       return {
-        selected: selection,
+        selected,
         article: paragraphText,
+        selectedHtml,
+        articleHtml: articleRoot?.innerHTML ?? '',
         pageTitle: document.title,
         pageUrl: location.href,
       }
@@ -161,6 +180,7 @@ async function captureSelection(): Promise<void> {
     const extract = await extractFromActiveTab()
     const text = trimForTts(pickPlayableText(extract.selected, extract.article))
     sourceEl.value = text
+    lastCapture = extract
     lastCaptureMeta = { pageTitle: extract.pageTitle, pageUrl: extract.pageUrl }
 
     if (!text) {
@@ -184,8 +204,6 @@ async function saveToLibrary(): Promise<void> {
     return
   }
 
-  const state = readStateFromForm()
-  await saveState(state)
   const sourceUrl = lastCaptureMeta?.pageUrl || 'chrome-extension://capture'
   const title = (lastCaptureMeta?.pageTitle || 'Captured Page').trim() || 'Captured Page'
 
@@ -193,30 +211,26 @@ async function saveToLibrary(): Promise<void> {
   setStatus('Saving to library...')
 
   try {
-    const response = await fetch(buildCreateLibraryItemUrl(state.apiBase), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(
-        buildLibraryItemPayload({
-          title,
-          content: text,
-          sourceUrl,
-        }),
-      ),
-    })
-
-    if (!response.ok) {
-      const detail = await response.text()
-      throw new Error(`API ${response.status}: ${detail}`)
-    }
-
-    setStatus('Saved to library')
+    const saved = await saveCapturedPage({
+      selectedHtml: lastCapture?.selectedHtml || '',
+      articleHtml: lastCapture?.articleHtml || `<p>${escapeHTML(text)}</p>`,
+      pageTitle: title,
+      pageUrl: sourceUrl,
+    }, localLibrary, extensionReadioSdk)
+    setStatus(`Saved locally · ${saved.content.length} chars`)
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Save failed'
     setStatus(message, true)
   } finally {
     setBusy(false)
   }
+}
+
+function escapeHTML(text: string): string {
+  return text
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
 }
 
 async function bootstrap(): Promise<void> {

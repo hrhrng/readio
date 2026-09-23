@@ -34,11 +34,26 @@ struct ReadioApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            ReadioThemedScene {
+                ContentView()
+            }
+        }
+        .commands {
+            ReadioCommands()
         }
         .onChange(of: scenePhase) { oldPhase, newPhase in
             handleScenePhaseChange(from: oldPhase, to: newPhase)
         }
+
+        #if os(macOS)
+        Settings {
+            ReadioThemedScene {
+                NavigationStack {
+                    SettingsView()
+                }
+            }
+        }
+        #endif
     }
 
     // MARK: - Private Helpers
@@ -56,6 +71,7 @@ struct ReadioApp: App {
     /// system-level behaviors like automatic ducking and "listen after speaking"
     /// routing for CarPlay / Bluetooth accessories.
     private func configureAudioSession() {
+        #if os(iOS)
         do {
             let session = AVAudioSession.sharedInstance()
             try session.setCategory(
@@ -69,6 +85,7 @@ struct ReadioApp: App {
             // will still work in the foreground, just not in the background.
             print("[ReadioApp] Failed to configure audio session: \(error.localizedDescription)")
         }
+        #endif
     }
 
     /// Responds to scene lifecycle transitions.
@@ -86,11 +103,87 @@ struct ReadioApp: App {
             // App has been fully backgrounded. Audio continues if session is active.
             NotificationCenter.default.post(name: .readioSaveProgress, object: nil)
         case .active:
-            // App returned to foreground — could refresh data here if needed.
-            break
+            Task {
+                _ = try? await AppleCloudService.shared.syncIfConnected()
+            }
         @unknown default:
             break
         }
+    }
+}
+
+private struct ReadioThemedScene<Content: View>: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @AppStorage(AppSettingsKeys.theme) private var storedTheme = "system"
+    @AppStorage(AppSettingsKeys.accentColor) private var storedAccent = "clover"
+    @AppStorage(AppleLocalization.preferenceKey) private var storedLanguage = "system"
+
+    let content: Content
+
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
+
+    var body: some View {
+        let palette = ReadioAppleTheme.palette(for: colorScheme)
+        content
+            .environment(\.readioTheme, palette)
+            .tint(palette.accent)
+            .foregroundStyle(palette.ink)
+            .background(palette.canvas.ignoresSafeArea())
+            .preferredColorScheme(ReadioAppleTheme.preferredColorScheme(storedTheme))
+            .environment(\.locale, AppleLocalization.locale(preference: storedLanguage))
+            .onAppear {
+                storedAccent = ReadioAppleTheme.normalizedAccentID(storedAccent)
+                storedLanguage = AppleLocalization.normalizedPreference(storedLanguage)
+            }
+    }
+}
+
+private struct ReadioCommands: Commands {
+    @FocusedValue(\.readioAppRouter) private var router
+
+    var body: some Commands {
+        CommandGroup(after: .newItem) {
+            Button("Import File…") {
+                router?.requestFileImport()
+            }
+            .disabled(router == nil)
+            .keyboardShortcut("o", modifiers: .command)
+        }
+
+        CommandMenu("Navigate") {
+            Button("Home") {
+                router?.navigate(to: .home)
+            }
+            .keyboardShortcut("1", modifiers: .command)
+
+            Button("Library") {
+                router?.navigate(to: .library)
+            }
+            .keyboardShortcut("2", modifiers: .command)
+
+            Button("Import") {
+                router?.navigate(to: .importItem)
+            }
+            .keyboardShortcut("3", modifiers: .command)
+
+            Button("Settings") {
+                router?.navigate(to: .settings)
+            }
+            .keyboardShortcut("4", modifiers: .command)
+        }
+    }
+}
+
+private struct ReadioAppRouterFocusedValueKey: FocusedValueKey {
+    typealias Value = AppleAppRouter
+}
+
+extension FocusedValues {
+    var readioAppRouter: AppleAppRouter? {
+        get { self[ReadioAppRouterFocusedValueKey.self] }
+        set { self[ReadioAppRouterFocusedValueKey.self] = newValue }
     }
 }
 

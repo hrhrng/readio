@@ -1,6 +1,29 @@
 import type { NextConfig } from "next";
 
+const apiOrigin =
+  process.env.READIO_API_ORIGIN ||
+  process.env.NEXT_PUBLIC_API_URL ||
+  "http://127.0.0.1:8000";
+
 const nextConfig: NextConfig = {
+  transpilePackages: ["@readio/sdk"],
+  async headers() {
+    return [
+      {
+        source: "/:path*",
+        headers: [
+          {
+            key: "Cross-Origin-Opener-Policy",
+            value: "same-origin",
+          },
+          {
+            key: "Cross-Origin-Embedder-Policy",
+            value: "require-corp",
+          },
+        ],
+      },
+    ];
+  },
   async rewrites() {
     return {
       beforeFiles: [],
@@ -8,16 +31,11 @@ const nextConfig: NextConfig = {
         {
           // Proxy all /api/* EXCEPT /api/auth/* to FastAPI
           source: "/api/:path((?!auth/).*)*",
-          destination: "http://127.0.0.1:8000/api/:path*",
+          destination: `${apiOrigin}/api/:path*`,
         },
       ],
       fallback: [],
     };
-  },
-  webpack: (config) => {
-    // pdf.js optional dependency
-    config.resolve.alias.canvas = false;
-    return config;
   },
 };
 

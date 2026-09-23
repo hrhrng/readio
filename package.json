@@ -23,7 +23,8 @@
       "better-sqlite3",
       "esbuild",
       "sharp",
-      "unrs-resolver"
+      "unrs-resolver",
+      "workerd"
     ]
   }
 }

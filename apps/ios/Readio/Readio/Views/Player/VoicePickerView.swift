@@ -104,7 +104,7 @@ struct VoicePickerView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            .listStyle(.insetGrouped)
+            .listStyle(.inset)
             .searchable(text: $searchText, prompt: "Search voices")
         }
     }
@@ -175,7 +175,7 @@ struct VoicePickerView: View {
                 if selectedVoiceId == nil {
                     Image(systemName: "checkmark.circle.fill")
                         .font(.title3)
-                        .foregroundStyle(.accentColor)
+                        .foregroundStyle(Color.accentColor)
                 }
             }
             .contentShape(Rectangle())
@@ -244,7 +244,7 @@ struct VoicePickerView: View {
                 if selectedVoiceId == voice.voiceId {
                     Image(systemName: "checkmark.circle.fill")
                         .font(.title3)
-                        .foregroundStyle(.accentColor)
+                        .foregroundStyle(Color.accentColor)
                 }
             }
             .contentShape(Rectangle())
@@ -308,7 +308,7 @@ private struct LanguageFilterChip: View {
                 .padding(.vertical, 6)
                 .background(
                     Capsule()
-                        .fill(isSelected ? Color.accentColor : Color(.secondarySystemGroupedBackground))
+                        .fill(isSelected ? Color.accentColor : Color.secondary.opacity(0.12))
                 )
         }
         .buttonStyle(.plain)

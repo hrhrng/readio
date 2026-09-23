@@ -4,6 +4,10 @@
 //! complete sentences where they do not. Each utterance keeps the byte range it
 //! came from, so when its audio starts the reader can highlight those words.
 
+use readio_sdk::ReadioSdk;
+use readio_sdk::documents::{Block, BlockKind, Document};
+use readio_sdk::highlight::{DocumentTextIndex, HighlightCursor};
+
 /// One thing to say, and where it sits in the passage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Utterance {
@@ -13,16 +17,130 @@ pub struct Utterance {
     pub range: (usize, usize),
 }
 
+/// Rust-owned sentence/word index plus the terminal-only source mapping.
+///
+/// Core ranges count Unicode scalars inside semantic blocks. The terminal
+/// renderer needs UTF-8 byte ranges inside the original passage; `sources` is
+/// the one-way adapter between those coordinate systems.
+pub struct HighlightPlan {
+    document: Document,
+    index: DocumentTextIndex,
+    sources: Vec<BlockSource>,
+}
+
+struct BlockSource {
+    block_id: String,
+    source_start: usize,
+    text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HighlightRange {
+    pub sentence: (usize, usize),
+    pub word: Option<(usize, usize)>,
+}
+
+impl HighlightPlan {
+    pub fn new(passage: &str) -> Option<Self> {
+        let lines = readable_lines(passage);
+        if lines.is_empty() {
+            return None;
+        }
+        let mut document = Document::default();
+        let mut sources = Vec::with_capacity(lines.len());
+        for (index, line) in lines.into_iter().enumerate() {
+            let block_id = format!("tui-passage-{index}");
+            document.blocks.push(Block {
+                id: block_id.clone(),
+                kind: BlockKind::Paragraph,
+                text: line.body.to_string(),
+                inline_spans: Vec::new(),
+            });
+            sources.push(BlockSource {
+                block_id,
+                source_start: line.start,
+                text: line.body.to_string(),
+            });
+        }
+        let index = ReadioSdk::new().documents.index_text(&document);
+        (!index.sentences.is_empty()).then_some(Self {
+            document,
+            index,
+            sources,
+        })
+    }
+
+    /// Resolve one media-clock sample through the shared Rust highlighter.
+    pub fn at(&self, progress: f32) -> Option<HighlightRange> {
+        let total = self
+            .index
+            .sentences
+            .iter()
+            .map(|sentence| sentence.text.chars().count() as u64)
+            .sum::<u64>();
+        if total == 0 {
+            return None;
+        }
+        let target =
+            ((progress.clamp(0.0, 1.0) as f64 * total as f64) as u64).min(total.saturating_sub(1));
+        let mut seen = 0_u64;
+        let sentence = self.index.sentences.iter().find(|sentence| {
+            let end = seen.saturating_add(sentence.text.chars().count() as u64);
+            let contains = target < end;
+            if !contains {
+                seen = end;
+            }
+            contains
+        })?;
+        let sentence_length = sentence.text.chars().count().max(1) as u64;
+        let word_progress_basis_points =
+            ((target.saturating_sub(seen) * 10_000) / sentence_length).min(10_000) as u16;
+        let target = ReadioSdk::new()
+            .documents
+            .resolve_highlight(
+                &self.document,
+                &self.index,
+                HighlightCursor {
+                    document_revision: self.document.revision.revision_digest.clone(),
+                    sentence_index: sentence.index,
+                    word_index: None,
+                    word_progress_basis_points: Some(word_progress_basis_points),
+                },
+            )
+            .ok()?;
+        let source = self
+            .sources
+            .iter()
+            .find(|source| source.block_id == target.block_id)?;
+        Some(HighlightRange {
+            sentence: source_range(source, target.sentence_range)?,
+            word: target
+                .word_range
+                .and_then(|range| source_range(source, range)),
+        })
+    }
+}
+
+fn source_range(source: &BlockSource, range: [u64; 2]) -> Option<(usize, usize)> {
+    Some((
+        source.source_start + scalar_to_byte(&source.text, range[0])?,
+        source.source_start + scalar_to_byte(&source.text, range[1])?,
+    ))
+}
+
+fn scalar_to_byte(text: &str, scalar: u64) -> Option<usize> {
+    let scalar = usize::try_from(scalar).ok()?;
+    if scalar == text.chars().count() {
+        return Some(text.len());
+    }
+    text.char_indices().nth(scalar).map(|(offset, _)| offset)
+}
+
 /// Sentence-final punctuation, Chinese and ASCII.
 const HARD_STOP: &str = "。！？…";
 /// Preferred synthesis-window ceiling. A complete sentence may exceed it: a
 /// semantic boundary is worth more than an arbitrary size guarantee.
 const MAX_CHARS: usize = 90;
-/// Below this, prefer to keep gluing clauses together. Chinese sentences are
-/// short — 「界面不是中立的。」 is eight characters — so the floor has to be low
-/// enough not to swallow them, while still refusing to synthesize 「好。」 alone.
-const MIN_CHARS: usize = 6;
-
 /// Split a passage into utterances.
 ///
 /// Understands the passage dialect used by the reader: `## ` headings, `> `
@@ -45,7 +163,26 @@ pub fn sentences(passage: &str) -> Vec<Utterance> {
 }
 
 fn paragraphs(passage: &str) -> Vec<Paragraph> {
-    let mut paragraphs: Vec<Paragraph> = Vec::new();
+    readable_lines(passage)
+        .into_iter()
+        .filter_map(|line| {
+            let clauses = split_line(line.body, line.start);
+            (!clauses.is_empty()).then_some(Paragraph {
+                clauses,
+                barrier_before: line.barrier_before,
+            })
+        })
+        .collect()
+}
+
+struct SourceLine<'a> {
+    body: &'a str,
+    start: usize,
+    barrier_before: bool,
+}
+
+fn readable_lines(passage: &str) -> Vec<SourceLine<'_>> {
+    let mut lines = Vec::new();
     let mut in_code = false;
     let mut barrier_before = false;
     // Byte offset of the current line within `passage`.
@@ -79,17 +216,17 @@ fn paragraphs(passage: &str) -> Vec<Paragraph> {
             0
         };
         let start = base + indent + marker;
-        let body = &line[indent + marker..];
-        let clauses = split_line(body, start);
-        if !clauses.is_empty() {
-            paragraphs.push(Paragraph {
-                clauses,
+        let body = line[indent + marker..].trim_end();
+        if !body.is_empty() {
+            lines.push(SourceLine {
+                body,
+                start,
                 barrier_before: std::mem::take(&mut barrier_before),
             });
         }
         base += advance;
     }
-    paragraphs
+    lines
 }
 
 struct Paragraph {
@@ -191,71 +328,27 @@ fn join(mut first: Utterance, second: Utterance, passage: &str) -> Utterance {
 
 /// Split one line of prose into utterances, offset by `origin`.
 fn split_line(line: &str, origin: usize) -> Vec<Utterance> {
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let mut current_start = 0usize;
-    let mut chars = 0usize;
-
-    let push = |text: &mut String, start: usize, end: usize, out: &mut Vec<Utterance>| {
-        let trimmed = text.trim();
-        if !trimmed.is_empty() {
-            out.push(Utterance {
-                text: trimmed.to_string(),
+    let mut document = Document::default();
+    document.blocks.push(Block {
+        id: "tui-fine-sentence".to_string(),
+        kind: BlockKind::Paragraph,
+        text: line.to_string(),
+        inline_spans: Vec::new(),
+    });
+    ReadioSdk::new()
+        .documents
+        .index_text(&document)
+        .sentences
+        .into_iter()
+        .filter_map(|sentence| {
+            let start = scalar_to_byte(line, sentence.range[0])?;
+            let end = scalar_to_byte(line, sentence.range[1])?;
+            Some(Utterance {
+                text: sentence.text,
                 range: (origin + start, origin + end),
-            });
-        }
-        text.clear();
-    };
-
-    for (index, ch) in line.char_indices() {
-        if current.is_empty() {
-            current_start = index;
-        }
-        current.push(ch);
-        chars += 1;
-
-        let end = index + ch.len_utf8();
-        let hard = HARD_STOP.contains(ch)
-            || (matches!(ch, '.' | '!' | '?')
-                && line[end..].chars().next().is_none_or(|n| n == ' ')
-                && !period_abbreviation(&current));
-        if hard && chars >= MIN_CHARS {
-            push(&mut current, current_start, end, &mut out);
-            chars = 0;
-        }
-    }
-    let end = line.len();
-    push(&mut current, current_start, end, &mut out);
-    out
-}
-
-fn period_abbreviation(text: &str) -> bool {
-    let token = text
-        .trim_end_matches('.')
-        .split_whitespace()
-        .next_back()
-        .unwrap_or_default()
-        .trim_matches(|ch: char| !ch.is_alphanumeric())
-        .to_lowercase();
-    matches!(
-        token.as_str(),
-        "e.g"
-            | "i.e"
-            | "etc"
-            | "trans"
-            | "ed"
-            | "eds"
-            | "p"
-            | "pp"
-            | "vol"
-            | "no"
-            | "mr"
-            | "mrs"
-            | "ms"
-            | "dr"
-            | "prof"
-            | "ph"
-    ) || (token.len() == 1 && token.chars().all(|ch| ch.is_ascii_alphabetic()))
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -413,195 +506,31 @@ mod tests {
         assert!(texts("\n\n   \n").is_empty());
         assert!(texts("```\ncode only\n```").is_empty());
     }
-}
-
-/// One step of the reading cursor: a word in a Latin script, a single character
-/// in Chinese or Japanese.
-///
-/// Chinese has no spaces to break on, and a character is the unit a reader's eye
-/// actually moves over, so per-character is both the only option and the right
-/// one. Latin words are kept whole because a highlight crawling through
-/// `attention` letter by letter reads as a stutter, not as speech.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Unit {
-    /// Byte range inside whatever text was passed in.
-    pub range: (usize, usize),
-    /// Characters in the unit, used to share out the clip's duration.
-    pub chars: usize,
-}
-
-/// Whether a character is a letter written without word spacing (CJK, kana,
-/// Hangul). Punctuation in those ranges — 。、！ — is deliberately excluded, so
-/// it attaches to the character before it instead of taking a step of its own.
-fn is_ideographic(c: char) -> bool {
-    c.is_alphanumeric()
-        && matches!(c as u32,
-        0x2E80..=0x9FFF      // CJK radicals through unified ideographs
-        | 0xA960..=0xA97F    // Hangul jamo extended
-        | 0xAC00..=0xD7AF    // Hangul syllables
-        | 0xF900..=0xFAFF    // CJK compatibility ideographs
-        | 0xFF00..=0xFF60    // fullwidth forms
-        | 0x1_0000..=0x1_FFFF
-        )
-}
-
-/// Split text into cursor units, in order and covering every non-space run.
-///
-/// Whitespace and punctuation are attached to the unit before them rather than
-/// becoming units of their own: a highlight that pauses on a comma looks like a
-/// bug, and the comma's time is better spent on the word it follows.
-pub fn units(text: &str) -> Vec<Unit> {
-    use unicode_segmentation::UnicodeSegmentation;
-
-    let mut out: Vec<Unit> = Vec::new();
-    for (offset, word) in text.split_word_bound_indices() {
-        if word.chars().all(char::is_whitespace) {
-            continue;
-        }
-        // Punctuation-only run: glue it onto the previous unit.
-        if word
-            .chars()
-            .all(|c| !c.is_alphanumeric() && !is_ideographic(c))
-            && let Some(last) = out.last_mut()
-        {
-            last.range.1 = offset + word.len();
-            continue;
-        }
-        if word.chars().next().is_some_and(is_ideographic) {
-            // No spaces to break on: one unit per character.
-            for (index, c) in word.char_indices() {
-                out.push(Unit {
-                    range: (offset + index, offset + index + c.len_utf8()),
-                    chars: 1,
-                });
-            }
-            continue;
-        }
-        out.push(Unit {
-            range: (offset, offset + word.len()),
-            chars: word.chars().count(),
-        });
-    }
-    out
-}
-
-/// The unit being sounded after `progress` of a clip has played, where
-/// `progress` runs 0.0 → 1.0.
-///
-/// Time is shared out by character count rather than by unit count, so a long
-/// English word holds the highlight longer than `a` does — which is what the
-/// audio does too.
-pub fn unit_at(units: &[Unit], progress: f32) -> Option<Unit> {
-    if units.is_empty() {
-        return None;
-    }
-    let total: usize = units.iter().map(|u| u.chars).sum();
-    if total == 0 {
-        return units.first().copied();
-    }
-    let target = (progress.clamp(0.0, 1.0) * total as f32).min(total as f32 - 0.001);
-    let mut seen = 0f32;
-    for unit in units {
-        seen += unit.chars as f32;
-        if target < seen {
-            return Some(*unit);
-        }
-    }
-    units.last().copied()
-}
-
-#[cfg(test)]
-mod cursor_tests {
-    use super::*;
 
     #[test]
-    fn chinese_advances_one_character_at_a_time() {
-        let text = "界面不是中立的。";
-        let units = units(text);
+    fn fine_sentences_follow_the_shared_rust_text_index() {
+        let fine = sentences("好。真的。");
         assert_eq!(
-            units.len(),
-            7,
-            "seven characters, the stop glued on: {units:?}"
+            fine.iter()
+                .map(|sentence| sentence.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["好。", "真的。"],
+            "TUI navigation must not keep a second sentence inside the first Rust range"
         );
-        assert_eq!(&text[units[0].range.0..units[0].range.1], "界");
-        let last = units.last().expect("a last unit");
+    }
+
+    #[test]
+    fn shared_highlight_maps_unicode_scalars_back_to_source_bytes() {
+        let text = "Next🙂 word?";
+        let plan = HighlightPlan::new(text).expect("shared text index");
+        let first = plan.at(0.0).expect("opening highlight");
+        let last = plan.at(0.8).expect("later highlight");
+
+        assert_eq!(&text[first.sentence.0..first.sentence.1], text);
         assert_eq!(
-            &text[last.range.0..last.range.1],
-            "的。",
-            "the full stop rides along with the character before it"
+            first.word.map(|range| &text[range.0..range.1]),
+            Some("Next")
         );
-        assert!(
-            units.iter().all(|u| u.chars == 1),
-            "each character carries one character of time"
-        );
-    }
-
-    #[test]
-    fn latin_advances_word_by_word() {
-        let text = "An interface is never neutral.";
-        let units = units(text);
-        let words: Vec<&str> = units.iter().map(|u| &text[u.range.0..u.range.1]).collect();
-        assert_eq!(
-            words,
-            vec!["An", "interface", "is", "never", "neutral."],
-            "punctuation joins the word it follows"
-        );
-        assert_eq!(units[1].chars, 9, "time is shared out by characters");
-    }
-
-    #[test]
-    fn mixed_scripts_split_at_the_boundary() {
-        let text = "用 ratatui 画界面";
-        let words: Vec<&str> = units(text)
-            .iter()
-            .map(|u| &text[u.range.0..u.range.1])
-            .collect();
-        assert_eq!(words, vec!["用", "ratatui", "画", "界", "面"]);
-    }
-
-    #[test]
-    fn the_cursor_walks_from_the_first_unit_to_the_last() {
-        let text = "界面不是中立的。";
-        let units = units(text);
-        let first = unit_at(&units, 0.0).expect("start");
-        let last = unit_at(&units, 1.0).expect("end");
-        assert_eq!(first, units[0], "progress 0 is the first unit");
-        assert_eq!(
-            last,
-            *units.last().expect("last"),
-            "progress 1 is the last unit, not past the end"
-        );
-
-        // Monotonic: the cursor never moves backwards.
-        let mut previous = 0usize;
-        for step in 0..=20 {
-            let unit = unit_at(&units, step as f32 / 20.0).expect("a unit");
-            assert!(
-                unit.range.0 >= previous,
-                "cursor went backwards at {step}: {unit:?}"
-            );
-            previous = unit.range.0;
-        }
-    }
-
-    #[test]
-    fn a_long_word_holds_the_cursor_longer_than_a_short_one() {
-        let text = "a internationalisation b";
-        let units = units(text);
-        let long = units[1];
-        let held = (0..100)
-            .filter(|step| unit_at(&units, *step as f32 / 100.0) == Some(long))
-            .count();
-        assert!(
-            held > 60,
-            "the long word should hold most of the clip: {held}%"
-        );
-    }
-
-    #[test]
-    fn empty_and_whitespace_text_have_no_units() {
-        assert!(units("").is_empty());
-        assert!(units("   \n  ").is_empty());
-        assert_eq!(unit_at(&[], 0.5), None, "no units means no cursor");
+        assert_eq!(last.word.map(|range| &text[range.0..range.1]), Some("word"));
     }
 }

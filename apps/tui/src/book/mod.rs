@@ -1,6 +1,5 @@
 //! Book model: the content side of the app, deliberately ignorant of the UI.
 
-pub mod css;
 pub mod epub;
 pub mod html;
 pub mod media;
@@ -11,6 +10,10 @@ pub mod text;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use readio_sdk::ReadioSdk;
+use readio_sdk::documents::{Document as CoreDocument, HtmlParseOptions};
+use readio_sdk::position::{Affinity, TextLocator};
+use readio_sdk::search::SearchRequest;
 
 /// A run of emphasised text inside a paragraph.
 ///
@@ -239,9 +242,13 @@ impl Book {
         let mut book = match ext.as_str() {
             "epub" => epub::load(&path)?,
             "pdf" => pdf::load(&path)?,
-            "txt" | "md" | "markdown" => text::load(&path, assets)?,
+            "html" | "htm" => html::load(&path)?,
+            "txt" => text::load(&path, assets)?,
+            "md" | "markdown" => text::load_markdown(&path, assets)?,
             other => {
-                anyhow::bail!("unsupported format `.{other}` (expected .epub, .pdf, .txt or .md)")
+                anyhow::bail!(
+                    "unsupported format `.{other}` (expected .epub, .pdf, .html, .txt or .md)"
+                )
             }
         };
         book.id = content_id(&path)?;
@@ -256,7 +263,10 @@ impl Book {
             .and_then(|e| e.to_str())
             .unwrap_or_default()
             .to_ascii_lowercase();
-        matches!(ext.as_str(), "epub" | "pdf" | "txt" | "md" | "markdown")
+        matches!(
+            ext.as_str(),
+            "epub" | "pdf" | "html" | "htm" | "txt" | "md" | "markdown"
+        )
     }
 
     pub fn char_count(&self) -> usize {
@@ -292,6 +302,81 @@ impl Book {
     pub fn progress(&self, chapter: usize, para: usize) -> f32 {
         let total = self.char_count().max(1);
         self.chars_before(chapter, para) as f32 / total as f32
+    }
+
+    /// Create the shared durable locator for a terminal chapter/paragraph.
+    ///
+    /// The terminal view is only a projection. Rebuilding its semantic blocks
+    /// through the same Rust Document IR used by Web and Apple gives progress a
+    /// coordinate independent of byte offsets, wrapping, and chapter cuts.
+    pub fn create_text_locator(&self, chapter: usize, para: usize) -> Option<TextLocator> {
+        let projected = self.locator_document()?;
+        let offset = projected.offset_before(chapter, para);
+        Some(ReadioSdk::new().documents.create_text_locator(
+            &projected.document,
+            offset,
+            Affinity::Forward,
+        ))
+    }
+
+    /// Resolve a shared locator back into the terminal's current chapter view.
+    pub fn restore_text_locator(&self, locator: &TextLocator) -> Option<(usize, usize)> {
+        let projected = self.locator_document()?;
+        let resolved = ReadioSdk::new()
+            .documents
+            .restore_text_locator(locator, &projected.document)
+            .ok()?;
+        projected.position_at(
+            resolved.projection.char_offset,
+            resolved.projection.block_id.as_deref(),
+        )
+    }
+
+    fn locator_document(&self) -> Option<LocatorDocument> {
+        let mut html = String::new();
+        let mut positions = Vec::new();
+        for (chapter_index, chapter) in self.chapters.iter().enumerate() {
+            for (para_index, para) in chapter.paras.iter().enumerate() {
+                let text = para.text();
+                if text.is_empty() {
+                    continue;
+                }
+                let escaped = escape_text_for_html(text);
+                match para {
+                    Para::Heading { level, .. } => {
+                        let level = (*level).clamp(1, 6);
+                        html.push_str(&format!("<h{level}>{escaped}</h{level}>"));
+                    }
+                    Para::Quote(_) => html.push_str(&format!("<blockquote>{escaped}</blockquote>")),
+                    Para::Code(_) => html.push_str(&format!("<pre>{escaped}</pre>")),
+                    Para::Text(_) | Para::Image { .. } => {
+                        html.push_str(&format!("<p>{escaped}</p>"));
+                    }
+                }
+                positions.push((chapter_index, para_index));
+            }
+        }
+        if positions.is_empty() {
+            return None;
+        }
+        let document = ReadioSdk::new()
+            .documents
+            .parse_html(
+                &html,
+                &HtmlParseOptions {
+                    max_input_bytes: html.len().saturating_add(1),
+                    max_blocks: positions.len(),
+                    base_url: None,
+                },
+            )
+            .ok()?;
+        if document.blocks.len() != positions.len() {
+            return None;
+        }
+        Some(LocatorDocument {
+            document,
+            positions,
+        })
     }
 
     /// The position `chars` characters into the book.
@@ -353,44 +438,146 @@ impl Book {
     /// is told "12 times" when the word appears 45 times has been misinformed,
     /// and `limit` only caps how many are handed back for display.
     pub fn search(&self, needle: &str, limit: usize) -> Hits {
-        let folded_needle = fold(needle).0;
+        let Some(projected) = self.locator_document() else {
+            return Hits::default();
+        };
+        let sdk = ReadioSdk::new();
+        let revision = projected.document.revision.revision_digest.clone();
+        let mut cursor = None;
         let mut hits = Hits::default();
-        if folded_needle.is_empty() {
-            return hits;
-        }
-        for (ci, ch) in self.chapters.iter().enumerate() {
-            for (pi, para) in ch.paras.iter().enumerate() {
-                let text = para.text();
-                let (folded, offsets) = fold(text);
-                let mut found_here = 0usize;
-                let mut from = 0usize;
-                while let Some(rel) = folded[from..].find(&folded_needle) {
-                    let start_folded = from + rel;
-                    let end_folded = start_folded + folded_needle.len();
-                    // Map folded offsets back: case and width folding can change
-                    // byte lengths, so the original positions are recorded as the
-                    // folded string is built rather than assumed to match.
-                    let start = offsets[start_folded];
-                    let end = offsets.get(end_folded).copied().unwrap_or(text.len());
-                    found_here += 1;
-                    hits.total += 1;
-                    if hits.shown.len() < limit {
-                        hits.shown.push(Hit {
-                            chapter: ci,
-                            para: pi,
-                            range: (start, end),
-                            excerpt: excerpt(text, start, end - start),
-                        });
-                    }
-                    from = end_folded.max(start_folded + 1);
-                }
-                if found_here > 0 {
-                    hits.paragraphs += 1;
-                }
+
+        loop {
+            // Core's public page size is deliberately bounded. Keep the TUI's
+            // historical `usize` limit by consuming another page only when a
+            // caller genuinely asks for more than one Core page.
+            let remaining = limit.saturating_sub(hits.shown.len());
+            let page_limit = remaining.min(u16::MAX as usize) as u16;
+            let Ok(page) = sdk.documents.search(
+                &projected.document,
+                SearchRequest {
+                    document_revision: revision.clone(),
+                    query: needle.to_string(),
+                    cursor: cursor.clone(),
+                    limit: page_limit,
+                },
+            ) else {
+                return Hits::default();
+            };
+
+            hits.total = usize::try_from(page.total_occurrences).unwrap_or(usize::MAX);
+            hits.paragraphs = usize::try_from(page.total_blocks).unwrap_or(usize::MAX);
+            for core_hit in page.hits {
+                let Some((chapter, para, block_start)) =
+                    projected.block_position(&core_hit.block_id)
+                else {
+                    continue;
+                };
+                let Some(text) = self
+                    .chapters
+                    .get(chapter)
+                    .and_then(|chapter| chapter.paras.get(para))
+                    .map(Para::text)
+                else {
+                    continue;
+                };
+                let Some(local_start) = core_hit.char_range[0].checked_sub(block_start) else {
+                    continue;
+                };
+                let Some(local_end) = core_hit.char_range[1].checked_sub(block_start) else {
+                    continue;
+                };
+                let Some(range) = scalar_range_to_byte_range(text, local_start, local_end) else {
+                    continue;
+                };
+                hits.shown.push(Hit {
+                    chapter,
+                    para,
+                    range,
+                    excerpt: core_hit.snippet,
+                });
+            }
+
+            cursor = page.next_cursor;
+            if hits.shown.len() >= limit || cursor.is_none() || page_limit == 0 {
+                break;
             }
         }
+
         hits
     }
+}
+
+struct LocatorDocument {
+    document: CoreDocument,
+    positions: Vec<(usize, usize)>,
+}
+
+impl LocatorDocument {
+    fn offset_before(&self, chapter: usize, para: usize) -> u64 {
+        let target = (chapter, para);
+        let mut offset = 0_u64;
+        for (index, (block, position)) in
+            self.document.blocks.iter().zip(&self.positions).enumerate()
+        {
+            if *position >= target {
+                return offset;
+            }
+            offset = offset
+                .saturating_add(block.text.chars().count() as u64)
+                .saturating_add(u64::from(index + 1 < self.document.blocks.len()));
+        }
+        self.document.revision.char_count
+    }
+
+    fn position_at(&self, offset: u64, block_id: Option<&str>) -> Option<(usize, usize)> {
+        if offset >= self.document.revision.char_count {
+            let chapter = self.positions.last()?.0;
+            return Some((chapter, self.positions.last()?.1.saturating_add(1)));
+        }
+        if let Some(block_id) = block_id
+            && let Some(index) = self
+                .document
+                .blocks
+                .iter()
+                .position(|block| block.id == block_id)
+        {
+            return self.positions.get(index).copied();
+        }
+
+        let mut block_start = 0_u64;
+        for (index, block) in self.document.blocks.iter().enumerate() {
+            let block_end = block_start.saturating_add(block.text.chars().count() as u64);
+            if offset <= block_end {
+                return self.positions.get(index).copied();
+            }
+            block_start = block_end.saturating_add(1);
+        }
+        self.positions.last().copied()
+    }
+
+    /// Terminal coordinates and the shared document offset for a Core block.
+    /// Search ranges are global Unicode-scalar offsets; rendering needs a byte
+    /// range inside one terminal paragraph, so both coordinate systems meet at
+    /// this boundary and nowhere else.
+    fn block_position(&self, block_id: &str) -> Option<(usize, usize, u64)> {
+        let mut block_start = 0_u64;
+        for (index, block) in self.document.blocks.iter().enumerate() {
+            if block.id == block_id {
+                let (chapter, para) = *self.positions.get(index)?;
+                return Some((chapter, para, block_start));
+            }
+            block_start = block_start
+                .saturating_add(block.text.chars().count() as u64)
+                .saturating_add(u64::from(index + 1 < self.document.blocks.len()));
+        }
+        None
+    }
+}
+
+fn escape_text_for_html(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// One occurrence, with enough information to go there and light it up.
@@ -425,60 +612,15 @@ impl Hits {
     }
 }
 
-/// Case- and width-folded copy of `text`, plus the original byte offset of every
-/// byte in it (and one past the end).
-///
-/// Searching a lowercased copy and reusing its offsets is wrong in general:
-/// lowercasing changes byte lengths for some characters, and full-width forms are
-/// three bytes where their ASCII equivalents are one. Recording the mapping while
-/// folding keeps "ＣＩＴＹ" findable as "city" and the highlight in the right place.
-fn fold(text: &str) -> (String, Vec<usize>) {
-    let mut folded = String::with_capacity(text.len());
-    let mut offsets = Vec::with_capacity(text.len() + 1);
-    for (index, c) in text.char_indices() {
-        let plain = match c {
-            // Full-width ASCII forms sit at U+FF01..U+FF5E, exactly 0xFEE0 above
-            // their ASCII counterparts. The ideographic space folds to a space.
-            '\u{ff01}'..='\u{ff5e}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
-            '\u{3000}' => ' ',
-            other => other,
-        };
-        for lowered in plain.to_lowercase() {
-            let before = folded.len();
-            folded.push(lowered);
-            offsets.resize(folded.len(), index);
-            debug_assert!(offsets.len() > before);
-        }
+fn scalar_range_to_byte_range(text: &str, start: u64, end: u64) -> Option<(usize, usize)> {
+    let start = usize::try_from(start).ok()?;
+    let end = usize::try_from(end).ok()?;
+    if end < start {
+        return None;
     }
+    let mut offsets: Vec<usize> = text.char_indices().map(|(offset, _)| offset).collect();
     offsets.push(text.len());
-    (folded, offsets)
-}
-
-/// A window of text around a match, snapped to character boundaries.
-fn excerpt(text: &str, at: usize, needle_len: usize) -> String {
-    let start = text[..at]
-        .char_indices()
-        .rev()
-        .take(18)
-        .last()
-        .map(|(i, _)| i)
-        .unwrap_or(at);
-    let tail_from = (at + needle_len).min(text.len());
-    let end = text[tail_from..]
-        .char_indices()
-        .take(40)
-        .last()
-        .map(|(i, c)| tail_from + i + c.len_utf8())
-        .unwrap_or(tail_from);
-    let mut out = String::new();
-    if start > 0 {
-        out.push('…');
-    }
-    out.push_str(text[start..end].trim());
-    if end < text.len() {
-        out.push('…');
-    }
-    out
+    Some((*offsets.get(start)?, *offsets.get(end)?))
 }
 
 /// Stable per-book key for the progress store.
@@ -487,34 +629,12 @@ fn excerpt(text: &str, at: usize, needle_len: usize) -> String {
 /// copies or moves it into the host directory) keeps the reading progress that
 /// was recorded before the import.
 pub fn content_id(path: &Path) -> Result<String> {
-    use std::io::Read;
-
-    let mut file =
-        std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
-    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-
-    // FNV-1a over the length plus a 128 KiB prefix: cheap, and two different
-    // books colliding on both is not a realistic concern here.
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut mix = |bytes: &[u8]| {
-        for byte in bytes {
-            hash ^= *byte as u64;
-            hash = hash.wrapping_mul(0x100_0000_01b3);
-        }
-    };
-    mix(&len.to_le_bytes());
-
-    let mut buffer = vec![0u8; 8 * 1024];
-    let mut read_total = 0usize;
-    while read_total < 128 * 1024 {
-        let n = file.read(&mut buffer).unwrap_or(0);
-        if n == 0 {
-            break;
-        }
-        mix(&buffer[..n]);
-        read_total += n;
-    }
-    Ok(format!("{hash:016x}"))
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("cannot read {} for content identity", path.display()))?;
+    Ok(readio_sdk::ReadioSdk::new()
+        .imports
+        .content_identity(&bytes)
+        .digest)
 }
 
 /// Fallback key for content that has no file behind it (the built-in sample).

@@ -3,11 +3,24 @@
 import { useTheme } from "next-themes";
 import { useEffect, useRef, useState, useCallback } from "react";
 import { createPortal } from "react-dom";
-import { Sun, Moon, Monitor, Check, X, Eye, EyeOff, Trash2, ChevronDown, Search } from "lucide-react";
+import { Sun, Moon, Monitor, Check, X, Eye, EyeOff, Trash2, ChevronDown, Search, Download, ShieldCheck } from "lucide-react";
 import { useSettings } from "@/lib/hooks";
 import { applyAccentColor, applyFontSize } from "@/lib/settings-utils";
+import { resolveStoredReadingPace } from "@/lib/settings-utils";
 import { fetchApiKeys, fetchVoicesByProvider, fetchModels, patchSettings, type ApiKeyStatus, type ModelInfo } from "@/lib/api";
 import type { VoiceInfo } from "@/lib/types";
+import { ACCENT_PRESETS } from "@/lib/design-tokens";
+import { BrandMark } from "./brand-mark";
+import { useToast } from "./toast-provider";
+import { useLocale } from "./locale-provider";
+import { supportBundleFile, webDiagnostics } from "@/lib/diagnostics";
+import { webReadioSdk } from "@/lib/readio-core-runtime";
+import type { LocalePreference, MessageKey } from "@/lib/localization";
+import type {
+  EffortLevel,
+  ReadingMode,
+  ReadingPace,
+} from "@/lib/rust-core";
 
 interface SettingsDialogProps {
   open: boolean;
@@ -15,21 +28,14 @@ interface SettingsDialogProps {
 }
 
 const NAV_ITEMS = [
-  { id: "appearance", label: "Appearance" },
-  { id: "reading", label: "Reading" },
-  { id: "api-keys", label: "API Keys" },
-  { id: "about", label: "About" },
+  { id: "appearance", labelKey: "settings.appearance" },
+  { id: "reading", labelKey: "settings.reading" },
+  { id: "api-keys", labelKey: "settings.apiKeys" },
+  { id: "diagnostics", labelKey: "settings.diagnostics" },
+  { id: "about", labelKey: "settings.about" },
 ] as const;
 
 type SectionId = (typeof NAV_ITEMS)[number]["id"];
-
-export const ACCENT_PRESETS = [
-  { name: "Sage", light: "#6B8F71", dark: "#7EC8A0" },
-  { name: "Blue", light: "#4A7FBF", dark: "#6EB5FF" },
-  { name: "Amber", light: "#B8860B", dark: "#E8B84B" },
-  { name: "Rose", light: "#C26B7E", dark: "#E8909F" },
-  { name: "Violet", light: "#7C6BAF", dark: "#A594D8" },
-] as const;
 
 /**
  * Full-screen modal overlay for settings.
@@ -37,11 +43,21 @@ export const ACCENT_PRESETS = [
  * All settings are persisted to the backend via the useSettings hook.
  */
 export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
+  const { t } = useLocale();
   const overlayRef = useRef<HTMLDivElement>(null);
   const { theme, setTheme } = useTheme();
   const [mounted, setMounted] = useState(false);
   const [activeSection, setActiveSection] = useState<SectionId>("appearance");
   const { settings, updateSetting } = useSettings();
+  const [readingPace, setReadingPace] = useState<ReadingPace>({
+    mode: "manual",
+    effort: "high",
+    multiplier: 1,
+    text_characters_per_second: 46,
+    audio_playback_rate: 1,
+    advances_automatically: false,
+    uses_audio: false,
+  });
 
   useEffect(() => setMounted(true), []);
 
@@ -55,58 +71,71 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
     return () => document.removeEventListener("keydown", handler);
   }, [open, onClose]);
 
+  useEffect(() => {
+    let active = true;
+    void resolveStoredReadingPace(settings).then((pace) => {
+      if (active) setReadingPace(pace);
+    });
+    return () => {
+      active = false;
+    };
+  }, [settings]);
+
   if (!open || !mounted) return null;
 
   // Derive current values from persisted settings (with sensible defaults)
   const accentIndex = parseInt(settings.accent_color ?? "0", 10);
   const fontSize = parseInt(settings.font_size ?? "18", 10);
-  const ttsSpeed = parseFloat(settings.tts_speed ?? "1.0");
+  const storedBaseTextRate = Number(settings.reading_base_cps);
+  const baseTextRate = Number.isFinite(storedBaseTextRate)
+    ? storedBaseTextRate
+    : 46;
 
   return createPortal(
     <div
       ref={overlayRef}
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
+      className="ui-overlay"
       onClick={(e) => {
         if (e.target === overlayRef.current) onClose();
       }}
     >
-      {/* Dialog card */}
-      <div className="bg-surface rounded-2xl shadow-2xl w-[780px] h-[560px] overflow-hidden flex flex-col">
-        {/* Header */}
-        <div className="flex items-center justify-between px-6 py-4 border-b border-border shrink-0">
-          <h2 className="text-lg font-semibold text-text-primary">Settings</h2>
+      <div
+        className="ui-modal ui-modal--settings"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="settings-dialog-title"
+      >
+        <div className="ui-modal-header">
+          <h2 id="settings-dialog-title" className="ui-modal-title">{t("settings.title")}</h2>
           <button
+            type="button"
             onClick={onClose}
-            className="p-1.5 rounded-lg text-text-tertiary hover:text-text-primary hover:bg-surface-hover transition-colors cursor-pointer"
+            className="ui-icon-button"
+            aria-label={t("settings.close")}
           >
-            <X size={18} />
+            <X className="ui-icon" aria-hidden="true" />
           </button>
         </div>
 
-        {/* Body: left nav + right content */}
-        <div className="flex flex-1 min-h-0">
-          {/* Left nav */}
-          <nav className="w-40 shrink-0 border-r border-border py-3 px-2">
-            <ul className="flex flex-col gap-0.5">
-              {NAV_ITEMS.map(({ id, label }) => (
+        <div className="settings-layout">
+          <nav className="settings-nav" aria-label={t("settings.sections")}>
+            <ul>
+              {NAV_ITEMS.map(({ id, labelKey }) => (
                 <li key={id}>
                   <button
+                    type="button"
                     onClick={() => setActiveSection(id)}
-                    className={`w-full text-left px-3 py-1.5 rounded-lg text-sm transition-colors cursor-pointer ${
-                      activeSection === id
-                        ? "bg-surface-active text-text-primary font-medium"
-                        : "text-text-secondary hover:bg-surface-hover hover:text-text-primary"
-                    }`}
+                    className="settings-nav-item"
+                    data-active={activeSection === id}
                   >
-                    {label}
+                    {t(labelKey)}
                   </button>
                 </li>
               ))}
             </ul>
           </nav>
 
-          {/* Right content — scrollable */}
-          <div className="flex-1 overflow-y-auto p-6">
+          <div className="settings-content">
             {activeSection === "appearance" && (
               <AppearanceSection
                 theme={theme}
@@ -121,17 +150,27 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
             {activeSection === "reading" && (
               <ReadingSection
                 fontSize={fontSize}
-                ttsSpeed={ttsSpeed}
+                mode={readingPace.mode}
+                effort={readingPace.effort}
+                baseTextRate={baseTextRate}
+                pace={readingPace}
                 onFontSizeChange={(size) => {
                   updateSetting("font_size", String(size));
                   applyFontSize(size);
                 }}
-                onTtsSpeedChange={(speed) => {
-                  updateSetting("tts_speed", speed.toFixed(1));
+                onModeChange={(mode) => {
+                  updateSetting("reading_mode", mode);
+                }}
+                onEffortChange={(effort) => {
+                  updateSetting("reading_effort", effort);
+                }}
+                onBaseTextRateChange={(rate) => {
+                  updateSetting("reading_base_cps", String(rate));
                 }}
               />
             )}
             {activeSection === "api-keys" && <ApiKeysSection />}
+            {activeSection === "diagnostics" && <DiagnosticsSection />}
             {activeSection === "about" && <AboutSection />}
           </div>
         </div>
@@ -154,36 +193,61 @@ function AppearanceSection({
   accentIndex: number;
   onAccentChange: (i: number) => void;
 }) {
+  const { preference, setPreference, t } = useLocale();
   const modes = [
-    { value: "light", icon: Sun, label: "Light" },
-    { value: "dark", icon: Moon, label: "Dark" },
-    { value: "system", icon: Monitor, label: "System" },
+    { value: "light", icon: Sun, labelKey: "settings.light" },
+    { value: "dark", icon: Moon, labelKey: "settings.dark" },
+    { value: "system", icon: Monitor, labelKey: "settings.system" },
   ] as const;
+  const languages: Array<{ value: LocalePreference; labelKey: MessageKey }> = [
+    { value: "system", labelKey: "settings.languageSystem" },
+    { value: "en", labelKey: "settings.languageEnglish" },
+    { value: "zh-Hans", labelKey: "settings.languageChinese" },
+  ];
 
   return (
     <div className="space-y-8">
       <div>
-        <SectionHeading>Color mode</SectionHeading>
+        <SectionHeading>{t("settings.language")}</SectionHeading>
+        <p className="text-sm text-text-tertiary mb-3">
+          {t("settings.languageDescription")}
+        </p>
+        <select
+          className="ui-input settings-field-input"
+          value={preference}
+          onChange={(event) =>
+            setPreference(event.target.value as LocalePreference)
+          }
+          aria-label={t("settings.language")}
+        >
+          {languages.map(({ value, labelKey }) => (
+            <option key={value} value={value}>
+              {t(labelKey)}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      <Divider />
+
+      <div>
+        <SectionHeading>{t("settings.colorMode")}</SectionHeading>
         <div className="flex gap-3">
-          {modes.map(({ value, icon: Icon, label }) => (
+          {modes.map(({ value, icon: Icon, labelKey }) => (
             <button
               key={value}
               onClick={() => setTheme(value)}
-              className={`flex flex-col items-center gap-2 rounded-xl border-2 px-6 py-4 transition-all cursor-pointer ${
-                theme === value
-                  ? "border-accent bg-surface-active"
-                  : "border-border hover:border-text-tertiary bg-surface-card"
-              }`}
+              className="settings-choice"
+              data-selected={theme === value}
             >
               <Icon
-                size={22}
-                strokeWidth={1.5}
-                className={theme === value ? "text-accent" : "text-text-secondary"}
+                className="ui-icon-lg"
+                aria-hidden="true"
               />
               <span
                 className={`text-xs font-medium ${theme === value ? "text-accent" : "text-text-secondary"}`}
               >
-                {label}
+                {t(labelKey)}
               </span>
             </button>
           ))}
@@ -193,25 +257,22 @@ function AppearanceSection({
       <Divider />
 
       <div>
-        <SectionHeading>Accent color</SectionHeading>
+        <SectionHeading>{t("settings.accentColor")}</SectionHeading>
         <div className="flex gap-3">
           {ACCENT_PRESETS.map((preset, i) => (
             <button
               key={preset.name}
               onClick={() => onAccentChange(i)}
               title={preset.name}
-              className="relative w-9 h-9 rounded-full border-2 transition-all cursor-pointer flex items-center justify-center"
+              className="accent-swatch"
+              data-selected={accentIndex === i}
               style={{
                 backgroundColor: preset.light,
-                borderColor: accentIndex === i ? preset.light : "transparent",
-                boxShadow:
-                  accentIndex === i
-                    ? `0 0 0 2px var(--surface-card), 0 0 0 4px ${preset.light}`
-                    : "none",
+                color: preset.light,
               }}
             >
               {accentIndex === i && (
-                <Check size={16} strokeWidth={2.5} className="text-white" />
+                <Check className="ui-icon-sm text-white" aria-hidden="true" />
               )}
             </button>
           ))}
@@ -223,23 +284,120 @@ function AppearanceSection({
 
 /* ─────────────── Section: Reading ─────────────── */
 
-function ReadingSection({
+export function ReadingSection({
   fontSize,
-  ttsSpeed,
+  mode,
+  effort,
+  baseTextRate,
+  pace,
   onFontSizeChange,
-  onTtsSpeedChange,
+  onModeChange,
+  onEffortChange,
+  onBaseTextRateChange,
 }: {
   fontSize: number;
-  ttsSpeed: number;
+  mode: ReadingMode;
+  effort: EffortLevel;
+  baseTextRate: number;
+  pace: ReadingPace;
   onFontSizeChange: (size: number) => void;
-  onTtsSpeedChange: (speed: number) => void;
+  onModeChange: (mode: ReadingMode) => void;
+  onEffortChange: (effort: EffortLevel) => void;
+  onBaseTextRateChange: (rate: number) => void;
 }) {
+  const { t } = useLocale();
+  const modes: Array<{ value: ReadingMode; labelKey: MessageKey }> = [
+    { value: "manual", labelKey: "settings.manual" },
+    { value: "auto", labelKey: "settings.auto" },
+    { value: "read_aloud", labelKey: "settings.readAloud" },
+  ];
+  const effortLevels: Array<{ value: EffortLevel; labelKey: MessageKey }> = [
+    { value: "minimal", labelKey: "settings.effortMinimal" },
+    { value: "low", labelKey: "settings.effortLow" },
+    { value: "medium", labelKey: "settings.effortMedium" },
+    { value: "high", labelKey: "settings.effortHigh" },
+    { value: "xhigh", labelKey: "settings.effortXHigh" },
+    { value: "max", labelKey: "settings.effortMax" },
+  ];
+
   return (
     <div className="space-y-8">
       <div>
-        <SectionHeading>Default font size</SectionHeading>
+        <SectionHeading>{t("settings.readingMode")}</SectionHeading>
         <p className="text-sm text-text-tertiary mb-3">
-          Adjust the default reading font size across all books.
+          {t("settings.readingModeDescription")}
+        </p>
+        <div className="segmented-control" aria-label={t("settings.readingMode")}>
+          {modes.map((candidate) => (
+            <button
+              type="button"
+              key={candidate.value}
+              aria-pressed={mode === candidate.value}
+              onClick={() => onModeChange(candidate.value)}
+            >
+              {t(candidate.labelKey)}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <Divider />
+
+      <div>
+        <SectionHeading>{t("settings.readingEffort")}</SectionHeading>
+        <p className="text-sm text-text-tertiary mb-3">
+          {t("settings.readingEffortDescription")}
+        </p>
+        <div className="settings-field-row">
+          <label className="settings-field-label" htmlFor="reading-effort">
+            {t("settings.level")}
+          </label>
+          <select
+            id="reading-effort"
+            aria-label={t("settings.readingEffort")}
+            className="ui-input settings-field-input"
+            value={effort}
+            onChange={(event) =>
+              onEffortChange(event.target.value as EffortLevel)
+            }
+          >
+            {effortLevels.map((level) => (
+              <option key={level.value} value={level.value}>
+                {t(level.labelKey)}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="settings-field-row mt-3">
+          <label className="settings-field-label" htmlFor="reading-base-rate">
+            {t("settings.baseTextPace")}
+          </label>
+          <input
+            id="reading-base-rate"
+            className="ui-input settings-field-input"
+            type="number"
+            min={4}
+            max={4000}
+            step={1}
+            value={baseTextRate}
+            onChange={(event) =>
+              onBaseTextRateChange(Number(event.target.value))
+            }
+          />
+          <span className="text-xs text-text-secondary">{t("settings.charactersPerSecond")}</span>
+        </div>
+        <p className="mt-3 text-sm text-text-secondary" aria-live="polite">
+          {formatPace(pace.text_characters_per_second)} {t("settings.charactersPerSecond")} ·{" "}
+          {formatPace(pace.audio_playback_rate)}× {t("settings.audio")}
+        </p>
+      </div>
+
+      <Divider />
+
+      <div>
+        <SectionHeading>{t("settings.defaultFontSize")}</SectionHeading>
+        <p className="text-sm text-text-tertiary mb-3">
+          {t("settings.defaultFontSizeDescription")}
         </p>
         <div className="flex items-center gap-4">
           <input
@@ -250,36 +408,18 @@ function ReadingSection({
             onChange={(e) => onFontSizeChange(Number(e.target.value))}
             className="flex-1 accent-accent"
           />
-          <span className="text-sm text-text-secondary font-medium tabular-nums w-10 text-right">
+          <span className="settings-range-value">
             {fontSize}px
           </span>
         </div>
       </div>
 
-      <Divider />
-
-      <div>
-        <SectionHeading>TTS speed</SectionHeading>
-        <p className="text-sm text-text-tertiary mb-3">
-          Default playback speed for text-to-speech.
-        </p>
-        <div className="flex items-center gap-4">
-          <input
-            type="range"
-            min={0.5}
-            max={2}
-            step={0.1}
-            value={ttsSpeed}
-            onChange={(e) => onTtsSpeedChange(Number(e.target.value))}
-            className="flex-1 accent-accent"
-          />
-          <span className="text-sm text-text-secondary font-medium tabular-nums w-10 text-right">
-            {ttsSpeed.toFixed(1)}x
-          </span>
-        </div>
-      </div>
     </div>
   );
+}
+
+function formatPace(value: number): string {
+  return Number(value.toFixed(2)).toString();
 }
 
 /* ─────────────── Section: API Keys ─────────────── */
@@ -307,6 +447,7 @@ const MINIMAX_FIELDS: ApiKeyFieldConfig[] = [
 ];
 
 function ApiKeysSection() {
+  const { t } = useLocale();
   const [keyStatus, setKeyStatus] = useState<Record<string, ApiKeyStatus>>({});
   const [loading, setLoading] = useState(true);
 
@@ -328,8 +469,8 @@ function ApiKeysSection() {
   if (loading) {
     return (
       <div className="space-y-4">
-        <SectionHeading>API Keys</SectionHeading>
-        <p className="text-sm text-text-tertiary">Loading...</p>
+        <SectionHeading>{t("settings.apiKeys")}</SectionHeading>
+        <p className="text-sm text-text-tertiary">{t("common.loading")}</p>
       </div>
     );
   }
@@ -337,9 +478,9 @@ function ApiKeysSection() {
   return (
     <div className="space-y-8">
       <div>
-        <SectionHeading>API Keys</SectionHeading>
+        <SectionHeading>{t("settings.apiKeys")}</SectionHeading>
         <p className="text-sm text-text-tertiary mb-4">
-          Configure your own TTS provider API keys. When not set, the global server keys will be used as fallback.
+          {t("settings.apiDescription")}
         </p>
       </div>
 
@@ -416,6 +557,8 @@ function ApiKeyField({
   const [value, setValue] = useState("");
   const [saving, setSaving] = useState(false);
   const [showValue, setShowValue] = useState(false);
+  const { showToast } = useToast();
+  const { t } = useLocale();
 
   const isConfigured = status?.configured ?? false;
   const hasGlobalFallback = status?.has_global_fallback ?? false;
@@ -428,6 +571,8 @@ function ApiKeyField({
       setValue("");
       setEditing(false);
       onUpdate();
+    } catch {
+      showToast("settings.failed", t("settings.couldNotSave", { label: config.label }));
     } finally {
       setSaving(false);
     }
@@ -438,6 +583,8 @@ function ApiKeyField({
     try {
       await patchSettings({ [config.key]: null as unknown as string });
       onUpdate();
+    } catch {
+      showToast("settings.failed", t("settings.couldNotRemove", { label: config.label }));
     } finally {
       setSaving(false);
     }
@@ -445,14 +592,14 @@ function ApiKeyField({
 
   if (editing) {
     return (
-      <div className="flex items-center gap-2">
-        <label className="w-20 text-xs text-text-secondary shrink-0">{config.label}</label>
+      <div className="settings-field-row">
+        <label className="settings-field-label">{config.label}</label>
         <input
           type={config.isSecret && !showValue ? "password" : "text"}
           value={value}
           onChange={(e) => setValue(e.target.value)}
           placeholder={config.placeholder}
-          className="flex-1 rounded-lg border border-border bg-surface-card px-3 py-1.5 text-sm text-text-primary placeholder:text-text-tertiary focus:outline-none focus:ring-2 focus:ring-accent"
+          className="ui-input settings-field-input"
           autoFocus
           onKeyDown={(e) => {
             if (e.key === "Enter") handleSave();
@@ -463,57 +610,57 @@ function ApiKeyField({
           <button
             type="button"
             onClick={() => setShowValue(!showValue)}
-            className="p-1.5 text-text-tertiary hover:text-text-secondary cursor-pointer"
+            className="ui-icon-button"
           >
-            {showValue ? <EyeOff size={14} /> : <Eye size={14} />}
+            {showValue ? <EyeOff className="ui-icon-sm" /> : <Eye className="ui-icon-sm" />}
           </button>
         )}
         <button
           onClick={handleSave}
           disabled={saving || !value.trim()}
-          className="px-3 py-1.5 text-xs font-medium rounded-lg bg-accent text-white hover:opacity-90 disabled:opacity-50 cursor-pointer"
+          className="ui-button ui-button--primary settings-compact-button"
         >
-          Save
+          {t("common.save")}
         </button>
         <button
           onClick={() => { setEditing(false); setValue(""); }}
-          className="px-2 py-1.5 text-xs text-text-tertiary hover:text-text-primary cursor-pointer"
+          className="ui-button ui-button--quiet settings-compact-button"
         >
-          Cancel
+          {t("common.cancel")}
         </button>
       </div>
     );
   }
 
   return (
-    <div className="flex items-center gap-2">
-      <label className="w-20 text-xs text-text-secondary shrink-0">{config.label}</label>
-      <div className="flex-1 text-sm">
+    <div className="settings-field-row">
+      <label className="settings-field-label">{config.label}</label>
+      <div className="settings-field-value" data-configured={isConfigured}>
         {isConfigured ? (
           <span className="text-text-primary font-mono text-xs">
-            {status?.masked ?? "Configured"}
+            {status?.masked ?? t("settings.configured")}
           </span>
         ) : (
           <span className="text-text-tertiary text-xs">
-            Not set
-            {hasGlobalFallback && " (using server default)"}
+            {t("settings.notSet")}
+            {hasGlobalFallback && ` (${t("settings.usingServerDefault")})`}
           </span>
         )}
       </div>
       <button
         onClick={() => setEditing(true)}
-        className="px-3 py-1.5 text-xs font-medium rounded-lg border border-border text-text-secondary hover:text-text-primary hover:bg-surface-hover cursor-pointer"
+        className="ui-button ui-button--secondary settings-compact-button"
       >
-        {isConfigured ? "Change" : "Set"}
+        {isConfigured ? t("settings.change") : t("settings.set")}
       </button>
       {isConfigured && (
         <button
           onClick={handleRemove}
           disabled={saving}
-          className="p-1.5 text-text-tertiary hover:text-red-500 cursor-pointer disabled:opacity-50"
-          title="Remove"
+          className="ui-icon-button hover:text-red-500"
+          title={t("settings.remove")}
         >
-          <Trash2 size={14} />
+          <Trash2 className="ui-icon-sm" />
         </button>
       )}
     </div>
@@ -543,7 +690,10 @@ function SelectableField({
   const [loadingItems, setLoadingItems] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
+  const { showToast } = useToast();
+  const { t } = useLocale();
 
   const isConfigured = status?.configured ?? false;
   const currentValue = status?.masked ?? null;
@@ -556,13 +706,27 @@ function SelectableField({
   useEffect(() => {
     if (!expanded) return;
     const handler = (e: MouseEvent) => {
-      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
+      const target = e.target as Node;
+      if (
+        !dropdownRef.current?.contains(target) &&
+        !panelRef.current?.contains(target)
+      ) {
+        setExpanded(false);
+        setSearch("");
+      }
+    };
+    const keyHandler = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
         setExpanded(false);
         setSearch("");
       }
     };
     document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
+    document.addEventListener("keydown", keyHandler);
+    return () => {
+      document.removeEventListener("mousedown", handler);
+      document.removeEventListener("keydown", keyHandler);
+    };
   }, [expanded]);
 
   // Focus search when expanded
@@ -586,7 +750,7 @@ function SelectableField({
         setDefaultId(data.default_model_id);
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to load");
+      setError(e instanceof Error ? e.message : t("settings.failedToLoad"));
     } finally {
       setLoadingItems(false);
     }
@@ -594,7 +758,7 @@ function SelectableField({
 
   function handleExpand() {
     if (config.fieldType === "voice" && config.provider === "elevenlabs" && !hasApiKey) {
-      setError("Set API key first to browse voices");
+      setError(t("settings.setApiKeyFirst"));
       setExpanded(true);
       return;
     }
@@ -609,6 +773,8 @@ function SelectableField({
       setExpanded(false);
       setSearch("");
       onUpdate();
+    } catch {
+      showToast("settings.failed", t("settings.couldNotSave", { label: config.label }));
     } finally {
       setSaving(false);
     }
@@ -622,6 +788,8 @@ function SelectableField({
       setManualValue("");
       setManualMode(false);
       onUpdate();
+    } catch {
+      showToast("settings.failed", t("settings.couldNotSave", { label: config.label }));
     } finally {
       setSaving(false);
     }
@@ -632,6 +800,8 @@ function SelectableField({
     try {
       await patchSettings({ [config.key]: null as unknown as string });
       onUpdate();
+    } catch {
+      showToast("settings.failed", t("settings.couldNotRemove", { label: config.label }));
     } finally {
       setSaving(false);
     }
@@ -639,14 +809,14 @@ function SelectableField({
 
   if (manualMode) {
     return (
-      <div className="flex items-center gap-2">
-        <label className="w-20 text-xs text-text-secondary shrink-0">{config.label}</label>
+      <div className="settings-field-row">
+        <label className="settings-field-label">{config.label}</label>
         <input
           type="text"
           value={manualValue}
           onChange={(e) => setManualValue(e.target.value)}
           placeholder={config.placeholder}
-          className="flex-1 rounded-lg border border-border bg-surface-card px-3 py-1.5 text-sm text-text-primary placeholder:text-text-tertiary focus:outline-none focus:ring-2 focus:ring-accent"
+          className="ui-input settings-field-input"
           autoFocus
           onKeyDown={(e) => {
             if (e.key === "Enter") handleManualSave();
@@ -656,15 +826,15 @@ function SelectableField({
         <button
           onClick={handleManualSave}
           disabled={saving || !manualValue.trim()}
-          className="px-3 py-1.5 text-xs font-medium rounded-lg bg-accent text-white hover:opacity-90 disabled:opacity-50 cursor-pointer"
+          className="ui-button ui-button--primary settings-compact-button"
         >
-          Save
+          {t("common.save")}
         </button>
         <button
           onClick={() => { setManualMode(false); setManualValue(""); }}
-          className="px-2 py-1.5 text-xs text-text-tertiary hover:text-text-primary cursor-pointer"
+          className="ui-button ui-button--quiet settings-compact-button"
         >
-          Cancel
+          {t("common.cancel")}
         </button>
       </div>
     );
@@ -675,77 +845,89 @@ function SelectableField({
       item.label.toLowerCase().includes(search.toLowerCase()) ||
       item.id.toLowerCase().includes(search.toLowerCase())
   );
+  const anchorRect = dropdownRef.current?.getBoundingClientRect();
 
   return (
-    <div className="relative" ref={dropdownRef}>
-      <div className="flex items-center gap-2">
-        <label className="w-20 text-xs text-text-secondary shrink-0">{config.label}</label>
-        <div className="flex-1 text-sm">
+    <div className="settings-picker" ref={dropdownRef}>
+      <div className="settings-field-row">
+        <label className="settings-field-label">{config.label}</label>
+        <div className="settings-field-value" data-configured={isConfigured}>
           {isConfigured ? (
             <span className="text-text-primary font-mono text-xs">{currentValue}</span>
           ) : (
             <span className="text-text-tertiary text-xs">
-              Not set
-              {status?.has_global_fallback && " (using server default)"}
+              {t("settings.notSet")}
+              {status?.has_global_fallback && ` (${t("settings.usingServerDefault")})`}
             </span>
           )}
         </div>
         <button
           onClick={handleExpand}
-          className="px-3 py-1.5 text-xs font-medium rounded-lg border border-border text-text-secondary hover:text-text-primary hover:bg-surface-hover cursor-pointer inline-flex items-center gap-1"
+          className="ui-button ui-button--secondary settings-compact-button"
         >
-          <ChevronDown size={12} />
-          {isConfigured ? "Change" : "Select"}
+          <ChevronDown className="ui-icon-sm" />
+          {isConfigured ? t("settings.change") : t("settings.select")}
         </button>
         {isConfigured && (
           <button
             onClick={handleRemove}
             disabled={saving}
-            className="p-1.5 text-text-tertiary hover:text-red-500 cursor-pointer disabled:opacity-50"
-            title="Remove"
+            className="ui-icon-button hover:text-red-500"
+            title={t("settings.remove")}
           >
-            <Trash2 size={14} />
+            <Trash2 className="ui-icon-sm" />
           </button>
         )}
       </div>
 
-      {expanded && (
-        <div className="absolute left-20 right-0 top-full mt-1 z-10 bg-surface-card border border-border rounded-xl shadow-lg overflow-hidden">
+      {expanded &&
+        createPortal(
+        <div
+          ref={panelRef}
+          className="surface-popover settings-picker-menu"
+          style={{
+            top: anchorRect
+              ? `calc(${anchorRect.bottom}px + var(--space-1))`
+              : "var(--space-16)",
+            left: anchorRect?.left ?? "var(--space-4)",
+            width: anchorRect?.width ?? "var(--modal-width-sm)",
+          }}
+        >
           {/* Search */}
-          <div className="flex items-center gap-2 px-3 py-2 border-b border-border">
-            <Search size={14} className="text-text-tertiary shrink-0" />
+          <div className="settings-picker-search">
+            <Search className="ui-icon-sm text-text-tertiary" />
             <input
               ref={searchRef}
               type="text"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search..."
+              placeholder={t("settings.searchPlaceholder")}
               className="flex-1 text-sm bg-transparent text-text-primary placeholder:text-text-tertiary outline-none"
             />
           </div>
 
           {/* List */}
-          <div className="max-h-52 overflow-y-auto">
+          <div className="settings-picker-list">
             {loadingItems && (
-              <div className="px-3 py-4 text-xs text-text-tertiary text-center">Loading...</div>
+              <div className="settings-picker-state">{t("common.loading")}</div>
             )}
             {error && (
-              <div className="px-3 py-4 text-xs text-text-tertiary text-center">{error}</div>
+              <div className="settings-picker-state">{error}</div>
             )}
             {!loadingItems && !error && filtered.length === 0 && (
-              <div className="px-3 py-4 text-xs text-text-tertiary text-center">No results</div>
+              <div className="settings-picker-state">{t("settings.noResults")}</div>
             )}
             {!loadingItems && !error && filtered.map((item) => (
               <button
                 key={item.id}
                 onClick={() => handleSelect(item.id)}
                 disabled={saving}
-                className="w-full text-left px-3 py-2 hover:bg-surface-hover transition-colors cursor-pointer flex flex-col gap-0.5"
+                className="settings-picker-option"
               >
                 <span className="text-sm text-text-primary flex items-center gap-2">
                   {item.label}
                   {item.id === defaultId && (
-                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-accent/10 text-accent font-medium">default</span>
+                    <span className="settings-default-badge">{t("settings.default")}</span>
                   )}
                   {item.id === currentValue && (
                     <Check size={14} className="text-accent" />
@@ -765,11 +947,87 @@ function SelectableField({
               onClick={() => { setExpanded(false); setSearch(""); setManualMode(true); }}
               className="text-xs text-accent hover:underline cursor-pointer"
             >
-              Type manually
+              {t("settings.typeManually")}
             </button>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
+    </div>
+  );
+}
+
+/* ─────────────── Section: Diagnostics ─────────────── */
+
+async function downloadWebSupportBundle() {
+  const bundle = await webDiagnostics.buildSupportBundle({
+    core: webReadioSdk,
+    appVersion: "0.1.0",
+  });
+  const file = supportBundleFile(bundle);
+  const url = URL.createObjectURL(
+    new Blob([file.contents], { type: file.mediaType })
+  );
+  try {
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = file.filename;
+    link.click();
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+export function DiagnosticsSection({
+  onDownload = downloadWebSupportBundle,
+}: {
+  onDownload?: () => Promise<void>;
+} = {}) {
+  const { t } = useLocale();
+  const [status, setStatus] = useState<"idle" | "downloading" | "done" | "failed">("idle");
+
+  async function handleDownload() {
+    setStatus("downloading");
+    try {
+      await onDownload();
+      setStatus("done");
+    } catch {
+      setStatus("failed");
+    }
+  }
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <SectionHeading>{t("settings.diagnostics")}</SectionHeading>
+        <p className="text-sm text-text-secondary leading-relaxed">
+          {t("settings.diagnosticsDescription")}
+        </p>
+      </div>
+      <div className="flex items-start gap-3">
+        <ShieldCheck className="ui-icon text-accent mt-0.5" aria-hidden="true" />
+        <p className="text-sm text-text-secondary leading-relaxed">
+          {t("settings.diagnosticsPrivacy")}
+        </p>
+      </div>
+      <button
+        type="button"
+        className="ui-button ui-button--primary"
+        disabled={status === "downloading"}
+        onClick={() => void handleDownload()}
+      >
+        <Download className="ui-icon-sm" aria-hidden="true" />
+        {status === "downloading"
+          ? t("settings.diagnosticsDownloading")
+          : t("settings.diagnosticsDownload")}
+      </button>
+      <p className="text-sm text-text-secondary" role="status" aria-live="polite">
+        {status === "done"
+          ? t("settings.diagnosticsDownloaded")
+          : status === "failed"
+            ? t("settings.diagnosticsFailed")
+            : ""}
+      </p>
     </div>
   );
 }
@@ -777,19 +1035,17 @@ function SelectableField({
 /* ─────────────── Section: About ─────────────── */
 
 function AboutSection() {
+  const { t } = useLocale();
   return (
     <div className="space-y-4">
-      <SectionHeading>About</SectionHeading>
-      <div className="bg-surface-card border border-border rounded-xl p-5 space-y-3">
-        <div className="flex items-baseline gap-3">
-          <span className="text-lg font-serif font-bold text-text-primary">
-            Readio
-          </span>
+      <SectionHeading>{t("settings.about")}</SectionHeading>
+      <div className="space-y-3">
+        <div className="flex items-center gap-3">
+          <BrandMark />
           <span className="text-xs text-text-tertiary">v0.1.0</span>
         </div>
         <p className="text-sm text-text-secondary leading-relaxed">
-          Open-source audiobook &amp; TTS reading platform. Turn any text, URL,
-          EPUB, or PDF into a listenable experience.
+          {t("settings.aboutDescription")}
         </p>
         <a
           href="https://github.com/nicepkg/readio"
@@ -797,7 +1053,7 @@ function AboutSection() {
           rel="noopener noreferrer"
           className="inline-block text-sm text-accent hover:underline"
         >
-          View on GitHub
+          {t("settings.viewOnGitHub")}
         </a>
       </div>
     </div>

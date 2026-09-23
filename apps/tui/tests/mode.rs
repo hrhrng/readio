@@ -303,6 +303,55 @@ fn pausing_does_not_quietly_drop_out_of_auto_scroll() {
 }
 
 #[test]
+fn sleep_timer_uses_a_wall_clock_deadline_without_changing_mode() {
+    let _guard = exclusive();
+    let (mut app, mut terminal) = fixture();
+    settle(&mut app, &mut terminal);
+
+    type_line(&mut app, "/mode auto");
+    type_line(&mut app, "/sleep 0.001");
+    assert!(
+        app.turn.busy(),
+        "auto-scroll should be active before the deadline"
+    );
+
+    // No UI ticks occur while suspended. The first tick after the absolute
+    // deadline must still stop at the current cursor.
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    app.on_tick();
+    let view = draw(&mut app, &mut terminal, 1);
+
+    assert!(
+        app.turn.paused(),
+        "the deadline should pause the active turn"
+    );
+    assert_eq!(app.mode(), Mode::Auto, "a timer is not a mode change");
+    assert!(
+        view.contains("睡眠定时已到"),
+        "the stop must be visible and explainable:\n{view}"
+    );
+}
+
+#[test]
+fn a_cancelled_sleep_timer_never_pauses_later() {
+    let _guard = exclusive();
+    let (mut app, mut terminal) = fixture();
+    settle(&mut app, &mut terminal);
+
+    type_line(&mut app, "/mode auto");
+    type_line(&mut app, "/sleep 0.001");
+    type_line(&mut app, "/sleep off");
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    app.on_tick();
+
+    assert!(
+        !app.turn.paused(),
+        "a cancelled deadline must have no late effect"
+    );
+    assert_eq!(app.mode(), Mode::Auto);
+}
+
+#[test]
 fn the_mode_survives_into_the_config_file() {
     let _guard = exclusive();
     let (mut app, mut terminal) = fixture();

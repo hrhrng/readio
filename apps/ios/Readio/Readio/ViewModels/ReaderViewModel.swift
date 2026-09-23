@@ -1,29 +1,66 @@
 import Foundation
 import SwiftUI
 
+enum AppleSearchWalkDirection: Sendable {
+    case previous
+    case next
+}
+
+struct AppleReaderSearchHit: Codable, Equatable, Identifiable, Sendable {
+    let hitId: String
+    let charRange: [UInt64]
+    let blockId: String
+    let snippet: String
+    let snippetMatchRange: [UInt32]
+
+    var id: String { hitId }
+
+    enum CodingKeys: String, CodingKey {
+        case hitId = "hit_id"
+        case charRange = "char_range"
+        case blockId = "block_id"
+        case snippet
+        case snippetMatchRange = "snippet_match_range"
+    }
+}
+
+struct AppleReaderSearchResult: Equatable, Sendable {
+    let foldedQuery: String
+    let totalOccurrences: UInt64
+    let totalPassages: UInt64
+}
+
+private struct AppleReaderSearchPage: Decodable {
+    let foldedQuery: String
+    let totalOccurrences: UInt64
+    let totalPassages: UInt64
+    let hits: [AppleReaderSearchHit]
+    let nextCursor: String?
+
+    enum CodingKeys: String, CodingKey {
+        case foldedQuery = "folded_query"
+        case totalOccurrences = "total_occurrences"
+        case totalPassages = "total_blocks"
+        case hits
+        case nextCursor = "next_cursor"
+    }
+}
+
 // MARK: - ReaderViewModel
 /// View model for the Reader screen that displays document content and manages
-/// sentence extraction for TTS playback.
+/// projection of parser-owned Reader IR for rendering and playback.
 ///
 /// The reader is the core content consumption screen. It:
 /// 1. Fetches the full `LibraryItem` (including `content`) from the backend.
-/// 2. Extracts `Sentence` values from the content based on document type.
+/// 2. Loads one Reader IR from the local-first library boundary.
 /// 3. Manages chapter navigation for EPUB documents.
 /// 4. Persists reading progress back to the server.
 ///
 /// ## Content Handling by Document Type
 ///
-/// | Type   | Content Format           | Sentence Extraction                          |
-/// |--------|--------------------------|----------------------------------------------|
-/// | `txt`  | Plain text string        | `SentenceSplitter.splitSentences(content)`   |
-/// | `web`  | Plain text or HTML       | Same as txt (HTML tags stripped by backend)   |
-/// | `pdf`  | Plain text (extracted)   | Same as txt                                  |
-/// | `epub` | JSON array of chapters   | Parse JSON → extract sentences from blocks   |
-///
-/// For EPUB, the `content` field is a JSON-encoded array of `EpubChapter` objects.
-/// Each chapter contains `ContentBlock` values, each of which contains `RichSentence`
-/// values. The reader extracts plain `Sentence` values from these for TTS, while
-/// the view layer renders the `RichSentence`/`ContentBlock` types for styled display.
+/// TXT, Web, PDF, and EPUB converge on the same `ReadioReaderIR`. SwiftUI only
+/// maps Rust-provided blocks, sentence ranges, inline spans, and navigation into
+/// native view values; it does not parse or split document content.
 ///
 /// ## Chapter Navigation (EPUB)
 ///
@@ -52,17 +89,33 @@ final class ReaderViewModel {
     /// For EPUB, this changes when the user switches chapters.
     var sentences: [Sentence] = []
 
-    /// Parsed EPUB chapters (only populated for `.epub` items).
-    /// Each chapter contains structured content blocks with rich sentences.
+    /// Structured EPUB or PDF chapters.
+    /// Each chapter contains shared semantic blocks with rich sentences.
     var chapters: [EpubChapter] = []
 
     /// Table of contents entries parsed from the EPUB navigation document.
     /// Used to render the TOC panel and for chapter-level navigation.
     var tocEntries: [TOCEntry] = []
 
-    /// The ID of the currently selected chapter (EPUB only).
-    /// `nil` for non-EPUB items or when no specific chapter is selected.
+    /// The ID of the currently selected structured EPUB/PDF chapter.
+    /// `nil` for unstructured items or when no chapter is selected.
     var currentChapterId: String? = nil
+
+    /// Exact sentence restored from the Rust scalar-position projection.
+    var restoredSentenceIndex = 0
+
+    /// Current optimistic-concurrency version for the item cursor.
+    var positionVersion: UInt64 = 0
+
+    /// Rust-projected bookmarks for the open item.
+    var bookmarks: [AppleBookmark] = []
+
+    /// Full local-book search projection returned by Rust Core.
+    var searchQuery = ""
+    var searchResult: AppleReaderSearchResult? = nil
+    var searchHits: [AppleReaderSearchHit] = []
+    var activeSearchHitIndex: Int? = nil
+    var searchError: String? = nil
 
     /// Whether the item data is being loaded from the backend.
     var isLoading = false
@@ -70,10 +123,36 @@ final class ReaderViewModel {
     /// Non-nil when a load or parse error occurred.
     var error: String? = nil
 
+    /// Parser-owned value currently projected by the GUI and playback engine.
+    private(set) var readerIR: ReadioReaderIR? = nil
+    private(set) var highlightDocument: ReadioHighlightDocument? = nil
+
     // MARK: - Dependencies
 
     /// Service layer for fetching and updating library items.
-    private let libraryService = LibraryService()
+    private let libraryService: LibraryService
+    private let positionService: AppleReadingPositionService
+    private let bookmarkService: AppleBookmarkService
+    private let sdk = ReadioSDK()
+    private let sessionID: String
+    private var documentRevision = ""
+    private var currentDocumentJSON = ""
+    private var readerProjection: AppleReaderProjection? = nil
+    private var lastSavedCharOffset: Int?
+    private var pendingProgressSentenceIndex: Int?
+    private var progressSaveTask: Task<Void, Never>?
+
+    init(
+        libraryService: LibraryService = LibraryService(),
+        positionService: AppleReadingPositionService = AppleReadingPositionService(),
+        bookmarkService: AppleBookmarkService = AppleBookmarkService(),
+        sessionID: String = UUID().uuidString
+    ) {
+        self.libraryService = libraryService
+        self.positionService = positionService
+        self.bookmarkService = bookmarkService
+        self.sessionID = sessionID
+    }
 
     // MARK: - Public API
 
@@ -81,9 +160,8 @@ final class ReaderViewModel {
     ///
     /// This is the primary entry point, called when the reader screen appears.
     /// After loading:
-    /// - For plain text types: sentences are extracted via `SentenceSplitter`.
-    /// - For EPUB: chapters are parsed from JSON, TOC entries are extracted,
-    ///   and the last-read chapter (or the first) is selected.
+    /// - Every type is installed from Reader IR.
+    /// - Structured publications restore the last-read chapter when possible.
     ///
     /// - Parameter id: The library item ID to load.
     func loadItem(id: String) async {
@@ -94,13 +172,10 @@ final class ReaderViewModel {
             let loadedItem = try await libraryService.fetchItem(id: id)
             item = loadedItem
 
-            // Extract sentences based on document type
-            switch loadedItem.type {
-            case .epub:
-                parseEpubContent(loadedItem)
-            case .txt, .web, .pdf:
-                extractPlainTextSentences(loadedItem)
-            }
+            let projection = try await libraryService.loadReaderProjection(for: loadedItem)
+            try installReaderProjection(projection, for: loadedItem)
+            try await restoreReadingPosition(itemID: loadedItem.id)
+            bookmarks = try await bookmarkService.list(itemID: loadedItem.id)
         } catch {
             self.error = "Failed to load item: \(error.localizedDescription)"
         }
@@ -108,20 +183,19 @@ final class ReaderViewModel {
         isLoading = false
     }
 
-    /// Extract sentences from the item's content based on its type.
-    ///
-    /// Called after `loadItem()` and when switching chapters. For non-EPUB types
-    /// this uses `SentenceSplitter`; for EPUB it extracts from the current chapter's
-    /// content blocks.
+    /// Refreshes the active GUI/playback slice from the already-installed IR.
     func extractSentences() {
-        guard let item else { return }
+        installActiveSentenceProjection()
+    }
 
-        switch item.type {
-        case .epub:
-            extractEpubSentences()
-        case .txt, .web, .pdf:
-            extractPlainTextSentences(item)
+    func loadEpubAsset(assetID: String) async throws -> Data {
+        guard let itemID = item?.id else {
+            throw LibraryServiceError.invalidMetadata
         }
+        return try await libraryService.loadEpubAsset(
+            itemID: itemID,
+            assetID: assetID
+        )
     }
 
     /// Select a specific EPUB chapter by its ID.
@@ -131,15 +205,18 @@ final class ReaderViewModel {
     ///
     /// - Parameter id: The chapter ID to select.
     func selectChapter(id: String) async {
-        guard item?.type == .epub else { return }
+        guard let item, readerProjection != nil else { return }
 
-        currentChapterId = id
-        extractEpubSentences()
+        let navigation = tocEntries.first(where: { $0.id == id })
+        let chapterId = navigation?.chapterId ?? id
+        currentChapterId = chapterId
+        installActiveSentenceProjection()
 
-        // Persist the chapter selection to the server
-        if let itemId = item?.id {
-            try? await libraryService.updateChapter(id: itemId, chapter: id)
+        if usesStructuredChapters(item) {
+            try? await libraryService.updateChapter(id: item.id, chapter: chapterId)
         }
+        restoredSentenceIndex = navigation?.sentenceIndex ?? 0
+        lastSavedCharOffset = nil
     }
 
     /// Save the current reading progress to the server.
@@ -150,10 +227,54 @@ final class ReaderViewModel {
     ///
     /// - Parameter sentenceIndex: The zero-based index of the current sentence.
     func saveProgress(sentenceIndex: Int) async {
-        guard let item, !sentences.isEmpty else { return }
+        guard let item,
+              !sentences.isEmpty,
+              sentences.indices.contains(sentenceIndex),
+              !documentRevision.isEmpty else { return }
 
-        // Compute progress as a percentage of total sentences
-        let progress = min(100, max(0, Int(Double(sentenceIndex) / Double(sentences.count) * 100)))
+        let charOffset = sentences[sentenceIndex].charOffset
+        guard charOffset != lastSavedCharOffset else { return }
+
+        do {
+            let locator = try createTextLocator(at: UInt64(charOffset))
+            let response = try await positionService.save(
+                itemID: item.id,
+                mutation: AppleReadingPositionMutation(
+                    documentRevision: documentRevision,
+                    charOffset: UInt64(charOffset),
+                    affinity: .forward,
+                    observedAtUnixMilliseconds: Int64(Date().timeIntervalSince1970 * 1_000),
+                    sessionId: sessionID,
+                    mutationId: UUID().uuidString,
+                    baseVersion: positionVersion,
+                    locator: locator
+                )
+            )
+            positionVersion = response.version
+            guard response.status == .applied else {
+                if let current = response.position,
+                   current.documentRevision == documentRevision {
+                    restoredSentenceIndex = resolveSentenceIndex(at: current.charOffset)
+                    lastSavedCharOffset = Int(exactly: current.charOffset)
+                }
+                return
+            }
+            restoredSentenceIndex = sentenceIndex
+            lastSavedCharOffset = charOffset
+        } catch {
+            self.error = "Failed to save reading position: \(error.localizedDescription)"
+            return
+        }
+
+        // Compatibility percentage is a projection of the same whole-book
+        // Unicode-scalar cursor; sentence counts are not a distance metric.
+        let progress: Int
+        do {
+            progress = try summaryProgressPercentage(at: UInt64(charOffset))
+        } catch {
+            self.error = "Failed to project reading progress: \(error.localizedDescription)"
+            return
+        }
 
         // Only save if the progress actually changed to avoid unnecessary network calls
         guard progress != item.progress else { return }
@@ -161,133 +282,419 @@ final class ReaderViewModel {
         try? await libraryService.updateProgress(id: item.id, progress: progress)
     }
 
-    // MARK: - Private Helpers
-
-    /// Extract sentences from plain text content using `SentenceSplitter`.
-    ///
-    /// Used for `.txt`, `.web`, and `.pdf` types where the content is a single
-    /// text string (HTML may be stripped by the backend before reaching here).
-    ///
-    /// - Parameter item: The library item whose `content` field contains plain text.
-    private func extractPlainTextSentences(_ item: LibraryItem) {
-        sentences = SentenceSplitter.splitSentences(item.content)
+    private func summaryProgressPercentage(at charOffset: UInt64) throws -> Int {
+        guard !currentDocumentJSON.isEmpty else {
+            throw ReadioSDKError.missingValue
+        }
+        let requestJSON = String(
+            decoding: try JSONSerialization.data(withJSONObject: [
+                "char_offset": charOffset,
+                "affinity": ApplePositionAffinity.forward.rawValue,
+            ]),
+            as: UTF8.self
+        )
+        let projectionJSON = try sdk.projectOffset(
+            documentJSON: currentDocumentJSON,
+            requestJSON: requestJSON
+        )
+        guard let projection = try JSONSerialization.jsonObject(
+            with: Data(projectionJSON.utf8)
+        ) as? [String: Any],
+            let basisPoints = projection["progress_basis_points"] as? NSNumber
+        else {
+            throw ReadioSDKError.missingValue
+        }
+        return min(100, max(0, (basisPoints.intValue + 50) / 100))
     }
 
-    /// Parse the EPUB content JSON into chapters, extract TOC entries, and
-    /// select the initial chapter.
-    ///
-    /// The `content` field for EPUB items is a JSON-encoded array of `EpubChapter`
-    /// objects. Each chapter has an `id`, `title`, and array of `ContentBlock` values.
-    ///
-    /// - Parameter item: The library item with EPUB-type content.
-    private func parseEpubContent(_ item: LibraryItem) {
-        guard let contentData = item.content.data(using: .utf8) else {
-            error = "Failed to read EPUB content"
+    /// Coalesces rapid Auto/read-aloud cursor changes behind one serialized
+    /// writer. Every mutation therefore observes the version produced by the
+    /// previous mutation, while pending work collapses to the newest sentence.
+    func enqueueProgressSave(sentenceIndex: Int) {
+        pendingProgressSentenceIndex = sentenceIndex
+        guard progressSaveTask == nil else { return }
+        progressSaveTask = Task { @MainActor [weak self] in
+            await self?.drainProgressSaves()
+        }
+    }
+
+    /// Awaitable durability barrier used by lifecycle handling and tests.
+    func flushProgressSaves() async {
+        while let task = progressSaveTask {
+            await task.value
+        }
+    }
+
+    func addBookmark(sentenceIndex: Int, note: String = "") async {
+        guard let item,
+              sentences.indices.contains(sentenceIndex),
+              !currentDocumentJSON.isEmpty else { return }
+        let charOffset = UInt64(sentences[sentenceIndex].charOffset)
+        let existing = bookmarks.first(where: { $0.charOffset == charOffset })
+        let now = Int64(Date().timeIntervalSince1970 * 1_000)
+        let trimmedNote = note.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedNote = trimmedNote.isEmpty
+            ? sentences[sentenceIndex].text
+            : trimmedNote
+        do {
+            let transition = try await bookmarkService.upsert(
+                documentJSON: currentDocumentJSON,
+                request: AppleBookmarkUpsertRequest(
+                    bookmarkId: existing?.id ?? UUID().uuidString,
+                    itemId: item.id,
+                    charOffset: charOffset,
+                    affinity: .forward,
+                    note: resolvedNote,
+                    createdAtUnixMilliseconds: existing?.createdAtUnixMilliseconds ?? now,
+                    updatedAtUnixMilliseconds: now,
+                    baseVersion: existing?.version ?? 0
+                )
+            )
+            storeBookmark(transition.bookmark)
+        } catch {
+            self.error = "Failed to save bookmark: \(error.localizedDescription)"
+        }
+    }
+
+    func renameBookmark(_ bookmark: AppleBookmark, note: String) async {
+        guard !currentDocumentJSON.isEmpty else { return }
+        let sentence = resolveSentenceIndex(at: bookmark.charOffset)
+        let trimmedNote = note.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedNote = trimmedNote.isEmpty && sentences.indices.contains(sentence)
+            ? sentences[sentence].text
+            : trimmedNote
+        do {
+            let transition = try await bookmarkService.upsert(
+                documentJSON: currentDocumentJSON,
+                request: AppleBookmarkUpsertRequest(
+                    bookmarkId: bookmark.id,
+                    itemId: bookmark.itemId,
+                    charOffset: bookmark.charOffset,
+                    affinity: bookmark.affinity,
+                    note: resolvedNote,
+                    createdAtUnixMilliseconds: bookmark.createdAtUnixMilliseconds,
+                    updatedAtUnixMilliseconds: Int64(
+                        Date().timeIntervalSince1970 * 1_000
+                    ),
+                    baseVersion: bookmark.version
+                )
+            )
+            storeBookmark(transition.bookmark)
+        } catch {
+            if let item {
+                bookmarks = (try? await bookmarkService.list(itemID: item.id))
+                    ?? bookmarks
+            }
+            self.error = "Failed to rename bookmark: \(error.localizedDescription)"
+        }
+    }
+
+    func deleteBookmark(_ bookmark: AppleBookmark) async {
+        do {
+            try await bookmarkService.delete(bookmarkID: bookmark.id)
+            bookmarks.removeAll(where: { $0.id == bookmark.id })
+        } catch {
+            self.error = "Failed to delete bookmark: \(error.localizedDescription)"
+        }
+    }
+
+    func sentenceIndex(for bookmark: AppleBookmark) -> Int {
+        resolveSentenceIndex(at: bookmark.charOffset)
+    }
+
+    /// Resolves one whole-book bookmark into the active chapter projection.
+    /// Structured EPUB and PDF readers keep chapter-local playback arrays, so
+    /// resolving only against the currently visible array can seek to the right
+    /// numeric index in the wrong chapter.
+    @discardableResult
+    func activateBookmark(_ bookmark: AppleBookmark) -> Int? {
+        if item.map(usesStructuredChapters) == true,
+           let sentence = selectReaderProjection(containing: bookmark.charOffset) {
+            restoredSentenceIndex = sentence
+            return sentence
+        }
+        let sentence = resolveSentenceIndex(at: bookmark.charOffset)
+        restoredSentenceIndex = sentence
+        return sentence
+    }
+
+    /// Searches the indexed reader document entirely in Rust. Pages are drained
+    /// locally so previous/next walking can wrap deterministically at either end.
+    func search(_ query: String) {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            searchQuery = ""
+            searchResult = nil
+            searchHits = []
+            activeSearchHitIndex = nil
+            searchError = nil
+            return
+        }
+        searchQuery = trimmed
+        guard !currentDocumentJSON.isEmpty, !documentRevision.isEmpty else {
+            searchError = "This book is still being indexed"
             return
         }
 
         do {
-            let decoder = JSONDecoder()
-            decoder.keyDecodingStrategy = .convertFromSnakeCase
-            let parsedChapters = try decoder.decode([EpubChapter].self, from: contentData)
-            chapters = parsedChapters
+            var cursor: String? = nil
+            var allHits: [AppleReaderSearchHit] = []
+            var summary: AppleReaderSearchResult?
+            repeat {
+                let request: [String: Any] = [
+                    "document_revision": documentRevision,
+                    "query": trimmed,
+                    "cursor": cursor ?? NSNull(),
+                    "limit": 256,
+                ]
+                let requestJSON = String(
+                    decoding: try JSONSerialization.data(withJSONObject: request),
+                    as: UTF8.self
+                )
+                let pageJSON = try sdk.searchDocument(
+                    documentJSON: currentDocumentJSON,
+                    requestJSON: requestJSON
+                )
+                let page = try JSONDecoder().decode(
+                    AppleReaderSearchPage.self,
+                    from: Data(pageJSON.utf8)
+                )
+                summary = AppleReaderSearchResult(
+                    foldedQuery: page.foldedQuery,
+                    totalOccurrences: page.totalOccurrences,
+                    totalPassages: page.totalPassages
+                )
+                allHits.append(contentsOf: page.hits)
+                cursor = page.nextCursor
+            } while cursor != nil
 
-            // Extract TOC entries from chapters for navigation
-            tocEntries = parsedChapters.map { chapter in
-                TOCEntry(id: chapter.id, title: chapter.title, href: nil)
-            }
-
-            // Restore the last-read chapter, or default to the first
-            let restoredChapterId = item.currentChapter ?? parsedChapters.first?.id
-            currentChapterId = restoredChapterId
-
-            // Extract sentences from the selected chapter
-            extractEpubSentences()
+            searchResult = summary
+            searchHits = allHits
+            activeSearchHitIndex = nil
+            searchError = nil
         } catch {
-            self.error = "Failed to parse EPUB content: \(error.localizedDescription)"
-            // Fallback: treat the content as plain text
-            sentences = SentenceSplitter.splitSentences(item.content)
+            searchResult = nil
+            searchHits = []
+            activeSearchHitIndex = nil
+            searchError = "Search failed: \(error.localizedDescription)"
         }
     }
 
-    /// Extract `Sentence` values from the current EPUB chapter's content blocks.
-    ///
-    /// Walks through each `ContentBlock` in the selected chapter, collecting
-    /// text from `RichSentence` values and falling back to `SentenceSplitter`
-    /// for blocks without pre-split sentences.
-    ///
-    /// The extracted `Sentence` values are plain-text only (for TTS). The view
-    /// layer uses the original `ContentBlock`/`RichSentence` types for styled rendering.
-    private func extractEpubSentences() {
-        guard let chapter = chapters.first(where: { $0.id == currentChapterId }) ?? chapters.first else {
+    /// Activates a source-range hit and returns its sentence projection for the
+    /// player. The query and hit list remain intact while reading continues.
+    @discardableResult
+    func activateSearchHit(at index: Int) -> Int? {
+        guard searchHits.indices.contains(index),
+              let charOffset = searchHits[index].charRange.first else { return nil }
+        activeSearchHitIndex = index
+        if item.map(usesStructuredChapters) == true,
+           let sentence = selectReaderProjection(containing: charOffset) {
+            return sentence
+        }
+        return resolveSentenceIndex(at: charOffset)
+    }
+
+    @discardableResult
+    func walkSearchHits(_ direction: AppleSearchWalkDirection) -> Int? {
+        guard !searchHits.isEmpty else { return nil }
+        let target: Int
+        switch (activeSearchHitIndex, direction) {
+        case (nil, .next):
+            target = 0
+        case (nil, .previous):
+            target = searchHits.count - 1
+        case let (.some(index), .next):
+            target = (index + 1) % searchHits.count
+        case let (.some(index), .previous):
+            target = (index - 1 + searchHits.count) % searchHits.count
+        }
+        return activateSearchHit(at: target)
+    }
+
+    /// Refresh lightweight Rust projections after a successful cloud sync.
+    /// The open document and playback engine stay intact; only synced cursor and
+    /// bookmark state are rematerialized from the shared local replica.
+    func refreshReplicaProjection() async {
+        guard let item else { return }
+        do {
+            async let refreshedBookmarks = bookmarkService.list(itemID: item.id)
+            async let refreshedPosition = positionService.fetch(itemID: item.id)
+            let (nextBookmarks, nextPosition) = try await (
+                refreshedBookmarks,
+                refreshedPosition
+            )
+            bookmarks = nextBookmarks
+            if let nextPosition {
+            positionVersion = nextPosition.version
+            if let charOffset = try resolvedCharOffset(for: nextPosition) {
+                if usesStructuredChapters(item) {
+                    _ = selectReaderProjection(containing: charOffset)
+                }
+                restoredSentenceIndex = resolveSentenceIndex(
+                    at: charOffset
+                )
+                    lastSavedCharOffset = Int(exactly: charOffset)
+                }
+            } else {
+                positionVersion = 0
+                restoredSentenceIndex = 0
+                lastSavedCharOffset = nil
+            }
+        } catch {
+            self.error = "Failed to refresh synced reading state: \(error.localizedDescription)"
+        }
+    }
+
+    // MARK: - Private Helpers
+
+    private func installReaderProjection(
+        _ projection: AppleReaderProjection,
+        for item: LibraryItem
+    ) throws {
+        readerProjection = projection
+        readerIR = projection.reader
+        chapters = projection.chapters
+        tocEntries = projection.navigation
+        let requestedChapter = usesStructuredChapters(item)
+            ? item.currentChapter.flatMap { requested in
+                projection.chapters.contains(where: { $0.id == requested })
+                    ? requested
+                    : nil
+            }
+            : nil
+        currentChapterId = requestedChapter ?? projection.chapters.first?.id
+        installActiveSentenceProjection()
+        documentRevision = projection.reader.document.revision.revisionDigest
+        currentDocumentJSON = String(
+            decoding: try JSONEncoder().encode(projection.reader.document),
+            as: UTF8.self
+        )
+        highlightDocument = try sdk.makeHighlightDocument(reader: projection.reader)
+    }
+
+    private func installActiveSentenceProjection() {
+        guard let readerProjection else {
             sentences = []
             return
         }
-
-        var extracted: [Sentence] = []
-        var runningIndex = 0
-
-        // Walk through each content block in the chapter and extract sentences
-        for block in chapter.blocks {
-            let blockSentences = extractSentencesFromBlock(block, startIndex: runningIndex)
-            extracted.append(contentsOf: blockSentences)
-            runningIndex += blockSentences.count
-        }
-
-        sentences = extracted
+        let chapterID = currentChapterId ?? readerProjection.chapters.first?.id
+        currentChapterId = chapterID
+        let chapterSentences = readerProjection.sentences(in: chapterID)
+        sentences = chapterSentences.isEmpty
+            ? readerProjection.allSentences
+            : chapterSentences
     }
 
-    /// Extract `Sentence` values from a single content block.
-    ///
-    /// Different block types contain sentences in different structures:
-    /// - `heading`, `paragraph`, `blockquote`: directly contain `RichSentence` arrays.
-    /// - `list`: each list item contains a `RichSentence` array.
-    /// - `code`: treated as a single sentence with the full code text.
-    /// - `image`, `separator`: no extractable text, skipped.
-    ///
-    /// - Parameters:
-    ///   - block: The content block to extract from.
-    ///   - startIndex: The starting sentence index for this block.
-    /// - Returns: Array of extracted `Sentence` values.
-    private func extractSentencesFromBlock(_ block: ContentBlock, startIndex: Int) -> [Sentence] {
-        var sentences: [Sentence] = []
-        var idx = startIndex
-
-        switch block {
-        case .heading(_, let richSentences, _),
-             .paragraph(let richSentences, _),
-             .blockquote(let richSentences, _):
-            // These block types directly contain an array of RichSentence values
-            for rs in richSentences {
-                let trimmed = rs.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmed.isEmpty else { continue }
-                sentences.append(Sentence(index: idx, text: trimmed))
-                idx += 1
-            }
-
-        case .list(_, let items, _):
-            // List items each contain their own RichSentence arrays
-            for item in items {
-                for rs in item.sentences {
-                    let trimmed = rs.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !trimmed.isEmpty else { continue }
-                    sentences.append(Sentence(index: idx, text: trimmed))
-                    idx += 1
-                }
-            }
-
-        case .code(let text, _):
-            // Code blocks are treated as single sentences
-            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty {
-                sentences.append(Sentence(index: idx, text: trimmed))
-            }
-
-        case .image, .separator:
-            // No extractable text from image or separator blocks
-            break
+    private func createTextLocator(at charOffset: UInt64) throws -> AppleTextLocator {
+        guard !currentDocumentJSON.isEmpty else {
+            throw ReadioSDKError.missingValue
         }
+        let requestJSON = String(
+            decoding: try JSONSerialization.data(withJSONObject: [
+                "char_offset": charOffset,
+                "affinity": ApplePositionAffinity.forward.rawValue,
+            ]),
+            as: UTF8.self
+        )
+        let locatorJSON = try sdk.createTextLocator(
+            documentJSON: currentDocumentJSON,
+            requestJSON: requestJSON
+        )
+        return try JSONDecoder().decode(
+            AppleTextLocator.self,
+            from: Data(locatorJSON.utf8)
+        )
+    }
 
-        return sentences
+    private func restoreReadingPosition(itemID: String) async throws {
+        guard let position = try await positionService.fetch(itemID: itemID) else {
+            restoredSentenceIndex = 0
+            positionVersion = 0
+            lastSavedCharOffset = nil
+            return
+        }
+        positionVersion = position.version
+        guard let charOffset = try resolvedCharOffset(for: position) else {
+            restoredSentenceIndex = 0
+            lastSavedCharOffset = nil
+            return
+        }
+        if item.map(usesStructuredChapters) == true {
+            _ = selectReaderProjection(containing: charOffset)
+        }
+        restoredSentenceIndex = resolveSentenceIndex(at: charOffset)
+        lastSavedCharOffset = Int(exactly: charOffset)
+    }
+
+    private func resolvedCharOffset(
+        for position: AppleReadingPositionRecord
+    ) throws -> UInt64? {
+        if position.documentRevision == documentRevision {
+            return position.charOffset
+        }
+        guard let locator = position.locator, !currentDocumentJSON.isEmpty else {
+            return nil
+        }
+        let locatorJSON = String(
+            decoding: try JSONEncoder().encode(locator),
+            as: UTF8.self
+        )
+        let resolutionJSON = try sdk.restoreTextLocator(
+            documentJSON: currentDocumentJSON,
+            locatorJSON: locatorJSON
+        )
+        guard let resolution = try JSONSerialization.jsonObject(
+            with: Data(resolutionJSON.utf8)
+        ) as? [String: Any],
+            let projection = resolution["projection"] as? [String: Any],
+            let charOffset = projection["char_offset"] as? NSNumber
+        else {
+            throw ReadioSDKError.missingValue
+        }
+        return charOffset.uint64Value
+    }
+
+    private func resolveSentenceIndex(at charOffset: UInt64) -> Int {
+        guard let offset = Int(exactly: charOffset) else {
+            return max(0, sentences.count - 1)
+        }
+        return sentences.last(where: { $0.charOffset <= offset })?.index ?? 0
+    }
+
+    /// Selects the chapter containing one whole-book scalar coordinate and
+    /// returns the chapter-local sentence cursor used by the playback reducer.
+    private func selectReaderProjection(containing charOffset: UInt64) -> Int? {
+        guard let readerProjection,
+              let chapterID = readerProjection.chapterID(containing: charOffset) else {
+            return nil
+        }
+        currentChapterId = chapterID
+        installActiveSentenceProjection()
+        return resolveSentenceIndex(at: charOffset)
+    }
+
+    private func isStructuredPDF(_ item: LibraryItem) -> Bool {
+        item.type == .pdf && item.contentFormat == "readio-pdf-v1"
+    }
+
+    private func usesStructuredChapters(_ item: LibraryItem) -> Bool {
+        item.type == .epub || isStructuredPDF(item)
+    }
+
+    private func drainProgressSaves() async {
+        while let sentence = pendingProgressSentenceIndex {
+            pendingProgressSentenceIndex = nil
+            await saveProgress(sentenceIndex: sentence)
+        }
+        progressSaveTask = nil
+    }
+
+    private func storeBookmark(_ bookmark: AppleBookmark) {
+        bookmarks.removeAll(where: { $0.id == bookmark.id })
+        bookmarks.append(bookmark)
+        bookmarks.sort {
+            ($0.charOffset, $0.createdAtUnixMilliseconds, $0.id)
+                < ($1.charOffset, $1.createdAtUnixMilliseconds, $1.id)
+        }
     }
 }

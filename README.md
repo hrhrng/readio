@@ -3,10 +3,10 @@
 **An open-source terminal ebook reader and local TTS audiobook player disguised as an AI coding agent.** Read EPUB, PDF, Markdown and plain text without leaving the terminal: press enter and it thinks, issues a tool call, then streams the next passage of your book. It looks like coding; the book is real.
 
 [![tui-ci](https://github.com/hrhrng/readio/actions/workflows/tui-ci.yml/badge.svg?branch=main)](https://github.com/hrhrng/readio/actions/workflows/tui-ci.yml)
-[![release](https://img.shields.io/github/v/release/hrhrng/readio?include_prereleases&filter=tui-v*&label=release&color=6f5ec7)](https://github.com/hrhrng/readio/releases)
-[![license](https://img.shields.io/badge/license-MIT-6f5ec7)](LICENSE)
-[![rust](https://img.shields.io/badge/rust-1.85%2B-6f5ec7)](https://www.rust-lang.org)
-![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-6f5ec7)
+[![release](https://img.shields.io/github/v/release/hrhrng/readio?include_prereleases&filter=tui-v*&label=release&color=4f7458)](https://github.com/hrhrng/readio/releases)
+[![license](https://img.shields.io/badge/license-MIT-4f7458)](LICENSE)
+[![rust](https://img.shields.io/badge/rust-1.85%2B-4f7458)](https://www.rust-lang.org)
+![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-4f7458)
 
 [中文文档](README.zh-CN.md)
 
@@ -15,7 +15,7 @@ Built in Rust as a keyboard-first TUI. Chapters follow the book's own table of c
 Every number on screen is a real reading — real paragraph offsets, real line ranges, real full-text search hits. Only the vocabulary is costume.
 
 ```
- readio   The Shape of Attention  readio sample                   ch 1/4  ·  ctx 0.0%
+ ❯_ readio   The Shape of Attention  readio sample                ch 1/4  ·  ctx 0.0%
    ○  3. Three  The feel of a tool  783 tok
    ○  4. Four  One continuous piece of work  485 tok
 

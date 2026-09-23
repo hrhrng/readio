@@ -1,0 +1,37 @@
+[workspace]
+members = [
+    "crates/readio-core",
+    "crates/readio-sdk",
+    "crates/readio-bridge",
+    "crates/readio-wasm",
+    "crates/readio-ffi",
+]
+exclude = ["apps/tui"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+base64 = "0.22.1"
+html5ever = "0.36.1"
+markup5ever_rcdom = "0.36.0"
+pdf-extract = "0.12.0"
+pulldown-cmark = { version = "0.13.0", default-features = false, features = ["html"] }
+quick-xml = "0.41.0"
+blake3 = "1.8.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.10.9"
+url = "2.5.8"
+unicode-segmentation = "1.13.3"
+wasm-bindgen = "=0.2.126"
+zip = { version = "7.2.0", default-features = false, features = ["deflate"] }
+
+# Every integration test is a separate executable. Debug sections and incremental
+# state were multiplying the same Rust code across dozens of test binaries.
+[profile.test]
+debug = 0
+incremental = false

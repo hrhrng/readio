@@ -539,8 +539,15 @@ fn diagnostic_log_records_voice_boundaries_and_clock_samples() {
     let source = long_chapters(common::isolated_home());
     let home = fixture_home();
     let log = home.join("readio.log");
-    let (mut app, mut terminal) =
-        fixture_at_home(home, source, SYNTH_MS, LONG_CLIP_MS, "", 46.0, Some(&log));
+    let (mut app, mut terminal) = fixture_at_home(
+        home.clone(),
+        source,
+        SYNTH_MS,
+        LONG_CLIP_MS,
+        "",
+        46.0,
+        Some(&log),
+    );
     start_reading_aloud(&mut app, &mut terminal);
     until(&mut app, &mut terminal, "a sampled audio clock", |app| {
         app.voice_position()
@@ -562,6 +569,71 @@ fn diagnostic_log_records_voice_boundaries_and_clock_samples() {
         trace.contains("voice clock") && trace.contains("media_ms=") && trace.contains("target="),
         "the log cannot reconstruct the reveal clock:\n{trace}"
     );
+
+    type_line(&mut app, "/diagnostics");
+    let support = std::fs::read_dir(home.join("support"))
+        .expect("safe support directory")
+        .next()
+        .expect("safe support bundle")
+        .expect("support entry")
+        .path();
+    let bundle = std::fs::read_to_string(support).expect("safe support contents");
+    assert!(bundle.contains("\"category\": \"tts\""), "{bundle}");
+    assert!(bundle.contains("\"provider\": \"stand-in\""), "{bundle}");
+    assert!(bundle.contains("\"category\": \"playback\""), "{bundle}");
+    assert!(bundle.contains("\"media_position_ms\""), "{bundle}");
+    assert!(bundle.contains("\"media_duration_ms\""), "{bundle}");
+    assert!(!bundle.contains("这一句"));
+    assert!(!bundle.contains("book_text"));
+    assert!(!bundle.contains("authorization"));
+}
+
+/// A provider failure keeps read-aloud selected and stops in place. The safe
+/// support bundle must make that explicit as provider → none, otherwise a
+/// support reader cannot distinguish an intentional stop from a silent switch.
+#[test]
+fn diagnostic_log_records_explicit_provider_to_none_fallback() {
+    let _guard = exclusive();
+    let home = fixture_home();
+    let source = long_chapters(&home);
+    let (mut app, mut terminal) =
+        fixture_at_home(home.clone(), source, SYNTH_MS, LONG_CLIP_MS, "", 46.0, None);
+    let engine = home.join(format!("stand-in-voice-{SYNTH_MS}-{LONG_CLIP_MS}"));
+    std::fs::write(&engine, "#!/bin/sh\nexit 7\n").expect("replace engine with failure");
+
+    start_reading_aloud(&mut app, &mut terminal);
+    until(
+        &mut app,
+        &mut terminal,
+        "the failed voice turn to stop",
+        |app| !app.turn.busy(),
+    );
+    type_line(&mut app, "/diagnostics");
+
+    let support = std::fs::read_dir(home.join("support"))
+        .expect("safe support directory")
+        .next()
+        .expect("safe support bundle")
+        .expect("support entry")
+        .path();
+    let bundle: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(support).expect("safe support contents"))
+            .expect("support JSON");
+    let events = bundle["events"].as_array().expect("diagnostic events");
+    let failed = events
+        .iter()
+        .find(|event| event["category"] == "tts" && event["fields"]["outcome"] == "failed")
+        .expect("failed provider fact");
+    let fallback = events
+        .iter()
+        .find(|event| event["category"] == "fallback")
+        .expect("explicit provider-to-none fact");
+    assert_eq!(fallback["operation_id"], failed["operation_id"]);
+    assert_eq!(fallback["fields"]["from_provider"], "stand-in");
+    assert_eq!(fallback["fields"]["to_provider"], "none");
+    assert_eq!(fallback["fields"]["attempt"], 1);
+    assert_eq!(fallback["fields"]["outcome"], "stopped");
+    assert_eq!(app.mode(), readio::mode::Mode::Speak);
 }
 
 /// The pacing itself, measured rather than reasoned about.

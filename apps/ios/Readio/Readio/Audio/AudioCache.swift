@@ -1,26 +1,22 @@
 import Foundation
 
 // MARK: - AudioCacheEntry
-/// A single cached audio entry holding decoded PCM/MP3 data and its duration.
+/// A single cached audio entry holding native synthesized audio and its duration.
 ///
-/// Entries are created after successfully decoding a base64 TTS response and
-/// are stored in `AudioCache` for fast replay without re-synthesis.
+/// Entries are created after the Apple SDK renders a sentence and are stored in
+/// `AudioCache` for fast replay without re-synthesis.
 struct AudioCacheEntry: Sendable {
-    /// Raw audio data (e.g., MP3 bytes) decoded from the TTS response's `audio_base64` field.
+    /// Reusable CAF data rendered by the installed Apple voice.
     /// Fed directly to `AVAudioPlayer(data:)` for playback.
     let data: Data
 
-    /// Duration of the audio clip in milliseconds, as reported by the TTS backend
-    /// (from `TTSJobStatusResponse.durationMs`). Used for estimating remaining
-    /// playback time before the actual `AVAudioPlayer` duration is available.
+    /// Provider-reported duration used to enter the portable playback state.
+    /// ETA never trusts this value; it waits for `AVAudioPlayer.duration`.
     let durationMs: Double
 }
 
 // MARK: - AudioCache
 /// Thread-safe LRU (Least Recently Used) cache for decoded TTS audio data.
-///
-/// Port of the web app's `AudioCache` class (`lib/audio-cache.ts`), adapted for
-/// iOS where we store raw `Data` instead of object URLs.
 ///
 /// **Design decisions:**
 /// - **LRU eviction:** When the cache is full, the least-recently-accessed entry is
@@ -28,14 +24,13 @@ struct AudioCacheEntry: Sendable {
 ///   prefetches are reclaimed first.
 /// - **Thread safety:** All mutations are serialized on a private `NSLock`. This is
 ///   lightweight and avoids the overhead of a dispatch queue for simple dictionary ops.
-/// - **Capacity default (50):** Matches the web app. At ~100KB per MP3 sentence this
-///   means ~5MB peak memory, well within iOS limits.
+/// - **Capacity default (50):** Bounds memory while retaining nearby sentences.
 /// - **Key = sentence index:** The TTS engine uses sentence indices as cache keys,
-///   matching the web app's `Map<number, CacheEntry>` pattern.
+///   which keeps lookup independent of the rendered audio container.
 ///
 /// **Lifecycle:**
 /// - Created once per `TTSPlaybackEngine` instance.
-/// - Cleared on voice or speed change (audio is speed/voice-specific).
+/// - Cleared on voice or document change; playback-rate changes reuse canonical audio.
 /// - Cleared on `cleanup()` when the player is torn down.
 final class AudioCache: @unchecked Sendable {
 
@@ -61,8 +56,7 @@ final class AudioCache: @unchecked Sendable {
 
     /// Create a new audio cache with the given capacity.
     ///
-    /// - Parameter capacity: Maximum number of entries to retain. Defaults to 50,
-    ///   matching the web app's `new AudioCache(50)`.
+    /// - Parameter capacity: Maximum number of entries to retain. Defaults to 50.
     init(capacity: Int = 50) {
         self.capacity = max(1, capacity)
     }
@@ -96,7 +90,7 @@ final class AudioCache: @unchecked Sendable {
     ///
     /// - Parameters:
     ///   - key: The sentence index to cache.
-    ///   - data: Raw audio bytes (e.g., decoded from base64 MP3).
+    ///   - data: Reusable audio bytes rendered by the native provider.
     ///   - durationMs: Audio duration in milliseconds.
     func set(_ key: Int, data: Data, durationMs: Double) {
         lock.lock()
@@ -151,8 +145,9 @@ final class AudioCache: @unchecked Sendable {
     ///
     /// Called when:
     /// - Voice changes (different voice produces different audio)
-    /// - Speed changes (different speed produces different audio)
     /// - The playback engine is torn down via `cleanup()`
+    ///
+    /// Playback-rate changes keep canonical audio and therefore do not clear it.
     func clear() {
         lock.lock()
         defer { lock.unlock() }

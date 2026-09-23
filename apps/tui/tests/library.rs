@@ -10,8 +10,9 @@ use std::path::PathBuf;
 use common::{isolated_home, source_book, under_books};
 use readio::app::parse_import_arg;
 use readio::book::content_id;
-use readio::library::{Library, Mode};
+use readio::library::{Entry, Library, Mode};
 use readio::paths;
+use readio_sdk::ReadioSdk;
 
 fn library() -> Library {
     isolated_home();
@@ -86,6 +87,87 @@ fn identity_follows_content_not_location() {
 
     assert_eq!(before, after, "copying must not change the id");
     assert_eq!(entry.id, before, "the entry is keyed by content");
+}
+
+#[test]
+fn tui_content_ids_use_the_shared_full_byte_identity() {
+    let root = isolated_home().join("sources").join("full-byte-identity");
+    std::fs::create_dir_all(&root).expect("source directory");
+    let mut left = vec![b'a'; 128 * 1024 + 1];
+    let mut right = left.clone();
+    left[128 * 1024] = b'x';
+    right[128 * 1024] = b'y';
+    let left_path = root.join("left.txt");
+    let right_path = root.join("right.txt");
+    std::fs::write(&left_path, &left).expect("left book");
+    std::fs::write(&right_path, &right).expect("right book");
+
+    let expected = ReadioSdk::new().imports.content_identity(&left).digest;
+    let actual = content_id(&left_path).expect("TUI content id");
+
+    assert_eq!(actual, expected, "TUI must use the shared SDK identity");
+    assert_ne!(
+        actual,
+        content_id(&right_path).expect("changed content id"),
+        "changes after the historical 128 KiB prefix must create a new identity"
+    );
+}
+
+#[test]
+fn reimporting_a_legacy_entry_keeps_its_progress_key() {
+    let source = source_book("legacy-identity", "旧进度不能丢");
+    let bytes = std::fs::metadata(&source).expect("source metadata").len();
+    let mut lib = library();
+    lib.entries.push(Entry {
+        id: "5f4dcc3b5aa765d6".to_string(),
+        title: "旧进度不能丢".to_string(),
+        author: None,
+        path: source.clone(),
+        origin: None,
+        mode: Mode::Link,
+        import_record: None,
+        bytes,
+        chars: 18,
+        words: 9,
+        chapters: 2,
+        imported: 10,
+        last_opened: 99,
+    });
+
+    let (entry, book) = lib.import(&source, Mode::Link).expect("reimport");
+
+    assert_eq!(entry.id, "5f4dcc3b5aa765d6");
+    assert_eq!(book.id, "5f4dcc3b5aa765d6");
+    assert_eq!(entry.last_opened, 99);
+    assert_eq!(lib.len(), 1, "migration must not create a duplicate entry");
+}
+
+#[test]
+fn new_imports_persist_the_shared_ownership_record() {
+    let source = source_book("shared-import-record", "统一导入记录");
+    let mut lib = library();
+
+    let (entry, _) = lib.import(&source, Mode::Copy).expect("import");
+    let encoded = serde_json::to_value(&entry).expect("entry JSON");
+
+    assert_eq!(encoded["import_record"]["item_id"], entry.id);
+    assert_eq!(
+        encoded["import_record"]["content_identity"]["digest"],
+        entry.id
+    );
+    assert_eq!(
+        encoded["import_record"]["content_identity"]["algorithm"],
+        "blake3-prefix-v1"
+    );
+    assert_eq!(encoded["import_record"]["ownership"], "copy");
+    assert_eq!(
+        encoded["import_record"]["source_key"],
+        source.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        encoded["import_record"]["storage_key"],
+        entry.path.to_string_lossy().as_ref()
+    );
 }
 
 #[test]

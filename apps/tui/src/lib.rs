@@ -21,13 +21,16 @@
 pub mod app;
 pub mod book;
 pub mod cli;
+pub mod cloud;
 pub mod config;
+pub mod diagnostics;
 pub mod effort;
 pub mod i18n;
 pub mod library;
 pub mod metrics;
 pub mod mode;
 pub mod paths;
+pub mod replica_sync;
 pub mod store;
 pub mod stream;
 pub mod theme;

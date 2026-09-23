@@ -25,6 +25,9 @@ import SwiftUI
 /// - System dividers between rows (handled by the parent).
 struct BookListRow: View {
 
+    @Environment(\.readioTheme) private var theme
+    @Environment(\.locale) private var locale
+
     // MARK: - Properties
 
     /// The library item summary to display in this row.
@@ -43,7 +46,13 @@ struct BookListRow: View {
             CoverImageView(
                 coverImage: item.coverImage,
                 title: item.title,
-                size: CGSize(width: thumbnailWidth, height: thumbnailHeight)
+                size: CGSize(width: thumbnailWidth, height: thumbnailHeight),
+                loadEpubAsset: { assetID in
+                    try await LibraryService().loadEpubAsset(
+                        itemID: item.id,
+                        assetID: assetID
+                    )
+                }
             )
             .clipShape(RoundedRectangle(cornerRadius: 6))
 
@@ -56,25 +65,25 @@ struct BookListRow: View {
                     .fontWeight(.medium)
                     .lineLimit(2)
                     .multilineTextAlignment(.leading)
-                    .foregroundStyle(.primary)
+                    .foregroundStyle(theme.ink)
 
                 // Metadata row: type badge + date
                 HStack(spacing: 8) {
                     // Type badge — small colored pill matching BookCardView's badge
                     Text(item.type.rawValue.uppercased())
                         .font(.system(size: 10, weight: .bold, design: .rounded))
-                        .foregroundStyle(.white)
+                        .foregroundStyle(theme.sidebarInk)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
                         .background(
                             Capsule()
-                                .fill(badgeColor)
+                                .fill(theme.sidebarSelected)
                         )
 
                     // Relative date — formatted from the ISO string
                     Text(formattedDate)
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(theme.secondaryInk)
 
                     Spacer()
                 }
@@ -87,11 +96,11 @@ struct BookListRow: View {
                         GeometryReader { geometry in
                             ZStack(alignment: .leading) {
                                 RoundedRectangle(cornerRadius: 2)
-                                    .fill(Color(.systemGray5))
+                                    .fill(theme.selected)
                                     .frame(height: 3)
 
                                 RoundedRectangle(cornerRadius: 2)
-                                    .fill(Color.accentColor)
+                                    .fill(theme.accent)
                                     .frame(
                                         width: geometry.size.width * CGFloat(item.progress) / 100.0,
                                         height: 3
@@ -103,7 +112,7 @@ struct BookListRow: View {
                         // Progress percentage
                         Text("\(item.progress)%")
                             .font(.system(size: 10, weight: .medium, design: .rounded))
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(theme.secondaryInk)
                             .frame(width: 32, alignment: .trailing)
                     }
                 }
@@ -113,7 +122,7 @@ struct BookListRow: View {
             // Right-facing chevron indicating the row is tappable/navigable.
             Image(systemName: "chevron.right")
                 .font(.caption)
-                .foregroundStyle(.quaternary)
+                .foregroundStyle(theme.secondaryInk.opacity(0.6))
         }
         .padding(.horizontal)
         .padding(.vertical, 8)
@@ -121,17 +130,6 @@ struct BookListRow: View {
     }
 
     // MARK: - Computed Properties
-
-    /// Returns a color corresponding to the item's document type.
-    /// Matches the color scheme used in `BookCardView.typeBadge`.
-    private var badgeColor: Color {
-        switch item.type {
-        case .epub: return .indigo
-        case .pdf: return .red
-        case .txt: return .gray
-        case .web: return .blue
-        }
-    }
 
     /// Formats the ISO 8601 date string into a concise relative or short date.
     ///
@@ -152,11 +150,12 @@ struct BookListRow: View {
 
         let calendar = Calendar.current
         if calendar.isDateInToday(date) {
-            return "Today"
+            return String(localized: "Today", locale: locale)
         } else if calendar.isDateInYesterday(date) {
-            return "Yesterday"
+            return String(localized: "Yesterday", locale: locale)
         } else {
             let displayFormatter = DateFormatter()
+            displayFormatter.locale = locale
             if calendar.isDate(date, equalTo: Date(), toGranularity: .year) {
                 displayFormatter.dateFormat = "MMM d"
             } else {

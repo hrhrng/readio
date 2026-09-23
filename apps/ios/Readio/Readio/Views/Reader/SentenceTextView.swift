@@ -1,70 +1,46 @@
 import SwiftUI
 
-// MARK: - SentenceTextView
-/// Renders a single sentence with optional word-level TTS highlighting.
-///
-/// **States:**
-///
-/// 1. **Inactive** — Normal body text, subtle hover/tap feedback.
-/// ```
-///   The quick brown fox jumps over the lazy dog.
-/// ```
-///
-/// 2. **Active (with word progress)** — Background highlighted, individual words
-///    colored up to the current TTS playback position.
-/// ```
-///   [The quick brown] fox jumps over the lazy dog.
-///    ^^^^^^^^^^^^^^^^
-///    highlighted words (spoken)
-/// ```
-///
-/// **Word-Level Highlighting Algorithm:**
-/// 1. Split the sentence text into tokens using whitespace.
-/// 2. Calculate the highlighted word index: `floor(wordProgress * tokenCount)`.
-/// 3. Build an `AttributedString` (or `Text` concatenation) where tokens up to
-///    the highlighted index use the accent color, and remaining tokens use default color.
-///
-/// **Performance:**
-/// This view is designed to be embedded in a `LazyVStack` with potentially thousands
-/// of siblings. Only the active sentence performs word-level splitting; inactive sentences
-/// render a simple `Text` view with no overhead.
-///
-/// **Interaction:**
-/// Tapping the sentence calls `onTap`, which typically tells the TTS engine to
-/// start playback from this sentence's index.
+struct ReadioSentenceTextProjection: Equatable {
+    let before: String
+    let highlighted: String
+    let after: String
+}
+
+struct ReadioStyledTextSegment: Equatable {
+    let text: String
+    let bold: Bool
+    let italic: Bool
+    let highlighted: Bool
+}
+
+/// Renders a sentence while treating Rust's Unicode-scalar range as the only
+/// authority for the active word. SwiftUI owns styling; it never tokenizes or
+/// derives a word index from playback progress.
 struct SentenceTextView: View {
-
-    // MARK: - Properties
-
-    /// The sentence data containing the index and text content.
+    @Environment(\.readioTheme) private var theme
     let sentence: Sentence
-
-    /// Whether this sentence is currently being spoken by the TTS engine.
     let isActive: Bool
-
-    /// Word-level progress within this sentence (0.0 to 1.0).
-    /// Only meaningful when `isActive` is true.
-    let wordProgress: Double
-
-    /// Callback invoked when the user taps this sentence.
+    let wordRange: ReadioScalarRange?
+    let runs: [StyledRun]?
     let onTap: () -> Void
 
-    // MARK: - Body
+    init(
+        sentence: Sentence,
+        isActive: Bool,
+        wordRange: ReadioScalarRange?,
+        runs: [StyledRun]? = nil,
+        onTap: @escaping () -> Void
+    ) {
+        self.sentence = sentence
+        self.isActive = isActive
+        self.wordRange = wordRange
+        self.runs = runs
+        self.onTap = onTap
+    }
 
     var body: some View {
         Button(action: onTap) {
-            if isActive {
-                // MARK: Active Sentence — Word-Level Highlighting
-                // Split into tokens and highlight up to the current word.
-                activeTextView
-            } else {
-                // MARK: Inactive Sentence — Plain Text
-                // Simple text rendering with no per-word overhead.
-                Text(sentence.text)
-                    .font(.body)
-                    .foregroundStyle(.primary)
-                    .multilineTextAlignment(.leading)
-            }
+            styledTextView(highlightRange: isActive ? wordRange : nil)
         }
         .buttonStyle(.plain)
         .padding(.vertical, 4)
@@ -72,131 +48,152 @@ struct SentenceTextView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 6)
-                .fill(isActive ? Color.accentColor.opacity(0.1) : Color.clear)
+                .fill(isActive ? theme.selected : Color.clear)
         )
         .animation(.easeInOut(duration: 0.15), value: isActive)
+        .id(sentence.index)
     }
 
-    // MARK: - Active Text View
-
-    /// Renders the sentence with per-word highlighting based on TTS playback progress.
-    ///
-    /// **Algorithm:**
-    /// 1. Tokenize the sentence text by splitting on whitespace boundaries.
-    /// 2. Compute how many tokens have been "spoken" based on `wordProgress`.
-    /// 3. Concatenate `Text` views: spoken tokens use accent color with bold weight,
-    ///    unspoken tokens use the default primary color.
-    ///
-    /// This approach uses SwiftUI's `Text` concatenation (`+` operator) rather than
-    /// `AttributedString` because it's more performant for simple color changes and
-    /// doesn't require Foundation's attributed string infrastructure.
-    private var activeTextView: some View {
-        let tokens = tokenize(sentence.text)
-        let totalTokens = tokens.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }.count
-        // Calculate the index of the currently highlighted word.
-        // Clamp to valid range to prevent out-of-bounds issues.
-        let highlightedIndex = totalTokens > 0
-            ? min(Int(floor(wordProgress * Double(totalTokens))), totalTokens - 1)
-            : -1
-
-        // Build the text by concatenating individually styled token Text views.
-        var wordIndex = 0
-        let styledText = tokens.reduce(Text("")) { accumulated, token in
-            if token.trimmingCharacters(in: .whitespaces).isEmpty {
-                // Whitespace token — render as-is, no word index increment
-                return accumulated + Text(token)
-            } else {
-                let currentWordIndex = wordIndex
-                wordIndex += 1
-
-                // Determine if this word should be highlighted
-                let isHighlighted = currentWordIndex == highlightedIndex
-                let isSpoken = currentWordIndex < highlightedIndex
-
-                if isHighlighted {
-                    // Currently spoken word — accent color with bold
-                    return accumulated + Text(token)
-                        .foregroundColor(.accentColor)
-                        .fontWeight(.semibold)
-                } else if isSpoken {
-                    // Already spoken word — slightly dimmer accent
-                    return accumulated + Text(token)
-                        .foregroundColor(.accentColor.opacity(0.7))
-                } else {
-                    // Not yet spoken — default color
-                    return accumulated + Text(token)
-                        .foregroundColor(.primary)
-                }
+    private func styledTextView(highlightRange: ReadioScalarRange?) -> some View {
+        let segments = Self.projectStyledText(
+            sentence.text,
+            runs: runs ?? [StyledRun(text: sentence.text)],
+            highlightRange: highlightRange
+        )
+        var content = AttributedString()
+        for segment in segments {
+            var value = AttributedString(segment.text)
+            var font = Font.body
+            if segment.bold || segment.highlighted {
+                font = font.weight(.semibold)
             }
+            if segment.italic {
+                font = font.italic()
+            }
+            value.font = font
+            if segment.highlighted {
+                value.foregroundColor = theme.accentStrong
+            }
+            content.append(value)
         }
-
-        return styledText
+        return Text(content)
             .font(.body)
+            .foregroundStyle(theme.ink)
             .multilineTextAlignment(.leading)
     }
 
-    // MARK: - Tokenization
+    static func projectStyledText(
+        _ text: String,
+        runs: [StyledRun],
+        highlightRange: ReadioScalarRange?
+    ) -> [ReadioStyledTextSegment] {
+        let scalars = Array(text.unicodeScalars)
+        let normalizedRuns = runs.map { run in
+            (
+                run: run,
+                length: run.text.unicodeScalars.count
+            )
+        }
+        guard normalizedRuns.reduce(0, { $0 + $1.length }) == scalars.count else {
+            return [
+                ReadioStyledTextSegment(
+                    text: text,
+                    bold: false,
+                    italic: false,
+                    highlighted: false
+                )
+            ]
+        }
 
-    /// Splits text into tokens while preserving whitespace as separate tokens.
-    ///
-    /// This tokenizer handles both Latin-script languages (space-separated words)
-    /// and CJK text (character-by-character). It preserves the original spacing
-    /// so the reconstructed text looks identical to the input.
-    ///
-    /// **Examples:**
-    /// - `"Hello world"` → `["Hello", " ", "world"]`
-    /// - `"The  quick"` → `["The", "  ", "quick"]`
-    ///
-    /// **Note:** This mirrors the web frontend's `tokenize()` function from `lib/cjk.ts`.
-    private func tokenize(_ text: String) -> [String] {
-        var tokens: [String] = []
-        var currentToken = ""
-        var inWhitespace = false
+        var runRanges: [(start: Int, end: Int, run: StyledRun)] = []
+        var cursor = 0
+        var boundaries: Set<Int> = [0, scalars.count]
+        for value in normalizedRuns {
+            let end = cursor + value.length
+            runRanges.append((cursor, end, value.run))
+            boundaries.insert(cursor)
+            boundaries.insert(end)
+            cursor = end
+        }
+        let highlight: (start: Int, end: Int)? = highlightRange.flatMap { range in
+            guard let start = Int(exactly: range.start),
+                  let end = Int(exactly: range.end),
+                  0 <= start,
+                  start < end,
+                  end <= scalars.count else { return nil }
+            boundaries.insert(start)
+            boundaries.insert(end)
+            return (start, end)
+        }
 
-        for char in text {
-            let charIsWhitespace = char.isWhitespace
-
-            if charIsWhitespace != inWhitespace && !currentToken.isEmpty {
-                // Transition between word and whitespace — flush current token
-                tokens.append(currentToken)
-                currentToken = ""
+        let ordered = boundaries.sorted()
+        var segments: [ReadioStyledTextSegment] = []
+        for (start, end) in zip(ordered, ordered.dropFirst()) where start < end {
+            let style = runRanges.first {
+                $0.start <= start && end <= $0.end
+            }?.run
+            let segment = ReadioStyledTextSegment(
+                text: String(String.UnicodeScalarView(scalars[start..<end])),
+                bold: style?.bold ?? false,
+                italic: style?.italic ?? false,
+                highlighted: highlight.map {
+                    $0.start <= start && end <= $0.end
+                } ?? false
+            )
+            if let previous = segments.last,
+               previous.bold == segment.bold,
+               previous.italic == segment.italic,
+               previous.highlighted == segment.highlighted {
+                segments[segments.count - 1] = ReadioStyledTextSegment(
+                    text: previous.text + segment.text,
+                    bold: segment.bold,
+                    italic: segment.italic,
+                    highlighted: segment.highlighted
+                )
+            } else {
+                segments.append(segment)
             }
-
-            currentToken.append(char)
-            inWhitespace = charIsWhitespace
         }
+        return segments
+    }
 
-        // Flush any remaining token
-        if !currentToken.isEmpty {
-            tokens.append(currentToken)
+    static func projectScalarHighlight(
+        _ text: String,
+        range: ReadioScalarRange
+    ) -> ReadioSentenceTextProjection {
+        let scalars = Array(text.unicodeScalars)
+        guard range.start < range.end,
+              let start = Int(exactly: range.start),
+              let end = Int(exactly: range.end),
+              start >= 0,
+              end <= scalars.count else {
+            return ReadioSentenceTextProjection(
+                before: text,
+                highlighted: "",
+                after: ""
+            )
         }
-
-        return tokens
+        return ReadioSentenceTextProjection(
+            before: String(String.UnicodeScalarView(scalars[0..<start])),
+            highlighted: String(String.UnicodeScalarView(scalars[start..<end])),
+            after: String(String.UnicodeScalarView(scalars[end..<scalars.count]))
+        )
     }
 }
-
-// MARK: - Preview
 
 #Preview("Active Sentence") {
     VStack(spacing: 12) {
         SentenceTextView(
-            sentence: Sentence(index: 0, text: "The quick brown fox jumps over the lazy dog."),
+            sentence: Sentence(index: 0, text: "The quick brown fox jumps."),
             isActive: true,
-            wordProgress: 0.4,
+            wordRange: ReadioScalarRange(start: 4, end: 9),
             onTap: {}
         )
 
         SentenceTextView(
-            sentence: Sentence(index: 1, text: "This sentence is not currently active."),
+            sentence: Sentence(index: 1, text: "This sentence is not active."),
             isActive: false,
-            wordProgress: 0,
-            onTap: {}
-        )
-
-        SentenceTextView(
-            sentence: Sentence(index: 2, text: "Another active sentence with different progress."),
-            isActive: true,
-            wordProgress: 0.8,
+            wordRange: nil,
             onTap: {}
         )
     }

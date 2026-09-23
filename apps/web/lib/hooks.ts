@@ -11,6 +11,7 @@ import {
   patchSettings,
 } from "./api";
 import { LibraryItem, LibraryItemsResponse, VoiceListResponse } from "./types";
+import { useToast } from "@/components/toast-provider";
 
 interface UseLibraryItemsParams {
   category?: string;
@@ -63,6 +64,7 @@ export function useSearchItems(query: string) {
 const SETTINGS_KEY = "user-settings";
 
 export function useSettings() {
+  const { showToast } = useToast();
   const { data: settings, isLoading } = useSWR<Record<string, string>>(
     SETTINGS_KEY,
     fetchSettings,
@@ -87,14 +89,17 @@ export function useSettings() {
       );
 
       // Fire-and-forget backend persistence
-      patchSettings({ [key]: value }).catch(() => {});
+      patchSettings({ [key]: value }).catch(() => {
+        globalMutate(SETTINGS_KEY);
+        showToast("settings.failed", "Your settings could not be saved");
+      });
 
       // Broadcast change so non-SWR consumers (e.g. CSS var appliers) can react
       window.dispatchEvent(
         new CustomEvent("readio-settings-change", { detail: { key, value } })
       );
     },
-    []
+    [showToast]
   );
 
   return { settings: settings ?? {}, isLoading, updateSetting };

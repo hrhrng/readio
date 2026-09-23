@@ -55,7 +55,7 @@ final class SettingsViewModel {
     /// Changing this value updates `APIClient.shared.baseURL` immediately so
     /// subsequent API calls use the new endpoint.
     var serverURL: String {
-        didSet { UserDefaults.standard.set(serverURL, forKey: Keys.serverURL) }
+        didSet { defaults.set(serverURL, forKey: Keys.serverURL) }
     }
 
     /// Appearance theme preference.
@@ -65,7 +65,7 @@ final class SettingsViewModel {
     /// - `"light"`: always use light mode
     /// - `"dark"`: always use dark mode
     var theme: String {
-        didSet { UserDefaults.standard.set(theme, forKey: Keys.theme) }
+        didSet { defaults.set(theme, forKey: Keys.theme) }
     }
 
     /// Accent color preset identifier.
@@ -74,7 +74,7 @@ final class SettingsViewModel {
     /// preset in the UI layer. The view is responsible for applying the actual
     /// color values to the app's tint.
     var accentColor: String {
-        didSet { UserDefaults.standard.set(accentColor, forKey: Keys.accentColor) }
+        didSet { defaults.set(accentColor, forKey: Keys.accentColor) }
     }
 
     /// Reader font size in points.
@@ -82,7 +82,45 @@ final class SettingsViewModel {
     /// Applied as a dynamic type size override in the reader view. The default
     /// (18.0) is optimized for comfortable reading on iPhone-sized screens.
     var fontSize: Double {
-        didSet { UserDefaults.standard.set(fontSize, forKey: Keys.fontSize) }
+        didSet { defaults.set(fontSize, forKey: Keys.fontSize) }
+    }
+
+    /// Device-local TTS effect selection. Cloud remains opt-in so launching,
+    /// reading, and native speech never depend on account or network state.
+    var ttsMode: AppleTTSMode {
+        didSet { defaults.set(ttsMode.rawValue, forKey: AppSettingsKeys.ttsMode) }
+    }
+
+    /// Provider-specific cloud voice identifier sent with authenticated jobs.
+    var cloudVoiceID: String {
+        didSet { defaults.set(cloudVoiceID, forKey: AppSettingsKeys.cloudVoiceID) }
+    }
+
+    var readingMode: ReadioReadingMode {
+        didSet {
+            defaults.set(readingMode.rawValue, forKey: AppSettingsKeys.readingMode)
+            persistPortableSetting("reading_mode", value: readingMode.rawValue)
+        }
+    }
+
+    var readingEffort: ReadioEffortLevel {
+        didSet {
+            defaults.set(readingEffort.rawValue, forKey: AppSettingsKeys.readingEffort)
+            persistPortableSetting("reading_effort", value: readingEffort.rawValue)
+        }
+    }
+
+    var baseTextCharactersPerSecond: Double {
+        didSet {
+            defaults.set(
+                baseTextCharactersPerSecond,
+                forKey: AppSettingsKeys.readingBaseCharactersPerSecond
+            )
+            persistPortableSetting(
+                "reading_base_cps",
+                value: String(baseTextCharactersPerSecond)
+            )
+        }
     }
 
     // MARK: - Server Settings
@@ -106,6 +144,7 @@ final class SettingsViewModel {
 
     /// Service layer for fetching and updating server-side settings.
     private let settingsService = SettingsService()
+    private let defaults: UserDefaults
 
     // MARK: - UserDefaults Keys
 
@@ -123,14 +162,27 @@ final class SettingsViewModel {
     // MARK: - Initialization
 
     /// Initialize with values from UserDefaults, falling back to sensible defaults.
-    init() {
-        let defaults = UserDefaults.standard
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
         self.serverURL = defaults.string(forKey: Keys.serverURL) ?? "http://localhost:8000"
         self.theme = defaults.string(forKey: Keys.theme) ?? "system"
-        self.accentColor = defaults.string(forKey: Keys.accentColor) ?? "blue"
+        self.accentColor = "clover"
         self.fontSize = defaults.double(forKey: Keys.fontSize) > 0
             ? defaults.double(forKey: Keys.fontSize)
             : 18.0
+        let preferences = AppleTTSPreferences(defaults: defaults)
+        self.ttsMode = preferences.mode
+        self.cloudVoiceID = preferences.cloudVoiceID
+        self.readingMode = ReadioReadingMode(
+            rawValue: defaults.string(forKey: AppSettingsKeys.readingMode) ?? "manual"
+        ) ?? .manual
+        self.readingEffort = ReadioEffortLevel(
+            rawValue: defaults.string(forKey: AppSettingsKeys.readingEffort) ?? "high"
+        ) ?? .high
+        let storedTextRate = defaults.double(
+            forKey: AppSettingsKeys.readingBaseCharactersPerSecond
+        )
+        self.baseTextCharactersPerSecond = storedTextRate > 0 ? storedTextRate : 46
     }
 
     // MARK: - Public API
@@ -146,6 +198,7 @@ final class SettingsViewModel {
         do {
             let settings = try await settingsService.fetchSettings()
             serverSettings = settings
+            applyPortableSettings(settings)
         } catch {
             self.error = "Failed to load settings: \(error.localizedDescription)"
         }
@@ -167,6 +220,32 @@ final class SettingsViewModel {
         }
     }
 
+    func readingPace() throws -> ReadioReadingPace {
+        try ReadioSDK().resolveReadingPace(
+            ReadioReadingPreferences(
+                mode: readingMode,
+                baseTextCharactersPerSecond: baseTextCharactersPerSecond,
+                effort: readingEffort
+            )
+        )
+    }
+
+    func applyPortableSettings(_ settings: [String: String]) {
+        if let rawMode = settings["reading_mode"],
+           let mode = ReadioReadingMode(rawValue: rawMode) {
+            readingMode = mode
+        }
+        if let rawEffort = settings["reading_effort"],
+           let effort = ReadioEffortLevel(rawValue: rawEffort) {
+            readingEffort = effort
+        }
+        if let rawBaseRate = settings["reading_base_cps"],
+           let baseRate = Double(rawBaseRate),
+           baseRate.isFinite {
+            baseTextCharactersPerSecond = baseRate
+        }
+    }
+
     /// Update the server URL and propagate the change to the API client.
     ///
     /// This is more than a simple property setter — it also updates the
@@ -181,5 +260,12 @@ final class SettingsViewModel {
         // APIClient.shared.baseURL reads from UserDefaults dynamically,
         // so writing to UserDefaults (via serverURL.didSet) is sufficient —
         // no explicit assignment needed.
+    }
+
+    private func persistPortableSetting(_ key: String, value: String) {
+        let service = settingsService
+        Task {
+            try? await service.patchSettings(data: [key: value])
+        }
     }
 }

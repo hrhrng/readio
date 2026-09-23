@@ -422,20 +422,20 @@ PDF 的排版复杂度极高（表格、多栏、公式、嵌入图片）。前�
 - File Tab：拖放区 + 文件选择器，支持 TXT、PDF、EPUB、DOCX
 - URL Tab：URL 输入框 + Import 按钮，抓取网页内容
 - Loading 状态：显示 spinner，禁用交互
-- 错误状态：显示后端返回的错误信息
-- 成功后自动关闭对话框，SWR revalidate 刷新列表
+- 错误状态：显示本地解析或 Cloud acquisition 返回的恢复信息
+- 成功后自动关闭对话框，本地 replica 刷新列表
 
 **API**：
 | 操作 | Endpoint | 说明 |
 |------|---------|------|
-| 文件上传 | `POST /api/library/import/file` | multipart form data |
-| URL 导入 | `POST /api/library/import/url` | JSON body: `{ url, category, folder_id }` |
+| 本地文件 | Rust WASM + browser SQLite | 原始 bytes → identity/import plan → 本地持久化 |
+| URL acquisition | `POST /api/cloud/v1/acquire/url` | JSON body: `{ url }`；仅返回 bounded raw HTML |
 
 **文件处理流程**：
-1. 前端 FormData 包含 `file` + `folder_id` + `category`
-2. 后端解析文件（txt 直读、pdf PyMuPDF 提取、epub 结构化解析、docx XML 提取）
-3. EPUB/PDF 原始文件同时保存到 `data/files/{item_id}/` 用于前端渲染
-4. 返回 `LibraryItem`
+1. 浏览器读取文件 bytes，Rust WASM 计算全字节 identity 与 import plan
+2. Rust/reader adapter 解析 TXT、PDF、EPUB 或 HTML 为 canonical content
+3. Browser SQLite 保存 reader content、原始 source bytes 与 Loro metadata
+4. 相同 identity 复用现有 `LibraryItem` 与阅读进度
 
 ### Delete
 

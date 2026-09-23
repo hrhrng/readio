@@ -33,10 +33,19 @@ import SwiftUI
 ///   an awkward empty carousel.
 struct HomeView: View {
 
+    @Environment(\.readioTheme) private var theme
+    @Environment(\.locale) private var locale
+
     // MARK: - State
 
     /// The view model that fetches and holds dashboard data (in-progress, recent items).
     @State private var viewModel = HomeViewModel()
+    @State private var isShowingBuiltinSample = false
+    private let onOpenReader: ((String) -> Void)?
+
+    init(onOpenReader: ((String) -> Void)? = nil) {
+        self.onOpenReader = onOpenReader
+    }
 
     // MARK: - Body
 
@@ -57,8 +66,9 @@ struct HomeView: View {
                     // Only show if there are items with 0 < progress < 100
                     if !viewModel.inProgressItems.isEmpty {
                         SectionCarouselView(
-                            title: "Continue Reading",
-                            items: viewModel.inProgressItems
+                            title: String(localized: "Continue Reading", locale: locale),
+                            items: viewModel.inProgressItems,
+                            onOpenReader: onOpenReader
                         )
                     }
 
@@ -66,25 +76,42 @@ struct HomeView: View {
                     // Shows the most recently imported/created items
                     if !viewModel.recentItems.isEmpty {
                         SectionCarouselView(
-                            title: "Recently Added",
-                            items: viewModel.recentItems
+                            title: String(localized: "Recently Added", locale: locale),
+                            items: viewModel.recentItems,
+                            onOpenReader: onOpenReader
                         )
                     }
                 }
             }
             .padding(.vertical)
         }
+        .scrollContentBackground(.hidden)
+        .scrollIndicators(
+            AppleReaderSurfacePolicy.showsHomeScrollIndicator ? .visible : .hidden
+        )
+        .background(theme.canvas.ignoresSafeArea())
         .refreshable {
             // Pull-to-refresh triggers a full dashboard reload.
             // The `refreshable` modifier automatically shows and hides the spinner.
             await viewModel.loadDashboard()
         }
         .navigationTitle("Readio")
+        .navigationDestination(isPresented: $isShowingBuiltinSample) {
+            if let itemID = AppleBuiltinSampleEntry.destinationItemID(
+                libraryIsEmpty: true,
+                searchOrFilterIsActive: false
+            ) {
+                ReaderView(itemId: itemID)
+            }
+        }
         .task {
             // Load dashboard data when the view first appears.
             // `.task` is preferred over `.onAppear` because it automatically
             // cancels the async work if the view disappears before completion.
             await viewModel.loadDashboard()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .readioReplicaDidSync)) { _ in
+            Task { await viewModel.loadDashboard() }
         }
     }
 
@@ -93,17 +120,23 @@ struct HomeView: View {
     /// A friendly greeting that changes based on the time of day.
     /// Provides a warm, personalized feel to the home screen.
     private var welcomeHeader: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(greetingText)
-                .font(.title2)
-                .fontWeight(.semibold)
-                .foregroundStyle(.primary)
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Text("❯")
+                .font(.system(.title, design: .monospaced, weight: .bold))
+                .foregroundStyle(theme.accent)
 
-            Text("What would you like to read today?")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(greetingText)
+                    .font(.largeTitle.weight(.bold))
+                    .foregroundStyle(theme.ink)
+
+                Text("What would you like to read today?")
+                    .font(.subheadline)
+                    .foregroundStyle(theme.secondaryInk)
+            }
         }
-        .padding(.horizontal)
+        .padding(.horizontal, 24)
+        .padding(.top, 8)
     }
 
     /// Generates a time-appropriate greeting string.
@@ -114,11 +147,11 @@ struct HomeView: View {
         let hour = Calendar.current.component(.hour, from: Date())
         switch hour {
         case 0..<12:
-            return "Good Morning"
+            return String(localized: "Good Morning", locale: locale)
         case 12..<17:
-            return "Good Afternoon"
+            return String(localized: "Good Afternoon", locale: locale)
         default:
-            return "Good Evening"
+            return String(localized: "Good Evening", locale: locale)
         }
     }
 
@@ -159,12 +192,22 @@ struct HomeView: View {
     private var emptyDashboard: some View {
         EmptyStateView(
             icon: "book.closed.fill",
-            title: "Your Library is Empty",
-            message: "Import an EPUB, PDF, or TXT file, or paste a URL to get started with Readio.",
-            actionLabel: "Import Now"
+            title: String(localized: "Your Library is Empty", locale: locale),
+            message: String(
+                localized: "Import an EPUB, PDF, or TXT file, or paste a URL to get started with Readio.",
+                locale: locale
+            ),
+            actionLabel: String(localized: "Open Sample", locale: locale)
         ) {
-            // This action could navigate to the Import tab.
-            // For now, we use NotificationCenter or a shared navigation state.
+            guard let itemID = AppleBuiltinSampleEntry.destinationItemID(
+                libraryIsEmpty: true,
+                searchOrFilterIsActive: false
+            ) else { return }
+            if let onOpenReader {
+                onOpenReader(itemID)
+            } else {
+                isShowingBuiltinSample = true
+            }
         }
         .padding(.top, 40)
     }

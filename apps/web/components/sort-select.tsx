@@ -42,42 +42,38 @@ export function SortSelect({ value, onChange, options }: SortSelectProps) {
   }, [open]);
 
   return (
-    <div ref={containerRef} className="relative">
-      {/* Trigger button */}
+    <div ref={containerRef} className="ui-select">
       <button
+        type="button"
         onClick={() => setOpen((v) => !v)}
-        className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm transition-colors cursor-pointer ${
-          open
-            ? "bg-surface-hover text-text-primary"
-            : "text-text-secondary hover:text-text-primary hover:bg-surface-hover"
-        }`}
+        className="ui-select-trigger"
+        aria-haspopup="listbox"
+        aria-expanded={open}
       >
         <span>{currentLabel}</span>
         <ChevronDown
-          size={14}
-          className={`text-text-tertiary transition-transform ${open ? "rotate-180" : ""}`}
+          className={`ui-icon-sm transition-transform ${open ? "rotate-180" : ""}`}
+          aria-hidden="true"
         />
       </button>
 
-      {/* Dropdown panel */}
       {open && (
-        <div className="absolute right-0 top-full mt-1.5 z-50 min-w-[140px] bg-surface-card border border-border rounded-xl shadow-lg py-1">
+        <div className="surface-popover ui-select-menu" role="listbox">
           {options.map((opt) => (
             <button
+              type="button"
               key={opt.value}
+              role="option"
+              aria-selected={opt.value === value}
               onClick={() => {
                 onChange(opt.value);
                 setOpen(false);
               }}
-              className={`flex items-center justify-between w-full px-3 py-1.5 text-sm transition-colors cursor-pointer ${
-                opt.value === value
-                  ? "text-text-primary font-medium"
-                  : "text-text-secondary hover:text-text-primary hover:bg-surface-hover"
-              }`}
+              className="popover-item"
             >
-              <span>{opt.label}</span>
+              <span className="flex-1">{opt.label}</span>
               {opt.value === value && (
-                <Check size={14} className="text-accent" />
+                <Check className="ui-icon-sm text-accent" aria-hidden="true" />
               )}
             </button>
           ))}

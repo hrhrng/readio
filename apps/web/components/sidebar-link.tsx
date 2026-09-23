@@ -23,13 +23,13 @@ export function SidebarLink({
   return (
     <Link
       href={href}
-      className={`flex items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors ${
-        isActive
-          ? "bg-surface-active text-text-primary font-medium"
-          : "text-text-secondary hover:bg-surface-hover hover:text-text-primary"
-      }`}
+      className="nav-item"
+      data-active={isActive}
+      aria-current={isActive ? "page" : undefined}
     >
-      <Icon size={18} strokeWidth={isActive ? 2 : 1.5} />
+      <span className="ui-icon-slot" aria-hidden="true">
+        <Icon className="ui-icon" />
+      </span>
       {label && <span>{label}</span>}
     </Link>
   );

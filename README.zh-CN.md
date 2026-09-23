@@ -3,10 +3,10 @@
 **一个伪装成 AI coding agent 的开源终端电子书阅读器，也是本地 TTS 有声书播放器。** EPUB、PDF、Markdown 和纯文本都不用离开终端：按下回车，它会“思考”、发起一次工具调用，再把书里的下一段流式吐出来。看起来在 coding，其实在看书或听书。
 
 [![tui-ci](https://github.com/hrhrng/readio/actions/workflows/tui-ci.yml/badge.svg?branch=main)](https://github.com/hrhrng/readio/actions/workflows/tui-ci.yml)
-[![release](https://img.shields.io/github/v/release/hrhrng/readio?include_prereleases&filter=tui-v*&label=release&color=6f5ec7)](https://github.com/hrhrng/readio/releases)
-[![license](https://img.shields.io/badge/license-MIT-6f5ec7)](LICENSE)
-[![rust](https://img.shields.io/badge/rust-1.85%2B-6f5ec7)](https://www.rust-lang.org)
-![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-6f5ec7)
+[![release](https://img.shields.io/github/v/release/hrhrng/readio?include_prereleases&filter=tui-v*&label=release&color=4f7458)](https://github.com/hrhrng/readio/releases)
+[![license](https://img.shields.io/badge/license-MIT-4f7458)](LICENSE)
+[![rust](https://img.shields.io/badge/rust-1.85%2B-4f7458)](https://www.rust-lang.org)
+![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-4f7458)
 
 [English](README.md)
 
@@ -15,7 +15,7 @@
 屏幕上的每一个数字都是真读出来的——真实的段落偏移、真实的行号区间、真实的全文检索命中数。伪装的只是词表，不是数据。
 
 ```
- readio   The Shape of Attention  readio sample                   ch 1/4  ·  ctx 0.0%
+ ❯_ readio   The Shape of Attention  readio sample                ch 1/4  ·  ctx 0.0%
    ○  3. Three  The feel of a tool  783 tok
    ○  4. Four  One continuous piece of work  485 tok
 

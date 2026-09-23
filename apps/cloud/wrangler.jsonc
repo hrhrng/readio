@@ -1,0 +1,56 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "readio-cloud",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-06",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "ai": {
+    "binding": "AI"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "readio-cloud",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "MEDIA",
+      "bucket_name": "readio-media"
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "TTS_QUEUE",
+        "queue": "readio-tts"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "readio-tts",
+        "max_batch_size": 5,
+        "max_batch_timeout": 5,
+        "max_retries": 3,
+        "dead_letter_queue": "readio-tts-dead-letter"
+      }
+    ]
+  },
+  "vars": {
+    "BETTER_AUTH_URL": "http://localhost:8787",
+    "WEB_URL": "http://localhost:3000",
+    "TRUSTED_ORIGINS": "http://localhost:3000,http://127.0.0.1:3000",
+    "AI_GATEWAY_ID": "readio",
+    "MINIMAX_BASE_URL": "https://api.minimax.io",
+    "MINIMAX_MODEL_ID": "speech-2.6-hd"
+  },
+  "secrets": {
+    "required": ["BETTER_AUTH_SECRET", "MINIMAX_API_KEY", "MINIMAX_GROUP_ID"]
+  }
+}
